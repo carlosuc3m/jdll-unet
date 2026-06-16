@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import numpy as np
 
+from .errors import InferenceError
+
 try:  # pragma: no cover
     from scipy import ndimage as ndi
 except Exception:  # pragma: no cover
     ndi = None
+
+
+def _validate_threshold(threshold: float) -> None:
+    if not 0 <= threshold <= 1:
+        raise InferenceError("threshold must be in [0, 1]")
+
+
+def _validate_min_size(min_object_size: int) -> None:
+    if min_object_size < 0:
+        raise InferenceError("min_object_size cannot be negative")
 
 
 def _remove_small(binary: np.ndarray, min_size: int) -> np.ndarray:
@@ -36,6 +48,10 @@ def postprocess_binary(
     fill_holes: bool = False,
     connected_components: bool = True,
 ) -> dict[str, np.ndarray]:
+    _validate_threshold(threshold)
+    _validate_min_size(min_object_size)
+    if probability.ndim != 2:
+        raise InferenceError(f"Binary probability map must be 2D, got shape {probability.shape}")
     binary = probability >= threshold
     if fill_holes and ndi is not None:
         binary = ndi.binary_fill_holes(binary)
@@ -47,6 +63,9 @@ def postprocess_binary(
 
 
 def postprocess_multiclass(probabilities: np.ndarray, min_object_size: int = 0) -> dict[str, np.ndarray]:
+    _validate_min_size(min_object_size)
+    if probabilities.ndim != 3:
+        raise InferenceError(f"Multiclass probabilities must be C,Y,X, got shape {probabilities.shape}")
     labels = np.argmax(probabilities, axis=0).astype(np.uint16)
     if min_object_size > 0 and ndi is not None:
         cleaned = np.zeros_like(labels)
@@ -62,6 +81,10 @@ def postprocess_instance(
     threshold: float = 0.5,
     min_object_size: int = 0,
 ) -> dict[str, np.ndarray]:
+    _validate_threshold(threshold)
+    _validate_min_size(min_object_size)
+    if foreground_probability.shape != boundary_probability.shape or foreground_probability.ndim != 2:
+        raise InferenceError("Instance foreground and boundary probabilities must be matching 2D arrays")
     foreground = foreground_probability >= threshold
     separators = boundary_probability >= threshold
     separated = foreground & ~separators

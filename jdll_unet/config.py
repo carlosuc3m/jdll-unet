@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import json
+import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
-import json
+from typing import Any
 
 import torch
 
+from .errors import ConfigError
 
 AUTO = "auto"
+SUPPORTED_TASKS = {"auto", "binary_semantic", "multiclass_semantic", "instance_friendly", "classes", "objects"}
+SUPPORTED_AUGMENTATION_PROFILES = {"auto", "fast", "light-balanced", "balanced", "strong"}
+DEFAULT_LOSS_WEIGHTS = {
+    "dice": 1.0,
+    "bce": 1.0,
+    "cross_entropy": 1.0,
+    "boundary": 0.5,
+}
+
+
+def _default_loss_weights() -> dict[str, float]:
+    return dict(DEFAULT_LOSS_WEIGHTS)
 
 
 @dataclass(slots=True)
@@ -74,14 +89,7 @@ class TrainingConfig:
     preview_count: int = 20
     normalization: NormalizationConfig = field(default_factory=NormalizationConfig)
     postprocessing: PostprocessingConfig = field(default_factory=PostprocessingConfig)
-    loss_weights: dict[str, float] = field(
-        default_factory=lambda: {
-            "dice": 1.0,
-            "bce": 1.0,
-            "cross_entropy": 1.0,
-            "boundary": 0.5,
-        }
-    )
+    loss_weights: dict[str, float] = field(default_factory=_default_loss_weights)
     augmentation: dict[str, Any] = field(default_factory=dict)
 
 
@@ -91,14 +99,56 @@ def _path_or_none(value: Any) -> Path | None:
     return Path(value)
 
 
+def _coerce_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lower in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ConfigError(f"{name} must be a boolean")
+
+
+def _auto_or_bool(value: Any, name: str) -> bool | str:
+    return AUTO if value == AUTO else _coerce_bool(value, name)
+
+
+def _auto_or_int(value: Any, name: str) -> int | str:
+    if value == AUTO:
+        return AUTO
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be 'auto' or an integer") from exc
+    return parsed
+
+
+def _auto_or_float(value: Any, name: str) -> float | str:
+    if value == AUTO:
+        return AUTO
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be 'auto' or a number") from exc
+    return parsed
+
+
 def _as_tuple2(value: Any) -> tuple[int, int] | str:
     if value == AUTO:
         return AUTO
     if isinstance(value, int):
-        return (value, value)
-    if isinstance(value, (list, tuple)) and len(value) == 2:
-        return (int(value[0]), int(value[1]))
-    raise ValueError("patch_size must be 'auto', an int, or a length-2 sequence")
+        parsed = (value, value)
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        parsed = (int(value[0]), int(value[1]))
+    else:
+        raise ConfigError("patch_size must be 'auto', an int, or a length-2 sequence")
+    if parsed[0] <= 0 or parsed[1] <= 0:
+        raise ConfigError("patch_size values must be positive")
+    return parsed
 
 
 def _nested_dataclass(cls: type, value: Any):
@@ -108,8 +158,54 @@ def _nested_dataclass(cls: type, value: Any):
         return cls()
     if isinstance(value, Mapping):
         valid = {field.name for field in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        unknown = sorted(set(value) - valid)
+        if unknown:
+            raise ConfigError(f"Unknown {cls.__name__} field(s): {', '.join(unknown)}")
         return cls(**{k: v for k, v in value.items() if k in valid})
-    raise ValueError(f"Expected mapping for {cls.__name__}")
+    raise ConfigError(f"Expected mapping for {cls.__name__}")
+
+
+def _loss_weights(value: Any) -> dict[str, float]:
+    if value is None:
+        return _default_loss_weights()
+    if not isinstance(value, Mapping):
+        raise ConfigError("loss_weights must be a mapping")
+    unknown = sorted(set(value) - set(DEFAULT_LOSS_WEIGHTS))
+    if unknown:
+        raise ConfigError(f"Unknown loss weight(s): {', '.join(unknown)}")
+    weights = _default_loss_weights()
+    for key, raw in value.items():
+        parsed = float(raw)
+        if parsed < 0:
+            raise ConfigError(f"loss weight {key} cannot be negative")
+        weights[key] = parsed
+    return weights
+
+
+def _validate_normalization(config: NormalizationConfig) -> None:
+    if config.type not in {"percentile", "minmax", "zscore", "none"}:
+        raise ConfigError(f"Unsupported normalization type: {config.type}")
+    if config.eps <= 0:
+        raise ConfigError("normalization.eps must be positive")
+    if config.type == "percentile" and not 0 <= config.low < config.high <= 100:
+        raise ConfigError("normalization percentile bounds must satisfy 0 <= low < high <= 100")
+
+
+def _validate_postprocessing(config: PostprocessingConfig) -> None:
+    if not 0 <= config.threshold <= 1:
+        raise ConfigError("postprocessing.threshold must be in [0, 1]")
+    if config.min_object_size < 0:
+        raise ConfigError("postprocessing.min_object_size cannot be negative")
+
+
+def _validate_auto_positive_int(value: int | str, name: str) -> None:
+    if value != AUTO and int(value) <= 0:
+        raise ConfigError(f"{name} must be positive")
+
+
+def _validate_auto_positive_float(value: float | str, name: str) -> None:
+    if value != AUTO and float(value) <= 0:
+        raise ConfigError(f"{name} must be positive")
 
 
 def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> TrainingConfig:
@@ -135,44 +231,60 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             seed=int(raw.get("seed", 42)),
             task=str(raw.get("task", AUTO)),
             axes=str(raw.get("axes", AUTO)),
-            input_channels=raw.get("input_channels", AUTO),
-            output_classes=raw.get("output_classes", AUTO),
+            input_channels=_auto_or_int(raw.get("input_channels", AUTO), "input_channels"),
+            output_classes=_auto_or_int(raw.get("output_classes", AUTO), "output_classes"),
             patch_size=_as_tuple2(raw.get("patch_size", AUTO)),
-            batch_size=raw.get("batch_size", AUTO),
-            learning_rate=raw.get("learning_rate", AUTO),
+            batch_size=_auto_or_int(raw.get("batch_size", AUTO), "batch_size"),
+            learning_rate=_auto_or_float(raw.get("learning_rate", AUTO), "learning_rate"),
             optimizer=str(raw.get("optimizer", "adamw")).lower(),
             weight_decay=float(raw.get("weight_decay", 1e-5)),
             validation_fraction=float(raw.get("validation_fraction", 0.15)),
-            foreground_oversampling=raw.get("foreground_oversampling", AUTO),
-            foreground_probability=raw.get("foreground_probability", AUTO),
+            foreground_oversampling=_auto_or_bool(raw.get("foreground_oversampling", AUTO), "foreground_oversampling"),
+            foreground_probability=_auto_or_float(raw.get("foreground_probability", AUTO), "foreground_probability"),
             augmentation_profile=str(raw.get("augmentation_profile", AUTO)),
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
-            save_every_epoch=bool(raw.get("save_every_epoch", True)),
+            save_every_epoch=_coerce_bool(raw.get("save_every_epoch", True), "save_every_epoch"),
             preview_count=int(raw.get("preview_count", 20)),
             normalization=_nested_dataclass(NormalizationConfig, raw.get("normalization")),
             postprocessing=_nested_dataclass(PostprocessingConfig, raw.get("postprocessing")),
-            loss_weights=dict(raw.get("loss_weights", {}))
-            or TrainingConfig(
-                model_name=str(raw["model_name"]),
-                output_dir=Path(raw["output_dir"]),
-                dataset_path=Path(raw["dataset_path"]),
-            ).loss_weights,
+            loss_weights=_loss_weights(raw.get("loss_weights")),
             augmentation=dict(raw.get("augmentation", {})),
         )
 
+    if not parsed.model_name.strip():
+        raise ConfigError("model_name cannot be empty")
+    if "/" in parsed.model_name or "\\" in parsed.model_name:
+        raise ConfigError("model_name must be a name, not a path")
     if parsed.starting_point not in {"scratch", "fine_tune", "finetune"}:
-        raise ValueError("starting_point must be 'scratch' or 'fine_tune'")
+        raise ConfigError("starting_point must be 'scratch' or 'fine_tune'")
     if parsed.starting_point in {"fine_tune", "finetune"} and parsed.base_model is None:
-        raise ValueError("base_model is required when starting_point is fine_tune")
+        raise ConfigError("base_model is required when starting_point is fine_tune")
+    if parsed.task not in SUPPORTED_TASKS:
+        raise ConfigError(f"Unsupported task: {parsed.task}")
+    if parsed.augmentation_profile not in SUPPORTED_AUGMENTATION_PROFILES:
+        raise ConfigError(f"Unsupported augmentation_profile: {parsed.augmentation_profile}")
     if parsed.optimizer not in {"adamw", "adam"}:
-        raise ValueError("optimizer must be 'adamw' or 'adam'")
+        raise ConfigError("optimizer must be 'adamw' or 'adam'")
     if parsed.epochs < 1:
-        raise ValueError("epochs must be at least 1")
+        raise ConfigError("epochs must be at least 1")
     if not 0.0 <= parsed.validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be in [0, 1)")
+        raise ConfigError("validation_fraction must be in [0, 1)")
+    if parsed.weight_decay < 0:
+        raise ConfigError("weight_decay cannot be negative")
     if parsed.num_workers < 0:
-        raise ValueError("num_workers cannot be negative")
+        raise ConfigError("num_workers cannot be negative")
+    if parsed.preview_count < 0:
+        raise ConfigError("preview_count cannot be negative")
+    if parsed.foreground_probability != AUTO and not 0 <= float(parsed.foreground_probability) <= 1:
+        raise ConfigError("foreground_probability must be in [0, 1]")
+    _validate_auto_positive_int(parsed.input_channels, "input_channels")
+    _validate_auto_positive_int(parsed.output_classes, "output_classes")
+    _validate_auto_positive_int(parsed.batch_size, "batch_size")
+    _validate_auto_positive_float(parsed.learning_rate, "learning_rate")
+    _validate_normalization(parsed.normalization)
+    _validate_postprocessing(parsed.postprocessing)
+    architecture_defaults(str(parsed.architecture))
     return parsed
 
 
@@ -223,14 +335,11 @@ def architecture_defaults(
             normalization=normalization,
             dimensions=dimensions,
         )
-    raise ValueError(f"Unsupported architecture: {architecture}")
+    raise ConfigError(f"Unsupported architecture: {architecture}")
 
 
 def default_patch_size(architecture: str, image_shape: tuple[int, int] | None = None) -> tuple[int, int]:
-    if architecture.lower().startswith("medium"):
-        preferred = (128, 128)
-    else:
-        preferred = (96, 96)
+    preferred = (128, 128) if architecture.lower().startswith("medium") else (96, 96)
     if image_shape is None:
         return preferred
     return (min(preferred[0], int(image_shape[0])), min(preferred[1], int(image_shape[1])))
@@ -310,8 +419,13 @@ def to_jsonable(value: Any) -> Any:
 
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(to_jsonable(dict(payload)), indent=2, sort_keys=True) + "\n")
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(json.dumps(to_jsonable(dict(payload)), indent=2, sort_keys=True) + "\n")
+    os.replace(tmp_path, path)
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Invalid JSON in {path}: {exc}") from exc

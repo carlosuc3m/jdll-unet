@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
 import logging
+import os
 import random
 import shutil
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -29,12 +30,13 @@ from .config import (
     write_json,
 )
 from .dataset import inspect_dataset, make_dataset, split_pairs
+from .errors import ModelLoadError
 from .io import discover_dataset
 from .losses import compute_loss
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
-from .task_detect import detect_task_from_pairs
 from .targets import target_output_channels
+from .task_detect import detect_task_from_pairs
 
 
 def _emit(task: Any, payload: dict[str, Any]) -> None:
@@ -53,6 +55,7 @@ def _setup_logging(output_dir: Path) -> logging.Logger:
     logger = logging.getLogger(f"jdll_unet.training.{output_dir}")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_handler = logging.FileHandler(output_dir / "training.log", encoding="utf-8")
     file_handler.setFormatter(formatter)
@@ -74,12 +77,6 @@ def _move_target(target: torch.Tensor | dict[str, torch.Tensor], device: torch.d
     return target.to(device, non_blocking=True)
 
 
-def _target_batch_size(target: torch.Tensor | dict[str, torch.Tensor]) -> int:
-    if isinstance(target, dict):
-        return int(next(iter(target.values())).shape[0])
-    return int(target.shape[0])
-
-
 def _mean_dict(values: list[dict[str, float]]) -> dict[str, float]:
     if not values:
         return {}
@@ -89,6 +86,20 @@ def _mean_dict(values: list[dict[str, float]]) -> dict[str, float]:
 
 def _tensor_losses_to_float(losses: dict[str, torch.Tensor]) -> dict[str, float]:
     return {key: float(value.detach().cpu().item()) for key, value in losses.items()}
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_name(f".{dst.name}.tmp")
+    shutil.copyfile(src, tmp_path)
+    os.replace(tmp_path, dst)
 
 
 def _save_checkpoint(
@@ -101,7 +112,7 @@ def _save_checkpoint(
     metrics: dict[str, Any],
     model_config: dict[str, Any],
 ) -> None:
-    torch.save(
+    _atomic_torch_save(
         {
             "state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -118,8 +129,10 @@ def _save_checkpoint(
 def _load_base_model(model: torch.nn.Module, base_model: Path, device: torch.device, logger: logging.Logger) -> None:
     checkpoint = base_model / "model.pt" if base_model.is_dir() else base_model
     if not checkpoint.exists():
-        raise FileNotFoundError(f"Base model checkpoint does not exist: {checkpoint}")
+        raise ModelLoadError(f"Base model checkpoint does not exist: {checkpoint}")
     state = torch.load(checkpoint, map_location=device, weights_only=False)
+    if not isinstance(state, dict):
+        raise ModelLoadError(f"Base model checkpoint {checkpoint} is not a valid JDLL UNet checkpoint")
     state_dict = state.get("state_dict", state)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     logger.info("Loaded base model %s (missing=%s unexpected=%s)", checkpoint, missing, unexpected)
@@ -140,7 +153,7 @@ def _save_previews(
     preview_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, _target in loader:
             images = images.to(device)
             logits = model(images).detach().cpu()
@@ -195,10 +208,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
 
     info = inspect_dataset(train_pairs + val_pairs)
     input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
-    if detected_task == "binary_semantic":
-        label_values = [1]
-    else:
-        label_values = info.label_values
+    label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
     if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
         output_channels = int(train_config.output_classes)
@@ -344,7 +354,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         model.eval()
         val_losses: list[dict[str, float]] = []
         val_metrics: list[dict[str, float]] = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for images, target_batch in val_loader:
                 images = images.to(device, non_blocking=True)
                 target_batch = _move_target(target_batch, device)
@@ -405,7 +415,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     best_path = output_dir / "weights_best.pt"
     if not best_path.exists():
         best_path = output_dir / "weights_last.pt"
-    shutil.copyfile(best_path, output_dir / "model.pt")
+    _atomic_copy(best_path, output_dir / "model.pt")
     result = {
         "model_dir": str(output_dir),
         "model_path": str(output_dir / "model.pt"),

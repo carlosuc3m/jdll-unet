@@ -4,8 +4,8 @@ import numpy as np
 import tifffile
 
 from jdll_unet.augment import apply_augmentation, make_augmentation_config
-from jdll_unet.task_detect import detect_task
 from jdll_unet.targets import binary_target, instance_targets, multiclass_target
+from jdll_unet.task_detect import detect_task
 
 
 def _write_dataset(root: Path, masks: list[np.ndarray]) -> None:

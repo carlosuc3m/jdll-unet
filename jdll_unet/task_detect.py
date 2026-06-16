@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
-from typing import Iterable
 
 import numpy as np
 
+from .errors import TaskDetectionError
 from .io import ImageMaskPair, discover_dataset, load_mask, read_class_names
 
 try:  # pragma: no cover - fallback exists for minimal environments
@@ -93,6 +94,10 @@ def detect_task_from_pairs(
 ) -> dict[str, object]:
     """Infer the task from mask statistics and lightweight metadata."""
 
+    requested_task = {"classes": "multiclass_semantic", "objects": "instance_friendly"}.get(
+        requested_task,
+        requested_task,
+    )
     if requested_task in SUPPORTED_TASKS:
         return {
             "task": requested_task,
@@ -101,7 +106,7 @@ def detect_task_from_pairs(
             "score": None,
         }
     if not pairs:
-        raise ValueError("Cannot detect task without image/mask pairs")
+        raise TaskDetectionError("Cannot detect task without image/mask pairs")
 
     dataset_root = Path(dataset_path) if dataset_path is not None else pairs[0].image.parent.parent
     metadata = _metadata_signals(dataset_root)
@@ -205,6 +210,8 @@ def detect_task(config: dict | str | Path) -> dict[str, object]:
         dataset_path = Path(config)
         requested = "auto"
     else:
+        if "dataset_path" not in config:
+            raise TaskDetectionError("detect_task config requires dataset_path")
         dataset_path = Path(config["dataset_path"])
         requested = str(config.get("task", "auto"))
         if requested == "classes":

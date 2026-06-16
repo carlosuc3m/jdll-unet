@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
-import json
 
 import imageio.v3 as imageio
 import numpy as np
 import tifffile
 
+from .errors import DataFormatError, DatasetError
 
 IMAGE_ALIASES = ("images", "image", "imgs", "img", "data")
 MASK_ALIASES = ("masks", "mask", "labels", "label", "gt")
@@ -85,14 +86,14 @@ def pair_images_and_masks(image_dir: Path, mask_dir: Path) -> list[ImageMaskPair
             continue
         if len(unique) > 1:
             names = ", ".join(path.name for path in unique)
-            raise ValueError(f"Ambiguous mask match for {image.name}: {names}")
+            raise DatasetError(f"Ambiguous mask match for {image.name}: {names}")
         pairs.append(ImageMaskPair(image=image, mask=unique[0], stem=_canonical_stem(image, IMAGE_SUFFIXES)))
 
     if missing:
         sample = ", ".join(missing[:5])
-        raise ValueError(f"Missing masks for {len(missing)} image(s): {sample}")
+        raise DatasetError(f"Missing masks for {len(missing)} image(s): {sample}")
     if not pairs:
-        raise ValueError(f"No image/mask pairs found in {image_dir} and {mask_dir}")
+        raise DatasetError(f"No image/mask pairs found in {image_dir} and {mask_dir}")
     return pairs
 
 
@@ -101,7 +102,9 @@ def discover_dataset(dataset_path: Path | str) -> DatasetSplits:
 
     root = Path(dataset_path)
     if not root.exists():
-        raise FileNotFoundError(f"Dataset path does not exist: {root}")
+        raise DatasetError(f"Dataset path does not exist: {root}")
+    if not root.is_dir():
+        raise DatasetError(f"Dataset path must be a directory: {root}")
 
     train_root = root / "train"
     val_root = root / "val"
@@ -120,19 +123,23 @@ def discover_dataset(dataset_path: Path | str) -> DatasetSplits:
     if image_dir and mask_dir:
         return DatasetSplits(train=pair_images_and_masks(image_dir, mask_dir), val=[], explicit_val=False)
 
-    raise ValueError(
+    raise DatasetError(
         "Unsupported dataset layout. Expected images/masks or train/images, train/masks, val/images, val/masks."
     )
 
 
 def load_array(path: Path | str) -> np.ndarray:
     path = Path(path)
+    if not path.exists():
+        raise DataFormatError(f"Image file does not exist: {path}")
+    if not path.is_file():
+        raise DataFormatError(f"Image path is not a file: {path}")
     suffix = path.suffix.lower()
     if suffix in {".tif", ".tiff"}:
         return tifffile.imread(path)
     if suffix in IMAGE_EXTENSIONS:
         return imageio.imread(path)
-    raise ValueError(f"Unsupported image format: {path.suffix}")
+    raise DataFormatError(f"Unsupported image format: {path.suffix}")
 
 
 def load_image(path: Path | str) -> np.ndarray:
@@ -142,12 +149,11 @@ def load_image(path: Path | str) -> np.ndarray:
     if arr.ndim == 2:
         out = arr[None, ...]
     elif arr.ndim == 3:
-        if arr.shape[-1] in {1, 3, 4} and arr.shape[0] not in {1, 3, 4}:
-            out = np.moveaxis(arr[..., :3], -1, 0)
-        else:
-            out = arr
+        out = np.moveaxis(arr[..., :3], -1, 0) if arr.shape[-1] in {1, 3, 4} and arr.shape[0] not in {1, 3, 4} else arr
     else:
-        raise ValueError(f"Unsupported image rank {arr.ndim} for {path}")
+        raise DataFormatError(f"Unsupported image rank {arr.ndim} for {path}")
+    if not np.all(np.isfinite(out)):
+        raise DataFormatError(f"Image {path} contains non-finite values")
     return np.ascontiguousarray(out.astype(np.float32, copy=False))
 
 
@@ -157,7 +163,7 @@ def _collapse_mask_channels(arr: np.ndarray, path: Path) -> np.ndarray:
     channels = arr[..., :3]
     if np.all(channels == channels[..., :1]):
         return channels[..., 0]
-    raise ValueError(
+    raise DataFormatError(
         f"Mask {path} has RGB channels that are not a duplicated label plane; "
         "store masks as single-channel integer label images."
     )
@@ -168,16 +174,16 @@ def load_mask(path: Path | str) -> np.ndarray:
 
     path = Path(path)
     if path.suffix.lower() in {".jpg", ".jpeg"}:
-        raise ValueError("JPEG masks are not supported because compression changes labels")
+        raise DataFormatError("JPEG masks are not supported because compression changes labels")
     arr = np.asarray(load_array(path))
     arr = _collapse_mask_channels(arr, path)
     if arr.ndim != 2:
-        raise ValueError(f"Only 2D masks are supported in this backend milestone, got shape {arr.shape}")
+        raise DataFormatError(f"Only 2D masks are supported in this backend milestone, got shape {arr.shape}")
     if np.issubdtype(arr.dtype, np.floating):
         if not np.all(np.isfinite(arr)):
-            raise ValueError(f"Mask {path} contains non-finite values")
+            raise DataFormatError(f"Mask {path} contains non-finite values")
         if not np.allclose(arr, np.round(arr)):
-            raise ValueError(f"Mask {path} contains non-integer floating values")
+            raise DataFormatError(f"Mask {path} contains non-integer floating values")
     return np.ascontiguousarray(arr.astype(np.int64, copy=False))
 
 
@@ -203,17 +209,17 @@ def normalize_image(image: np.ndarray, normalization: dict | object | None = Non
     if norm_type == "minmax":
         mins = img.reshape(img.shape[0], -1).min(axis=1)
         maxs = img.reshape(img.shape[0], -1).max(axis=1)
-        for channel, mn, mx in zip(range(img.shape[0]), mins, maxs):
+        for channel, mn, mx in zip(range(img.shape[0]), mins, maxs, strict=True):
             img[channel] = (img[channel] - mn) / max(float(mx - mn), eps)
         return img
     if norm_type == "zscore":
         means = img.reshape(img.shape[0], -1).mean(axis=1)
         stds = img.reshape(img.shape[0], -1).std(axis=1)
-        for channel, mean, std in zip(range(img.shape[0]), means, stds):
+        for channel, mean, std in zip(range(img.shape[0]), means, stds, strict=True):
             img[channel] = (img[channel] - mean) / max(float(std), eps)
         return img
     if norm_type != "percentile":
-        raise ValueError(f"Unsupported normalization type: {norm_type}")
+        raise DataFormatError(f"Unsupported normalization type: {norm_type}")
 
     for channel in range(img.shape[0]):
         lo, hi = np.percentile(img[channel], [low, high])

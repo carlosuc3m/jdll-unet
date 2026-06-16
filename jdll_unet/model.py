@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from .config import ArchitectureConfig, architecture_defaults
 
@@ -105,7 +105,7 @@ class UNet2D(nn.Module):
             skips.append(x)
             if index != len(self.encoders) - 1:
                 x = self.pool(x)
-        for upconv, decoder, skip in zip(self.upconvs, self.decoders, reversed(skips[:-1])):
+        for upconv, decoder, skip in zip(self.upconvs, self.decoders, reversed(skips[:-1]), strict=True):
             x = upconv(x)
             if x.shape[-2:] != skip.shape[-2:]:
                 x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
