@@ -6,9 +6,11 @@ import pytest
 import torch
 
 from jdll_unet.appose_api import infer as appose_infer
+from jdll_unet.callbacks import CallbackDispatcher
 from jdll_unet.config import architecture_defaults, parse_training_config, write_json
 from jdll_unet.errors import ConfigError, InferenceError
 from jdll_unet.infer import clear_model_cache, infer
+from jdll_unet.losses import compute_loss, primary_logits
 from jdll_unet.model import build_unet
 from jdll_unet.postprocess import postprocess_binary
 
@@ -95,6 +97,52 @@ def test_appose_api_emits_error_update_on_failure():
     assert updates[-1]["error_class"] == "InferenceError"
 
 
+class _ApposeLikeTask:
+    def __init__(self) -> None:
+        self.updates = []
+
+    def update(self, *, message, current, maximum, info):
+        self.updates.append({"message": message, "current": current, "maximum": maximum, "info": info})
+
+
+def test_callback_dispatcher_supports_appose_and_callables():
+    task = _ApposeLikeTask()
+    callable_events = []
+    dispatcher = CallbackDispatcher([task, callable_events.append])
+
+    assert dispatcher.emit("progress", message="hello", current=1, maximum=2, step=1)
+
+    assert task.updates[0]["message"] == "hello"
+    assert task.updates[0]["current"] == 1
+    assert task.updates[0]["maximum"] == 2
+    assert task.updates[0]["info"]["type"] == "progress"
+    assert callable_events[0]["type"] == "progress"
+    assert callable_events[0]["message"] == "hello"
+
+
+def test_callback_dispatcher_can_request_cancellation():
+    dispatcher = CallbackDispatcher(lambda _event: False)
+
+    assert dispatcher.emit("progress", step=1) is False
+    assert dispatcher.cancel_requested()
+
+
 def test_postprocess_rejects_invalid_options():
     with pytest.raises(InferenceError, match="threshold"):
         postprocess_binary(np.zeros((8, 8), dtype=np.float32), threshold=2.0)
+
+
+def test_resenc_architecture_and_deep_supervision_outputs():
+    arch = architecture_defaults("resenc-tiny-2d", input_channels=1, output_channels=1, deep_supervision=True)
+    model = build_unet(arch)
+    outputs = model(torch.zeros((2, 1, 32, 32)))
+
+    assert arch.block_type == "residual"
+    assert isinstance(outputs, list)
+    assert primary_logits(outputs).shape == (2, 1, 32, 32)
+    assert outputs[1].shape[-2:] == (16, 16)
+
+    target = torch.zeros((2, 1, 32, 32))
+    loss, components = compute_loss("binary_semantic", outputs, target)
+    assert loss.isfinite()
+    assert "deep_supervision_loss" in components

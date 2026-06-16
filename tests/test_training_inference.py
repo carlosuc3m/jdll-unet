@@ -63,3 +63,117 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
     assert inference["metadata"]["task"] == "binary_semantic"
     assert inference["outputs"]["foreground_probability"].shape == (32, 32)
     assert inference["outputs"]["mask"].shape == (32, 32)
+
+
+def test_training_emits_callback_events_and_png_previews(tmp_path: Path):
+    dataset = tmp_path / "dataset"
+    _synthetic_dataset(dataset)
+    output_dir = tmp_path / "callback_model"
+    events = []
+
+    result = train(
+        {
+            "model_name": "callback-smoke",
+            "output_dir": str(output_dir),
+            "dataset_path": str(dataset),
+            "architecture": "tiny-2d",
+            "device": "cpu",
+            "epochs": 1,
+            "seed": 111,
+            "patch_size": [32, 32],
+            "batch_size": 2,
+            "preview_count": 1,
+            "progress_update_interval": 1,
+            "augmentation": {
+                "flip_probability": 0.0,
+                "rotate90_probability": 0.0,
+                "brightness_probability": 0.0,
+                "contrast_probability": 0.0,
+                "gamma_probability": 0.0,
+                "noise_probability": 0.0,
+            },
+        },
+        task=events.append,
+    )
+
+    event_types = [event["type"] for event in events]
+    assert "progress" in event_types
+    assert "preview" in event_types
+    assert event_types[-1] == "complete"
+    preview_event = next(event for event in events if event["type"] == "preview")
+    assert Path(preview_event["preview_path"]).is_absolute()
+    assert Path(preview_event["latest_preview_path"]).exists()
+    assert result["latest_preview_path"] == preview_event["latest_preview_path"]
+    assert (output_dir / "previews" / "preview_000_image.png").exists()
+    assert (output_dir / "previews" / "preview_000_target.png").exists()
+    assert (output_dir / "previews" / "preview_000_prediction.png").exists()
+    assert (output_dir / "previews" / "preview_000_overlay.png").exists()
+
+
+def test_training_callback_can_cancel(tmp_path: Path):
+    dataset = tmp_path / "dataset"
+    _synthetic_dataset(dataset)
+    output_dir = tmp_path / "cancelled_model"
+
+    def cancel_on_progress(event):
+        return False if event["type"] == "progress" else None
+
+    result = train(
+        {
+            "model_name": "cancel-smoke",
+            "output_dir": str(output_dir),
+            "dataset_path": str(dataset),
+            "architecture": "tiny-2d",
+            "device": "cpu",
+            "epochs": 2,
+            "seed": 222,
+            "patch_size": [32, 32],
+            "batch_size": 2,
+            "preview_count": 0,
+            "progress_update_interval": 1,
+        },
+        task=cancel_on_progress,
+    )
+
+    assert result["cancelled"] is True
+    assert (output_dir / "weights_last.pt").exists()
+
+
+def test_resenc_deep_supervision_training_smoke(tmp_path: Path):
+    dataset = tmp_path / "dataset"
+    _synthetic_dataset(dataset)
+    output_dir = tmp_path / "resenc_model"
+
+    result = train(
+        {
+            "model_name": "resenc-smoke",
+            "output_dir": str(output_dir),
+            "dataset_path": str(dataset),
+            "architecture": "resenc-tiny-2d",
+            "deep_supervision": True,
+            "device": "cpu",
+            "epochs": 1,
+            "seed": 321,
+            "patch_size": [32, 32],
+            "batch_size": 2,
+            "preview_count": 0,
+            "augmentation": {
+                "flip_probability": 0.0,
+                "rotate90_probability": 0.0,
+                "brightness_probability": 0.0,
+                "contrast_probability": 0.0,
+                "gamma_probability": 0.0,
+                "noise_probability": 0.0,
+            },
+        }
+    )
+
+    assert result["config"]["architecture_config"]["block_type"] == "residual"
+    assert result["config"]["architecture_config"]["deep_supervision"] is True
+    assert "deep_supervision_loss" in result["metrics"]["train_losses"]
+
+    inference = infer(
+        {"model_path": str(output_dir / "model.pt"), "device": "cpu", "tile_size": [32, 32]},
+        {"image_path": str(dataset / "images" / "sample_0.tif")},
+    )
+    assert inference["outputs"]["foreground_probability"].shape == (32, 32)

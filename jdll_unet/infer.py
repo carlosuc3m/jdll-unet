@@ -11,9 +11,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .callbacks import CallbackDispatcher
 from .config import ArchitectureConfig, read_json, resolve_device
 from .errors import InferenceError, ModelLoadError
 from .io import load_image, normalize_image
+from .losses import primary_logits
 from .model import build_unet
 from .postprocess import postprocess_binary, postprocess_instance, postprocess_multiclass
 
@@ -136,7 +138,7 @@ def tiled_predict(
             for x in xs:
                 patch = image[:, y : y + tile_size[0], x : x + tile_size[1]]
                 patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
-                logits = model(patch_t)[0]
+                logits = primary_logits(model(patch_t))[0]
                 if logits.shape[-2:] != tuple(tile_size):
                     logits = F.interpolate(logits[None], size=tile_size, mode="bilinear", align_corners=False)[0]
                 accum[:, y : y + tile_size[0], x : x + tile_size[1]] += logits
@@ -228,10 +230,5 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "input_shape": list(image.shape),
         "output_keys": sorted(outputs),
     }
-    if task is not None:
-        update = getattr(task, "update", None)
-        if callable(update):
-            update({"type": "complete", **metadata})
-        elif callable(task):
-            task({"type": "complete", **metadata})
+    CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)
     return {"metadata": metadata, "outputs": outputs}

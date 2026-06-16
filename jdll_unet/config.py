@@ -57,6 +57,8 @@ class ArchitectureConfig:
     dropout: float = 0.0
     dimensions: str = "2d"
     context_slices: int = 3
+    block_type: str = "conv"
+    deep_supervision: bool = False
 
 
 @dataclass(slots=True)
@@ -85,6 +87,9 @@ class TrainingConfig:
     augmentation_profile: str = AUTO
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
+    deep_supervision: bool | str = False
+    progress_update_interval: int | str = AUTO
+    log_update_interval: int | str = AUTO
     save_every_epoch: bool = True
     preview_count: int = 20
     normalization: NormalizationConfig = field(default_factory=NormalizationConfig)
@@ -244,6 +249,9 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             augmentation_profile=str(raw.get("augmentation_profile", AUTO)),
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
+            deep_supervision=_auto_or_bool(raw.get("deep_supervision", False), "deep_supervision"),
+            progress_update_interval=_auto_or_int(raw.get("progress_update_interval", AUTO), "progress_update_interval"),
+            log_update_interval=_auto_or_int(raw.get("log_update_interval", AUTO), "log_update_interval"),
             save_every_epoch=_coerce_bool(raw.get("save_every_epoch", True), "save_every_epoch"),
             preview_count=int(raw.get("preview_count", 20)),
             normalization=_nested_dataclass(NormalizationConfig, raw.get("normalization")),
@@ -281,6 +289,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_auto_positive_int(parsed.input_channels, "input_channels")
     _validate_auto_positive_int(parsed.output_classes, "output_classes")
     _validate_auto_positive_int(parsed.batch_size, "batch_size")
+    _validate_auto_positive_int(parsed.progress_update_interval, "progress_update_interval")
+    _validate_auto_positive_int(parsed.log_update_interval, "log_update_interval")
     _validate_auto_positive_float(parsed.learning_rate, "learning_rate")
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
@@ -312,10 +322,12 @@ def architecture_defaults(
     input_channels: int = 1,
     output_channels: int = 1,
     normalization: str = "batch",
+    deep_supervision: bool = False,
 ) -> ArchitectureConfig:
     name = architecture.lower()
     dimensions = "2.5d" if "2.5" in name or "25d" in name else "2d"
-    if name.startswith("medium"):
+    block_type = "residual" if name.startswith("resenc") or name.startswith("residual") else "conv"
+    if name.startswith("medium") or name.startswith("resenc-medium") or name.startswith("residual-medium"):
         return ArchitectureConfig(
             name=architecture,
             input_channels=input_channels,
@@ -324,8 +336,10 @@ def architecture_defaults(
             depth=4,
             normalization=normalization,
             dimensions=dimensions,
+            block_type=block_type,
+            deep_supervision=deep_supervision,
         )
-    if name.startswith("tiny"):
+    if name.startswith("tiny") or name.startswith("resenc-tiny") or name.startswith("residual-tiny"):
         return ArchitectureConfig(
             name=architecture,
             input_channels=input_channels,
@@ -334,19 +348,21 @@ def architecture_defaults(
             depth=3,
             normalization=normalization,
             dimensions=dimensions,
+            block_type=block_type,
+            deep_supervision=deep_supervision,
         )
     raise ConfigError(f"Unsupported architecture: {architecture}")
 
 
 def default_patch_size(architecture: str, image_shape: tuple[int, int] | None = None) -> tuple[int, int]:
-    preferred = (128, 128) if architecture.lower().startswith("medium") else (96, 96)
+    preferred = (128, 128) if "medium" in architecture.lower() else (96, 96)
     if image_shape is None:
         return preferred
     return (min(preferred[0], int(image_shape[0])), min(preferred[1], int(image_shape[1])))
 
 
 def default_batch_size(architecture: str, device: torch.device) -> int:
-    if architecture.lower().startswith("medium"):
+    if "medium" in architecture.lower():
         return 2 if device.type == "cpu" else 4
     return 4 if device.type == "cpu" else 8
 
@@ -366,17 +382,25 @@ def default_mixed_precision(value: bool | str, device: torch.device) -> bool:
 def default_foreground_probability(task: str, architecture: str) -> float:
     if task == "instance_friendly":
         return 0.67
-    if architecture.lower().startswith("medium"):
+    if "medium" in architecture.lower():
         return 0.5
     return 0.4
 
 
 def default_augmentation_profile(architecture: str, device: torch.device) -> str:
-    if architecture.lower().startswith("medium") and device.type in {"cuda", "mps"}:
+    if "medium" in architecture.lower() and device.type in {"cuda", "mps"}:
         return "balanced"
-    if architecture.lower().startswith("medium"):
+    if "medium" in architecture.lower():
         return "light-balanced"
     return "fast"
+
+
+def default_progress_update_interval(device: torch.device) -> int:
+    return 1 if device.type == "cpu" else 5
+
+
+def default_log_update_interval(device: torch.device) -> int:
+    return 10 if device.type == "cpu" else 50
 
 
 def model_folder_config(

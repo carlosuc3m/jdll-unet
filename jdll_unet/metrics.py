@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from .losses import Logits, primary_logits
+
 try:  # pragma: no cover
     from scipy import ndimage as ndi
 except Exception:  # pragma: no cover
@@ -66,9 +68,10 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> d
 
 def compute_metrics(
     task: str,
-    logits: torch.Tensor,
+    logits: Logits,
     target: torch.Tensor | dict[str, torch.Tensor],
 ) -> dict[str, float]:
+    logits = primary_logits(logits)
     if task == "binary_semantic":
         assert isinstance(target, torch.Tensor)
         return binary_metrics(logits, target)

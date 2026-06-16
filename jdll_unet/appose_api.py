@@ -4,20 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from .callbacks import CallbackDispatcher
 from .infer import infer as _infer
 from .task_detect import detect_task as _detect_task
 from .trainer import train as _train
 
 
 def _emit_error(task: Any, exc: Exception) -> None:
-    if task is None:
-        return
-    payload = {"type": "error", "error_class": exc.__class__.__name__, "message": str(exc)}
-    update = getattr(task, "update", None)
-    if callable(update):
-        update(payload)
-    elif callable(task):
-        task(payload)
+    CallbackDispatcher(task).emit("error", message=str(exc), error_class=exc.__class__.__name__)
 
 
 def train(config: dict, task: Any = None) -> dict:

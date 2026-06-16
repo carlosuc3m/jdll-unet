@@ -62,6 +62,45 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
+class ResidualEncoderBlock(nn.Module):
+    """Residual encoder block used by the ResEnc UNet variants."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        convs_per_level: int = 2,
+        normalization: str = "batch",
+        activation: str = "relu",
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if convs_per_level < 1:
+            raise ValueError("convs_per_level must be at least 1")
+        layers: list[nn.Module] = []
+        current = in_channels
+        for index in range(convs_per_level):
+            layers.append(nn.Conv2d(current, out_channels, kernel_size=3, padding=1, bias=False))
+            layers.append(_normalization(normalization, out_channels))
+            if index != convs_per_level - 1:
+                layers.append(_activation(activation))
+                if dropout > 0:
+                    layers.append(nn.Dropout2d(dropout))
+            current = out_channels
+        self.body = nn.Sequential(*layers)
+        self.projection = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        )
+        self.activation = _activation(activation)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.body(x) + self.projection(x)
+        return self.dropout(self.activation(out))
+
+
 class UNet2D(nn.Module):
     def __init__(self, config: ArchitectureConfig) -> None:
         super().__init__()
@@ -69,9 +108,10 @@ class UNet2D(nn.Module):
         channels = [config.base_channels * (2**level) for level in range(config.depth)]
         self.encoders = nn.ModuleList()
         in_channels = config.input_channels
+        encoder_block = ResidualEncoderBlock if config.block_type == "residual" else ConvBlock
         for out_channels in channels:
             self.encoders.append(
-                ConvBlock(
+                encoder_block(
                     in_channels,
                     out_channels,
                     convs_per_level=config.convs_per_level,
@@ -84,6 +124,7 @@ class UNet2D(nn.Module):
         self.pool = nn.MaxPool2d(2)
         self.upconvs = nn.ModuleList()
         self.decoders = nn.ModuleList()
+        self.deep_supervision_heads = nn.ModuleList()
         for level in range(config.depth - 1, 0, -1):
             self.upconvs.append(nn.ConvTranspose2d(channels[level], channels[level - 1], kernel_size=2, stride=2))
             self.decoders.append(
@@ -96,22 +137,34 @@ class UNet2D(nn.Module):
                     dropout=config.dropout,
                 )
             )
+            if config.deep_supervision and level > 1:
+                self.deep_supervision_heads.append(nn.Conv2d(channels[level - 1], config.output_channels, kernel_size=1))
         self.out = nn.Conv2d(channels[0], config.output_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
         skips: list[torch.Tensor] = []
         for index, encoder in enumerate(self.encoders):
             x = encoder(x)
             skips.append(x)
             if index != len(self.encoders) - 1:
                 x = self.pool(x)
-        for upconv, decoder, skip in zip(self.upconvs, self.decoders, reversed(skips[:-1]), strict=True):
+        auxiliary_outputs: list[torch.Tensor] = []
+        head_index = 0
+        for decoder_index, (upconv, decoder, skip) in enumerate(
+            zip(self.upconvs, self.decoders, reversed(skips[:-1]), strict=True)
+        ):
             x = upconv(x)
             if x.shape[-2:] != skip.shape[-2:]:
                 x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
             x = torch.cat([skip, x], dim=1)
             x = decoder(x)
-        return self.out(x)
+            if self.config.deep_supervision and decoder_index < len(self.decoders) - 1:
+                auxiliary_outputs.append(self.deep_supervision_heads[head_index](x))
+                head_index += 1
+        primary = self.out(x)
+        if not self.config.deep_supervision:
+            return primary
+        return [primary, *auxiliary_outputs]
 
 
 def build_unet(

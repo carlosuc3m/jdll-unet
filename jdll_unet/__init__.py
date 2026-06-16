@@ -1,9 +1,12 @@
 """Lightweight JDLL-owned UNet backend."""
 
 from .appose_api import detect_task, infer, train
+from .callbacks import CallbackDispatcher, CallbackEvent
 from .errors import ConfigError, DataFormatError, DatasetError, InferenceError, JdllUnetError, ModelLoadError
 
 __all__ = [
+    "CallbackDispatcher",
+    "CallbackEvent",
     "ConfigError",
     "DataFormatError",
     "DatasetError",

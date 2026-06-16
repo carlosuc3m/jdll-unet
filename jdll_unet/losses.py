@@ -5,6 +5,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+Logits = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
+Target = torch.Tensor | dict[str, torch.Tensor]
+
+
+def primary_logits(logits: Logits) -> torch.Tensor:
+    return logits[0] if isinstance(logits, (list, tuple)) else logits
+
 
 def binary_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     probs = torch.sigmoid(logits)
@@ -39,8 +46,41 @@ def focal_binary_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float =
 
 def compute_loss(
     task: str,
+    logits: Logits,
+    target: Target,
+    weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if isinstance(logits, (list, tuple)):
+        primary_loss, components = _compute_single_loss(task, logits[0], target, weights)
+        aux_losses = []
+        for index, aux_logits in enumerate(logits[1:]):
+            aux_target = resize_target_for_logits(task, target, aux_logits)
+            aux_loss, _aux_components = _compute_single_loss(task, aux_logits, aux_target, weights)
+            aux_losses.append((0.5 ** (index + 1), aux_loss))
+        if not aux_losses:
+            return primary_loss, components
+        total_weight = 1.0 + sum(weight for weight, _loss in aux_losses)
+        aux_weighted = sum(weight * aux_loss for weight, aux_loss in aux_losses)
+        total = (primary_loss + aux_weighted) / total_weight
+        components["deep_supervision_loss"] = (aux_weighted / (total_weight - 1.0)).detach()
+        return total, components
+    return _compute_single_loss(task, logits, target, weights)
+
+
+def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) -> Target:
+    size = logits.shape[-2:]
+    if task == "multiclass_semantic":
+        assert isinstance(target, torch.Tensor)
+        return F.interpolate(target[:, None].float(), size=size, mode="nearest")[:, 0].long()
+    if isinstance(target, dict):
+        return {key: F.interpolate(value.float(), size=size, mode="nearest") for key, value in target.items()}
+    return F.interpolate(target.float(), size=size, mode="nearest")
+
+
+def _compute_single_loss(
+    task: str,
     logits: torch.Tensor,
-    target: torch.Tensor | dict[str, torch.Tensor],
+    target: Target,
     weights: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or {}

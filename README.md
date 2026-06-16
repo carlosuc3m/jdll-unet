@@ -15,6 +15,21 @@ inference for binary semantic, multiclass semantic, and instance-friendly
 segmentation datasets laid out as `images/` and `masks/`, or as explicit
 `train/images`, `train/masks`, `val/images`, and `val/masks` folders.
 
+## Architectures
+
+Available 2D architecture names:
+
+- `tiny-2d`: compact baseline UNet for CPU-friendly training.
+- `medium-2d`: wider/deeper baseline UNet for GPUs or longer CPU runs.
+- `resenc-tiny-2d`: tiny UNet with residual encoder blocks.
+- `resenc-medium-2d`: medium UNet with residual encoder blocks.
+
+The `resenc-*` variants keep the UNet encoder-decoder shape but replace encoder
+conv blocks with residual blocks for better gradient flow. Deep supervision can
+be enabled with `"deep_supervision": true`; the trainer then applies auxiliary
+losses to intermediate decoder outputs while inference still uses the primary
+full-resolution output.
+
 ## Install
 
 ```bash
@@ -33,6 +48,7 @@ result = train(
         "dataset_path": "datasets/cells",
         "starting_point": "scratch",
         "architecture": "tiny-2d",
+        "deep_supervision": False,
         "device": "auto",
         "epochs": 100,
         "seed": 42,
@@ -44,6 +60,20 @@ print(result["model_path"])
 Training writes `config.json`, `weights_best.pt`, `weights_last.pt`,
 `model.pt`, `training.log`, `metrics.json`, and optional previews into the
 model folder.
+
+## Callbacks
+
+Training and inference accept the optional `task` argument as a generic
+callback target. Supported forms:
+
+- Appose-style object exposing `update(message=..., current=..., maximum=..., info=...)`.
+- Callable accepting one flat event payload dictionary.
+- Object exposing `emit(payload)`.
+- A list or tuple containing any mix of the above.
+
+Every event payload contains a string `type`, such as `progress`, `preview`,
+`warning`, `complete`, `cancelled`, or `error`. A callable can return `False`
+to request cooperative cancellation during training.
 
 ## Minimal Inference Example
 
