@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from jdll_unet.appose_api import infer as appose_infer
 from jdll_unet.callbacks import CallbackDispatcher
@@ -26,6 +27,9 @@ def _base_config(tmp_path: Path) -> dict:
 def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
     config = parse_training_config({**_base_config(tmp_path), "save_every_epoch": "false"})
     assert config.save_every_epoch is False
+    assert config.model_normalization == "group"
+    assert parse_training_config({**_base_config(tmp_path), "network_normalization": "batch"}).model_normalization == "batch"
+    assert parse_training_config({**_base_config(tmp_path), "architecture_normalization": "identity"}).model_normalization == "none"
 
     with pytest.raises(ConfigError, match="foreground_probability"):
         parse_training_config({**_base_config(tmp_path), "foreground_probability": 2.0})
@@ -35,6 +39,9 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
 
     with pytest.raises(ConfigError, match="model_name"):
         parse_training_config({**_base_config(tmp_path), "model_name": "bad/name"})
+
+    with pytest.raises(ConfigError, match="model_normalization"):
+        parse_training_config({**_base_config(tmp_path), "model_normalization": "layer"})
 
 
 def test_write_json_is_readable_after_atomic_write(tmp_path: Path):
@@ -138,6 +145,8 @@ def test_resenc_architecture_and_deep_supervision_outputs():
     outputs = model(torch.zeros((2, 1, 32, 32)))
 
     assert arch.block_type == "residual"
+    assert arch.normalization == "group"
+    assert any(isinstance(module, nn.GroupNorm) for module in model.modules())
     assert isinstance(outputs, list)
     assert primary_logits(outputs).shape == (2, 1, 32, 32)
     assert outputs[1].shape[-2:] == (16, 16)

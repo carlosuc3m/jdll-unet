@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import tifffile
+import torch
 
 from jdll_unet.appose_api import infer, train
 
@@ -52,8 +54,16 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
     )
 
     assert result["task"] == "binary_semantic"
+    assert result["lr_scheduler"]["type"] == "poly"
+    assert result["metrics"]["learning_rate"] < 0.001
+    assert result["config"]["architecture_config"]["normalization"] == "group"
     for name in ("config.json", "weights_best.pt", "weights_last.pt", "model.pt", "training.log", "metrics.json"):
         assert (output_dir / name).exists()
+    config = json.loads((output_dir / "config.json").read_text())
+    assert config["training"]["lr_scheduler"]["type"] == "poly"
+    assert config["training"]["model_normalization"] == "group"
+    checkpoint = torch.load(output_dir / "weights_last.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["scheduler_state_dict"]["type"] == "poly"
 
     inference = infer(
         {"model_path": str(output_dir / "model.pt"), "device": "cpu", "tile_size": [32, 32]},

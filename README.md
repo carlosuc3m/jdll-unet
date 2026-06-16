@@ -30,6 +30,11 @@ be enabled with `"deep_supervision": true`; the trainer then applies auxiliary
 losses to intermediate decoder outputs while inference still uses the primary
 full-resolution output.
 
+Convolutional UNet blocks use group normalization by default because it is
+stable for the small batches common in biomedical segmentation. Set
+`"model_normalization"` to `group`, `instance`, `batch`, or `none` to override
+the default. This is separate from the image-intensity `"normalization"` setting.
+
 ## Install
 
 ```bash
@@ -49,6 +54,8 @@ result = train(
         "starting_point": "scratch",
         "architecture": "tiny-2d",
         "deep_supervision": False,
+        "model_normalization": "group",
+        "lr_scheduler": {"type": "poly"},
         "device": "auto",
         "epochs": 100,
         "seed": 42,
@@ -60,6 +67,29 @@ print(result["model_path"])
 Training writes `config.json`, `weights_best.pt`, `weights_last.pt`,
 `model.pt`, `training.log`, `metrics.json`, and optional previews into the
 model folder.
+
+## Learning Rate Scheduling
+
+Training uses polynomial decay by default:
+
+```python
+"lr_scheduler": {
+    "type": "poly",
+    "min_lr": 0.0,
+    "poly_power": 0.9,
+}
+```
+
+Supported scheduler types:
+
+- `poly`: per-step polynomial decay from `learning_rate` to `min_lr`; this is the default.
+- `cosine`: per-step cosine annealing from `learning_rate` to `min_lr`.
+- `plateau`: epoch-level reduction when the validation score stops improving, using `plateau_factor`, `plateau_patience`, and `plateau_threshold`.
+- `none`: constant learning rate.
+
+For convenience, `lr_scheduler` may be either a string such as `"cosine"` or a
+mapping with scheduler options. `learning_rate_scheduler` and `scheduler` are
+accepted as aliases.
 
 ## Callbacks
 

@@ -40,6 +40,7 @@ from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .postprocess import postprocess_instance
+from .schedulers import LearningRateScheduler
 from .targets import target_output_channels
 from .task_detect import detect_task_from_pairs
 
@@ -107,6 +108,7 @@ def _save_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: LearningRateScheduler | None,
     epoch: int,
     task: str,
     arch: ArchitectureConfig,
@@ -117,6 +119,7 @@ def _save_checkpoint(
         {
             "state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "epoch": epoch,
             "task": task,
             "model_config": model_config,
@@ -347,6 +350,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         train_config.architecture,
         input_channels=input_channels,
         output_channels=output_channels,
+        normalization=train_config.model_normalization,
         deep_supervision=deep_supervision,
     )
     model = build_unet(arch).to(device)
@@ -395,6 +399,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     )
     optimizer_cls = torch.optim.AdamW if train_config.optimizer == "adamw" else torch.optim.Adam
     optimizer = optimizer_cls(model.parameters(), lr=learning_rate, weight_decay=train_config.weight_decay)
+    total_steps = len(train_loader) * train_config.epochs
+    lr_scheduler = LearningRateScheduler(optimizer, train_config.lr_scheduler, total_steps=total_steps)
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
     except AttributeError:  # pragma: no cover - older torch fallback
@@ -413,18 +419,19 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "patch_size": list(patch_size),
             "batch_size": batch_size,
             "learning_rate": learning_rate,
+            "model_normalization": train_config.model_normalization,
             "foreground_oversampling": foreground_oversampling,
             "foreground_probability": foreground_probability,
             "augmentation_profile": augmentation_profile,
             "mixed_precision": mixed_precision,
             "deep_supervision": deep_supervision,
+            "lr_scheduler": lr_scheduler.config_dict(),
         }
     )
     write_json(output_dir / "config.json", model_config)
 
     history: list[dict[str, Any]] = []
     best_score = -float("inf")
-    total_steps = len(train_loader) * train_config.epochs
     global_step = 0
     latest_preview_path: str | None = None
     for epoch in range(1, train_config.epochs + 1):
@@ -432,7 +439,18 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         train_losses: list[dict[str, float]] = []
         for images, target_batch in train_loader:
             if callbacks.cancel_requested():
-                return _cancel_training(callbacks, output_dir, model, optimizer, epoch, global_step, detected_task, arch, model_config)
+                return _cancel_training(
+                    callbacks,
+                    output_dir,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    epoch,
+                    global_step,
+                    detected_task,
+                    arch,
+                    model_config,
+                )
             global_step += 1
             images = images.to(device, non_blocking=True)
             target_batch = _move_target(target_batch, device)
@@ -443,6 +461,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            lr_scheduler.step_batch()
             component_floats = _tensor_losses_to_float(components)
             component_floats["total_loss"] = float(loss.detach().cpu().item())
             train_losses.append(component_floats)
@@ -460,10 +479,22 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 step=global_step,
                 total_epochs=train_config.epochs,
                 total_steps=total_steps,
+                learning_rate=lr_scheduler.current_lr,
                 losses={f"train/{key}": value for key, value in component_floats.items()},
                 metrics={},
             ):
-                return _cancel_training(callbacks, output_dir, model, optimizer, epoch, global_step, detected_task, arch, model_config)
+                return _cancel_training(
+                    callbacks,
+                    output_dir,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    epoch,
+                    global_step,
+                    detected_task,
+                    arch,
+                    model_config,
+                )
 
         model.eval()
         val_losses: list[dict[str, float]] = []
@@ -485,8 +516,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "val_losses": _mean_dict(val_losses),
             "val_metrics": _mean_dict(val_metrics),
         }
-        history.append(epoch_record)
         score = primary_metric(detected_task, epoch_record["val_metrics"])
+        lr_scheduler.step_epoch(score)
+        epoch_record["learning_rate"] = lr_scheduler.current_lr
+        history.append(epoch_record)
         logger.info("epoch=%s train=%s val=%s metrics=%s", epoch, epoch_record["train_losses"], epoch_record["val_losses"], epoch_record["val_metrics"])
         if not callbacks.emit(
             "progress",
@@ -497,15 +530,28 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             step=global_step,
             total_epochs=train_config.epochs,
             total_steps=total_steps,
+            learning_rate=lr_scheduler.current_lr,
             losses={f"val/{key}": value for key, value in epoch_record["val_losses"].items()},
             metrics={f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
         ):
-            return _cancel_training(callbacks, output_dir, model, optimizer, epoch, global_step, detected_task, arch, model_config)
+            return _cancel_training(
+                callbacks,
+                output_dir,
+                model,
+                optimizer,
+                lr_scheduler,
+                epoch,
+                global_step,
+                detected_task,
+                arch,
+                model_config,
+            )
 
         _save_checkpoint(
             output_dir / "weights_last.pt",
             model,
             optimizer,
+            lr_scheduler,
             epoch,
             detected_task,
             arch,
@@ -518,6 +564,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 output_dir / "weights_best.pt",
                 model,
                 optimizer,
+                lr_scheduler,
                 epoch,
                 detected_task,
                 arch,
@@ -548,6 +595,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "epochs": train_config.epochs,
         "best_score": best_score,
         "metrics": history[-1] if history else {},
+        "learning_rate": lr_scheduler.current_lr,
+        "lr_scheduler": lr_scheduler.state_dict(),
         "metrics_path": str(output_dir / "metrics.json"),
         "config_path": str(output_dir / "config.json"),
         "latest_preview_path": latest_preview_path,
@@ -563,6 +612,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         task=detected_task,
         epochs=train_config.epochs,
         best_score=best_score,
+        learning_rate=lr_scheduler.current_lr,
         metrics_path=result["metrics_path"],
         config_path=result["config_path"],
         latest_preview_path=latest_preview_path,
@@ -576,6 +626,7 @@ def _cancel_training(
     output_dir: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: LearningRateScheduler,
     epoch: int,
     step: int,
     task: str,
@@ -586,6 +637,7 @@ def _cancel_training(
         output_dir / "weights_last.pt",
         model,
         optimizer,
+        scheduler,
         epoch,
         task,
         arch,

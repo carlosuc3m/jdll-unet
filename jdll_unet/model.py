@@ -42,7 +42,7 @@ class ConvBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         convs_per_level: int = 2,
-        normalization: str = "batch",
+        normalization: str = "group",
         activation: str = "relu",
         dropout: float = 0.0,
     ) -> None:
@@ -70,7 +70,7 @@ class ResidualEncoderBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         convs_per_level: int = 2,
-        normalization: str = "batch",
+        normalization: str = "group",
         activation: str = "relu",
         dropout: float = 0.0,
     ) -> None:
@@ -171,7 +171,7 @@ def build_unet(
     architecture: str | ArchitectureConfig = "tiny-2d",
     input_channels: int = 1,
     output_channels: int = 1,
-    normalization: str = "batch",
+    normalization: str = "group",
 ) -> UNet2D:
     if isinstance(architecture, ArchitectureConfig):
         config = architecture

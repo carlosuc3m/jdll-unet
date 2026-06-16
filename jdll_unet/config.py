@@ -16,6 +16,8 @@ from .errors import ConfigError
 AUTO = "auto"
 SUPPORTED_TASKS = {"auto", "binary_semantic", "multiclass_semantic", "instance_friendly", "classes", "objects"}
 SUPPORTED_AUGMENTATION_PROFILES = {"auto", "fast", "light-balanced", "balanced", "strong"}
+SUPPORTED_LR_SCHEDULERS = {"poly", "cosine", "plateau", "none", "constant"}
+SUPPORTED_MODEL_NORMALIZATIONS = {"group", "instance", "batch", "none", "identity"}
 DEFAULT_LOSS_WEIGHTS = {
     "dice": 1.0,
     "bce": 1.0,
@@ -45,6 +47,16 @@ class PostprocessingConfig:
 
 
 @dataclass(slots=True)
+class LRSchedulerConfig:
+    type: str = "poly"
+    min_lr: float = 0.0
+    poly_power: float = 0.9
+    plateau_factor: float = 0.5
+    plateau_patience: int = 5
+    plateau_threshold: float = 1e-4
+
+
+@dataclass(slots=True)
 class ArchitectureConfig:
     name: str = "tiny-2d"
     input_channels: int = 1
@@ -52,7 +64,7 @@ class ArchitectureConfig:
     base_channels: int = 16
     depth: int = 3
     convs_per_level: int = 2
-    normalization: str = "batch"
+    normalization: str = "group"
     activation: str = "relu"
     dropout: float = 0.0
     dimensions: str = "2d"
@@ -76,11 +88,13 @@ class TrainingConfig:
     axes: str = AUTO
     input_channels: int | str = AUTO
     output_classes: int | str = AUTO
+    model_normalization: str = "group"
     patch_size: tuple[int, int] | str = AUTO
     batch_size: int | str = AUTO
     learning_rate: float | str = AUTO
     optimizer: str = "adamw"
     weight_decay: float = 1e-5
+    lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     validation_fraction: float = 0.15
     foreground_oversampling: bool | str = AUTO
     foreground_probability: float | str = AUTO
@@ -170,6 +184,22 @@ def _nested_dataclass(cls: type, value: Any):
     raise ConfigError(f"Expected mapping for {cls.__name__}")
 
 
+def _lr_scheduler_config(value: Any) -> LRSchedulerConfig:
+    if value is None:
+        return LRSchedulerConfig()
+    if isinstance(value, LRSchedulerConfig):
+        return value
+    if isinstance(value, str):
+        return LRSchedulerConfig(type=value)
+    if isinstance(value, Mapping):
+        valid = {field.name for field in LRSchedulerConfig.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        unknown = sorted(set(value) - valid)
+        if unknown:
+            raise ConfigError(f"Unknown LRSchedulerConfig field(s): {', '.join(unknown)}")
+        return LRSchedulerConfig(**{key: value[key] for key in value if key in valid})
+    raise ConfigError("lr_scheduler must be a string or mapping")
+
+
 def _loss_weights(value: Any) -> dict[str, float]:
     if value is None:
         return _default_loss_weights()
@@ -196,11 +226,44 @@ def _validate_normalization(config: NormalizationConfig) -> None:
         raise ConfigError("normalization percentile bounds must satisfy 0 <= low < high <= 100")
 
 
+def _model_normalization(value: Any) -> str:
+    normalization = str(value).lower()
+    if normalization not in SUPPORTED_MODEL_NORMALIZATIONS:
+        raise ConfigError(f"Unsupported model_normalization: {normalization}")
+    return "none" if normalization == "identity" else normalization
+
+
 def _validate_postprocessing(config: PostprocessingConfig) -> None:
     if not 0 <= config.threshold <= 1:
         raise ConfigError("postprocessing.threshold must be in [0, 1]")
     if config.min_object_size < 0:
         raise ConfigError("postprocessing.min_object_size cannot be negative")
+
+
+def _validate_lr_scheduler(config: LRSchedulerConfig) -> None:
+    config.type = str(config.type).lower()
+    if config.type not in SUPPORTED_LR_SCHEDULERS:
+        raise ConfigError(f"Unsupported lr_scheduler.type: {config.type}")
+    if config.type == "constant":
+        config.type = "none"
+    try:
+        config.min_lr = float(config.min_lr)
+        config.poly_power = float(config.poly_power)
+        config.plateau_factor = float(config.plateau_factor)
+        config.plateau_patience = int(config.plateau_patience)
+        config.plateau_threshold = float(config.plateau_threshold)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("lr_scheduler numeric options must be valid numbers") from exc
+    if config.min_lr < 0:
+        raise ConfigError("lr_scheduler.min_lr cannot be negative")
+    if config.poly_power <= 0:
+        raise ConfigError("lr_scheduler.poly_power must be positive")
+    if not 0 < config.plateau_factor < 1:
+        raise ConfigError("lr_scheduler.plateau_factor must be in (0, 1)")
+    if config.plateau_patience < 0:
+        raise ConfigError("lr_scheduler.plateau_patience cannot be negative")
+    if config.plateau_threshold < 0:
+        raise ConfigError("lr_scheduler.plateau_threshold cannot be negative")
 
 
 def _validate_auto_positive_int(value: int | str, name: str) -> None:
@@ -238,11 +301,17 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             axes=str(raw.get("axes", AUTO)),
             input_channels=_auto_or_int(raw.get("input_channels", AUTO), "input_channels"),
             output_classes=_auto_or_int(raw.get("output_classes", AUTO), "output_classes"),
+            model_normalization=_model_normalization(
+                raw.get("model_normalization", raw.get("network_normalization", raw.get("architecture_normalization", "group")))
+            ),
             patch_size=_as_tuple2(raw.get("patch_size", AUTO)),
             batch_size=_auto_or_int(raw.get("batch_size", AUTO), "batch_size"),
             learning_rate=_auto_or_float(raw.get("learning_rate", AUTO), "learning_rate"),
             optimizer=str(raw.get("optimizer", "adamw")).lower(),
             weight_decay=float(raw.get("weight_decay", 1e-5)),
+            lr_scheduler=_lr_scheduler_config(
+                raw.get("lr_scheduler", raw.get("learning_rate_scheduler", raw.get("scheduler")))
+            ),
             validation_fraction=float(raw.get("validation_fraction", 0.15)),
             foreground_oversampling=_auto_or_bool(raw.get("foreground_oversampling", AUTO), "foreground_oversampling"),
             foreground_probability=_auto_or_float(raw.get("foreground_probability", AUTO), "foreground_probability"),
@@ -292,9 +361,11 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_auto_positive_int(parsed.progress_update_interval, "progress_update_interval")
     _validate_auto_positive_int(parsed.log_update_interval, "log_update_interval")
     _validate_auto_positive_float(parsed.learning_rate, "learning_rate")
+    parsed.model_normalization = _model_normalization(parsed.model_normalization)
+    _validate_lr_scheduler(parsed.lr_scheduler)
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
-    architecture_defaults(str(parsed.architecture))
+    architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
     return parsed
 
 
@@ -321,9 +392,10 @@ def architecture_defaults(
     architecture: str,
     input_channels: int = 1,
     output_channels: int = 1,
-    normalization: str = "batch",
+    normalization: str = "group",
     deep_supervision: bool = False,
 ) -> ArchitectureConfig:
+    normalization = _model_normalization(normalization)
     name = architecture.lower()
     dimensions = "2.5d" if "2.5" in name or "25d" in name else "2d"
     block_type = "residual" if name.startswith("resenc") or name.startswith("residual") else "conv"
