@@ -35,13 +35,13 @@ from .config import (
 )
 from .dataset import inspect_dataset, make_dataset, split_pairs
 from .errors import ModelLoadError
-from .io import discover_dataset
+from .io import ImageMaskPair, discover_dataset, load_mask
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .postprocess import postprocess_instance
 from .schedulers import LearningRateScheduler
-from .targets import target_output_channels
+from .targets import boundary_target, target_output_channels
 from .task_detect import detect_task_from_pairs
 
 
@@ -77,6 +77,72 @@ def _mean_dict(values: list[dict[str, float]]) -> dict[str, float]:
         return {}
     keys = sorted(set().union(*(item.keys() for item in values)))
     return {key: float(np.mean([item[key] for item in values if key in item])) for key in keys}
+
+
+def _sample_pairs(pairs: list[ImageMaskPair], sample_limit: int) -> list[ImageMaskPair]:
+    if len(pairs) <= sample_limit:
+        return pairs
+    if sample_limit == 1:
+        return [pairs[0]]
+    indexes = np.linspace(0, len(pairs) - 1, num=sample_limit, dtype=int)
+    return [pairs[int(index)] for index in indexes]
+
+
+def _estimate_target_sparsity(
+    pairs: list[ImageMaskPair],
+    task: str,
+    sample_limit: int,
+) -> dict[str, float | int | None]:
+    sampled = _sample_pairs(pairs, sample_limit)
+    foreground_pixels = 0
+    boundary_pixels = 0
+    total_pixels = 0
+    for pair in sampled:
+        mask = load_mask(pair.mask)
+        foreground_pixels += int(np.count_nonzero(mask))
+        total_pixels += int(mask.size)
+        if task == "instance_friendly":
+            boundary_pixels += int(np.count_nonzero(boundary_target(mask)))
+
+    foreground_ratio = float(foreground_pixels / total_pixels) if total_pixels else 0.0
+    boundary_ratio = float(boundary_pixels / total_pixels) if total_pixels and task == "instance_friendly" else None
+    return {
+        "sample_count": len(sampled),
+        "foreground_ratio": foreground_ratio,
+        "boundary_ratio": boundary_ratio,
+    }
+
+
+def _resolve_loss_weights(
+    train_config: Any,
+    train_pairs: list[ImageMaskPair],
+    task: str,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    weights = dict(train_config.loss_weights)
+    if not train_config.auto_focal:
+        return weights, {
+            "sample_count": 0,
+            "foreground_ratio": None,
+            "boundary_ratio": None,
+            "auto_focal_enabled": False,
+            "foreground_focal_enabled": weights.get("focal", 0.0) > 0,
+            "boundary_focal_enabled": weights.get("boundary_focal", 0.0) > 0,
+        }
+
+    stats = _estimate_target_sparsity(train_pairs, task, train_config.auto_focal_sample_limit)
+    if train_config.auto_focal and stats["foreground_ratio"] <= train_config.auto_focal_foreground_threshold:
+        weights["focal"] = max(weights.get("focal", 0.0), train_config.auto_focal_weight)
+    if (
+        train_config.auto_focal
+        and task == "instance_friendly"
+        and stats["boundary_ratio"] is not None
+        and stats["boundary_ratio"] <= train_config.auto_focal_boundary_threshold
+    ):
+        weights["boundary_focal"] = max(weights.get("boundary_focal", 0.0), train_config.auto_boundary_focal_weight)
+    stats["auto_focal_enabled"] = bool(train_config.auto_focal)
+    stats["foreground_focal_enabled"] = weights.get("focal", 0.0) > 0
+    stats["boundary_focal_enabled"] = weights.get("boundary_focal", 0.0) > 0
+    return weights, stats
 
 
 def _tensor_losses_to_float(losses: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -345,6 +411,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         if train_config.deep_supervision == AUTO
         else bool(train_config.deep_supervision)
     )
+    effective_loss_weights, target_sparsity = _resolve_loss_weights(train_config, train_pairs, detected_task)
+    logger.info("loss_weights=%s target_sparsity=%s", effective_loss_weights, target_sparsity)
 
     arch = architecture_defaults(
         train_config.architecture,
@@ -425,6 +493,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "augmentation_profile": augmentation_profile,
             "mixed_precision": mixed_precision,
             "deep_supervision": deep_supervision,
+            "effective_loss_weights": effective_loss_weights,
+            "target_sparsity": target_sparsity,
             "lr_scheduler": lr_scheduler.config_dict(),
         }
     )
@@ -457,7 +527,14 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", enabled=mixed_precision):
                 logits = model(images)
-                loss, components = compute_loss(detected_task, logits, target_batch, train_config.loss_weights)
+                loss, components = compute_loss(
+                    detected_task,
+                    logits,
+                    target_batch,
+                    effective_loss_weights,
+                    focal_gamma=train_config.focal_gamma,
+                    focal_alpha=train_config.focal_alpha,
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -504,7 +581,14 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 images = images.to(device, non_blocking=True)
                 target_batch = _move_target(target_batch, device)
                 logits = model(images)
-                loss, components = compute_loss(detected_task, logits, target_batch, train_config.loss_weights)
+                loss, components = compute_loss(
+                    detected_task,
+                    logits,
+                    target_batch,
+                    effective_loss_weights,
+                    focal_gamma=train_config.focal_gamma,
+                    focal_alpha=train_config.focal_alpha,
+                )
                 losses = _tensor_losses_to_float(components)
                 losses["total_loss"] = float(loss.detach().cpu().item())
                 val_losses.append(losses)
@@ -595,6 +679,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "epochs": train_config.epochs,
         "best_score": best_score,
         "metrics": history[-1] if history else {},
+        "loss_weights": effective_loss_weights,
+        "target_sparsity": target_sparsity,
         "learning_rate": lr_scheduler.current_lr,
         "lr_scheduler": lr_scheduler.state_dict(),
         "metrics_path": str(output_dir / "metrics.json"),

@@ -28,8 +28,22 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
     config = parse_training_config({**_base_config(tmp_path), "save_every_epoch": "false"})
     assert config.save_every_epoch is False
     assert config.model_normalization == "group"
+    assert config.loss_weights["focal"] == 0.0
+    assert config.loss_weights["boundary_focal"] == 0.0
     assert parse_training_config({**_base_config(tmp_path), "network_normalization": "batch"}).model_normalization == "batch"
     assert parse_training_config({**_base_config(tmp_path), "architecture_normalization": "identity"}).model_normalization == "none"
+    focal_config = parse_training_config(
+        {
+            **_base_config(tmp_path),
+            "loss_weights": {"focal": 0.25, "boundary_focal": 0.1},
+            "focal_alpha": 0.75,
+            "auto_focal": True,
+        }
+    )
+    assert focal_config.loss_weights["focal"] == 0.25
+    assert focal_config.loss_weights["boundary_focal"] == 0.1
+    assert focal_config.focal_alpha == 0.75
+    assert focal_config.auto_focal is True
 
     with pytest.raises(ConfigError, match="foreground_probability"):
         parse_training_config({**_base_config(tmp_path), "foreground_probability": 2.0})
@@ -42,6 +56,12 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
 
     with pytest.raises(ConfigError, match="model_normalization"):
         parse_training_config({**_base_config(tmp_path), "model_normalization": "layer"})
+
+    with pytest.raises(ConfigError, match="focal_gamma"):
+        parse_training_config({**_base_config(tmp_path), "focal_gamma": 0})
+
+    with pytest.raises(ConfigError, match="focal_alpha"):
+        parse_training_config({**_base_config(tmp_path), "focal_alpha": 1.5})
 
 
 def test_write_json_is_readable_after_atomic_write(tmp_path: Path):
@@ -155,3 +175,42 @@ def test_resenc_architecture_and_deep_supervision_outputs():
     loss, components = compute_loss("binary_semantic", outputs, target)
     assert loss.isfinite()
     assert "deep_supervision_loss" in components
+
+
+def test_focal_loss_components_for_supported_tasks():
+    binary_logits = torch.zeros((2, 1, 8, 8))
+    binary_target = torch.zeros((2, 1, 8, 8))
+    binary_target[:, :, 2:4, 2:4] = 1
+    loss, components = compute_loss(
+        "binary_semantic",
+        binary_logits,
+        binary_target,
+        {"focal": 0.5},
+        focal_gamma=2.0,
+        focal_alpha=0.75,
+    )
+    assert loss.isfinite()
+    assert "focal_loss" in components
+
+    multiclass_logits = torch.zeros((2, 3, 8, 8))
+    multiclass_target = torch.zeros((2, 8, 8), dtype=torch.long)
+    multiclass_target[:, 2:4, 2:4] = 2
+    loss, components = compute_loss("multiclass_semantic", multiclass_logits, multiclass_target, {"focal": 0.5})
+    assert loss.isfinite()
+    assert "focal_loss" in components
+
+    instance_logits = torch.zeros((2, 2, 8, 8))
+    instance_target = {
+        "foreground": binary_target,
+        "boundary": torch.zeros((2, 1, 8, 8)),
+    }
+    instance_target["boundary"][:, :, 2, 2:4] = 1
+    loss, components = compute_loss(
+        "instance_friendly",
+        instance_logits,
+        instance_target,
+        {"focal": 0.5, "boundary_focal": 0.25},
+    )
+    assert loss.isfinite()
+    assert "foreground_focal_loss" in components
+    assert "boundary_focal_loss" in components

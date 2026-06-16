@@ -36,12 +36,37 @@ def multiclass_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float 
     return 1.0 - dice.mean()
 
 
-def focal_binary_loss(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+def focal_binary_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float | None = None,
+) -> torch.Tensor:
     target = target.float()
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     probs = torch.sigmoid(logits)
     p_t = probs * target + (1 - probs) * (1 - target)
-    return (bce * (1 - p_t).pow(gamma)).mean()
+    focal = bce * (1 - p_t).pow(gamma)
+    if alpha is not None:
+        alpha_t = alpha * target + (1 - alpha) * (1 - target)
+        focal = alpha_t * focal
+    return focal.mean()
+
+
+def multiclass_focal_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float | None = None,
+) -> torch.Tensor:
+    target = target.long()
+    ce = F.cross_entropy(logits, target, reduction="none")
+    p_t = torch.exp(-ce)
+    focal = ce * (1 - p_t).pow(gamma)
+    if alpha is not None:
+        alpha_t = torch.where(target > 0, torch.full_like(focal, alpha), torch.full_like(focal, 1 - alpha))
+        focal = alpha_t * focal
+    return focal.mean()
 
 
 def compute_loss(
@@ -49,13 +74,15 @@ def compute_loss(
     logits: Logits,
     target: Target,
     weights: dict[str, float] | None = None,
+    focal_gamma: float = 2.0,
+    focal_alpha: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if isinstance(logits, (list, tuple)):
-        primary_loss, components = _compute_single_loss(task, logits[0], target, weights)
+        primary_loss, components = _compute_single_loss(task, logits[0], target, weights, focal_gamma, focal_alpha)
         aux_losses = []
         for index, aux_logits in enumerate(logits[1:]):
             aux_target = resize_target_for_logits(task, target, aux_logits)
-            aux_loss, _aux_components = _compute_single_loss(task, aux_logits, aux_target, weights)
+            aux_loss, _aux_components = _compute_single_loss(task, aux_logits, aux_target, weights, focal_gamma, focal_alpha)
             aux_losses.append((0.5 ** (index + 1), aux_loss))
         if not aux_losses:
             return primary_loss, components
@@ -64,7 +91,7 @@ def compute_loss(
         total = (primary_loss + aux_weighted) / total_weight
         components["deep_supervision_loss"] = (aux_weighted / (total_weight - 1.0)).detach()
         return total, components
-    return _compute_single_loss(task, logits, target, weights)
+    return _compute_single_loss(task, logits, target, weights, focal_gamma, focal_alpha)
 
 
 def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) -> Target:
@@ -82,6 +109,8 @@ def _compute_single_loss(
     logits: torch.Tensor,
     target: Target,
     weights: dict[str, float] | None = None,
+    focal_gamma: float = 2.0,
+    focal_alpha: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or {}
     if task == "binary_semantic":
@@ -89,13 +118,23 @@ def _compute_single_loss(
         bce = F.binary_cross_entropy_with_logits(logits, target.float())
         dice = binary_dice_loss(logits, target)
         total = weights.get("bce", 1.0) * bce + weights.get("dice", 1.0) * dice
-        return total, {"bce_loss": bce.detach(), "dice_loss": dice.detach()}
+        components = {"bce_loss": bce.detach(), "dice_loss": dice.detach()}
+        if weights.get("focal", 0.0) > 0:
+            focal = focal_binary_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha)
+            total = total + weights.get("focal", 0.0) * focal
+            components["focal_loss"] = focal.detach()
+        return total, components
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
         ce = F.cross_entropy(logits, target.long())
         dice = multiclass_dice_loss(logits, target)
         total = weights.get("cross_entropy", 1.0) * ce + weights.get("dice", 1.0) * dice
-        return total, {"cross_entropy_loss": ce.detach(), "dice_loss": dice.detach()}
+        components = {"cross_entropy_loss": ce.detach(), "dice_loss": dice.detach()}
+        if weights.get("focal", 0.0) > 0:
+            focal = multiclass_focal_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha)
+            total = total + weights.get("focal", 0.0) * focal
+            components["focal_loss"] = focal.detach()
+        return total, components
     if task == "instance_friendly":
         assert isinstance(target, dict)
         foreground = target["foreground"].float()
@@ -110,9 +149,18 @@ def _compute_single_loss(
             + weights.get("dice", 1.0) * fg_dice
             + weights.get("boundary", 0.5) * boundary_loss
         )
-        return total, {
+        components = {
             "foreground_bce_loss": fg_bce.detach(),
             "foreground_dice_loss": fg_dice.detach(),
             "boundary_loss": boundary_loss.detach(),
         }
+        if weights.get("focal", 0.0) > 0:
+            fg_focal = focal_binary_loss(fg_logits, foreground, gamma=focal_gamma, alpha=focal_alpha)
+            total = total + weights.get("focal", 0.0) * fg_focal
+            components["foreground_focal_loss"] = fg_focal.detach()
+        if weights.get("boundary_focal", 0.0) > 0:
+            boundary_focal = focal_binary_loss(boundary_logits, boundary, gamma=focal_gamma, alpha=focal_alpha)
+            total = total + weights.get("boundary_focal", 0.0) * boundary_focal
+            components["boundary_focal_loss"] = boundary_focal.detach()
+        return total, components
     raise ValueError(f"Unsupported task: {task}")

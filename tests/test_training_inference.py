@@ -41,6 +41,9 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
             "patch_size": [32, 32],
             "batch_size": 2,
             "learning_rate": 0.001,
+            "auto_focal": True,
+            "auto_focal_foreground_threshold": 0.2,
+            "auto_focal_weight": 0.25,
             "preview_count": 1,
             "augmentation": {
                 "flip_probability": 0.0,
@@ -55,13 +58,18 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
 
     assert result["task"] == "binary_semantic"
     assert result["lr_scheduler"]["type"] == "poly"
+    assert result["loss_weights"]["focal"] == 0.25
+    assert result["target_sparsity"]["foreground_focal_enabled"] is True
     assert result["metrics"]["learning_rate"] < 0.001
+    assert "focal_loss" in result["metrics"]["train_losses"]
     assert result["config"]["architecture_config"]["normalization"] == "group"
     for name in ("config.json", "weights_best.pt", "weights_last.pt", "model.pt", "training.log", "metrics.json"):
         assert (output_dir / name).exists()
     config = json.loads((output_dir / "config.json").read_text())
     assert config["training"]["lr_scheduler"]["type"] == "poly"
     assert config["training"]["model_normalization"] == "group"
+    assert config["training"]["effective_loss_weights"]["focal"] == 0.25
+    assert config["training"]["target_sparsity"]["foreground_focal_enabled"] is True
     checkpoint = torch.load(output_dir / "weights_last.pt", map_location="cpu", weights_only=False)
     assert checkpoint["scheduler_state_dict"]["type"] == "poly"
 

@@ -22,7 +22,9 @@ DEFAULT_LOSS_WEIGHTS = {
     "dice": 1.0,
     "bce": 1.0,
     "cross_entropy": 1.0,
+    "focal": 0.0,
     "boundary": 0.5,
+    "boundary_focal": 0.0,
 }
 
 
@@ -102,6 +104,14 @@ class TrainingConfig:
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
     deep_supervision: bool | str = False
+    focal_gamma: float = 2.0
+    focal_alpha: float | None = None
+    auto_focal: bool = False
+    auto_focal_foreground_threshold: float = 0.05
+    auto_focal_boundary_threshold: float = 0.02
+    auto_focal_weight: float = 0.5
+    auto_boundary_focal_weight: float = 0.25
+    auto_focal_sample_limit: int = 64
     progress_update_interval: int | str = AUTO
     log_update_interval: int | str = AUTO
     save_every_epoch: bool = True
@@ -154,6 +164,17 @@ def _auto_or_float(value: Any, name: str) -> float | str:
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{name} must be 'auto' or a number") from exc
     return parsed
+
+
+def _optional_float(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null", AUTO}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be null, 'auto', or a number") from exc
 
 
 def _as_tuple2(value: Any) -> tuple[int, int] | str:
@@ -319,6 +340,14 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", False), "deep_supervision"),
+            focal_gamma=float(raw.get("focal_gamma", 2.0)),
+            focal_alpha=_optional_float(raw.get("focal_alpha"), "focal_alpha"),
+            auto_focal=_coerce_bool(raw.get("auto_focal", False), "auto_focal"),
+            auto_focal_foreground_threshold=float(raw.get("auto_focal_foreground_threshold", 0.05)),
+            auto_focal_boundary_threshold=float(raw.get("auto_focal_boundary_threshold", 0.02)),
+            auto_focal_weight=float(raw.get("auto_focal_weight", 0.5)),
+            auto_boundary_focal_weight=float(raw.get("auto_boundary_focal_weight", 0.25)),
+            auto_focal_sample_limit=int(raw.get("auto_focal_sample_limit", 64)),
             progress_update_interval=_auto_or_int(raw.get("progress_update_interval", AUTO), "progress_update_interval"),
             log_update_interval=_auto_or_int(raw.get("log_update_interval", AUTO), "log_update_interval"),
             save_every_epoch=_coerce_bool(raw.get("save_every_epoch", True), "save_every_epoch"),
@@ -353,6 +382,20 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("num_workers cannot be negative")
     if parsed.preview_count < 0:
         raise ConfigError("preview_count cannot be negative")
+    if parsed.focal_gamma <= 0:
+        raise ConfigError("focal_gamma must be positive")
+    if parsed.focal_alpha is not None and not 0 < parsed.focal_alpha < 1:
+        raise ConfigError("focal_alpha must be in (0, 1)")
+    if not 0 <= parsed.auto_focal_foreground_threshold <= 1:
+        raise ConfigError("auto_focal_foreground_threshold must be in [0, 1]")
+    if not 0 <= parsed.auto_focal_boundary_threshold <= 1:
+        raise ConfigError("auto_focal_boundary_threshold must be in [0, 1]")
+    if parsed.auto_focal_weight < 0:
+        raise ConfigError("auto_focal_weight cannot be negative")
+    if parsed.auto_boundary_focal_weight < 0:
+        raise ConfigError("auto_boundary_focal_weight cannot be negative")
+    if parsed.auto_focal_sample_limit < 1:
+        raise ConfigError("auto_focal_sample_limit must be at least 1")
     if parsed.foreground_probability != AUTO and not 0 <= float(parsed.foreground_probability) <= 1:
         raise ConfigError("foreground_probability must be in [0, 1]")
     _validate_auto_positive_int(parsed.input_channels, "input_channels")

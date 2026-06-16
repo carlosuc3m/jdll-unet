@@ -91,6 +91,44 @@ For convenience, `lr_scheduler` may be either a string such as `"cosine"` or a
 mapping with scheduler options. `learning_rate_scheduler` and `scheduler` are
 accepted as aliases.
 
+## Losses
+
+The trainer chooses a composite segmentation loss from the detected task:
+
+- Binary semantic: BCE with logits plus Dice loss.
+- Multiclass semantic: cross entropy plus Dice loss.
+- Instance-friendly: foreground BCE plus foreground Dice, with an auxiliary boundary BCE term.
+
+Focal loss is available as an additive term for class-imbalanced datasets. It is
+off by default; enable it directly through `loss_weights`:
+
+```python
+"loss_weights": {
+    "dice": 1.0,
+    "bce": 1.0,
+    "cross_entropy": 1.0,
+    "focal": 0.5,
+    "boundary": 0.5,
+    "boundary_focal": 0.25,
+},
+"focal_gamma": 2.0,
+"focal_alpha": None,
+```
+
+For sparse foreground datasets, focal can be enabled automatically from a mask
+sample:
+
+```python
+"auto_focal": True,
+"auto_focal_foreground_threshold": 0.05,
+"auto_focal_weight": 0.5,
+```
+
+`auto_focal_foreground_threshold` is the foreground-pixel fraction, measured as
+foreground pixels divided by total pixels. For instance-friendly models,
+`auto_focal_boundary_threshold` and `auto_boundary_focal_weight` do the same for
+the boundary/separator channel.
+
 ## Callbacks
 
 Training and inference accept the optional `task` argument as a generic
