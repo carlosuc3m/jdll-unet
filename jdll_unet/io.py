@@ -1,0 +1,239 @@
+"""Image, mask, and dataset layout I/O."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+import json
+
+import imageio.v3 as imageio
+import numpy as np
+import tifffile
+
+
+IMAGE_ALIASES = ("images", "image", "imgs", "img", "data")
+MASK_ALIASES = ("masks", "mask", "labels", "label", "gt")
+IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+MASK_EXTENSIONS = {".tif", ".tiff", ".png"}
+IMAGE_SUFFIXES = ("_image", "-image", "_img", "-img", "_raw", "-raw")
+MASK_SUFFIXES = ("_mask", "-mask", "_label", "-label", "_labels", "-labels", "_gt", "-gt")
+
+
+@dataclass(frozen=True, slots=True)
+class ImageMaskPair:
+    image: Path
+    mask: Path
+    stem: str
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSplits:
+    train: list[ImageMaskPair]
+    val: list[ImageMaskPair]
+    explicit_val: bool
+
+
+def _iter_files(folder: Path, extensions: set[str]) -> list[Path]:
+    return sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in extensions and not path.name.startswith(".")
+    )
+
+
+def _canonical_stem(path: Path, suffixes: Sequence[str]) -> str:
+    stem = path.stem
+    lower = stem.lower()
+    for suffix in suffixes:
+        if lower.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _find_alias_folder(root: Path, aliases: Iterable[str]) -> Path | None:
+    if not root.exists():
+        return None
+    candidates = {child.name.lower(): child for child in root.iterdir() if child.is_dir()}
+    for alias in aliases:
+        if alias in candidates:
+            return candidates[alias]
+    return None
+
+
+def pair_images_and_masks(image_dir: Path, mask_dir: Path) -> list[ImageMaskPair]:
+    """Pair images and masks by stem, accepting common suffix variants."""
+
+    images = _iter_files(image_dir, IMAGE_EXTENSIONS)
+    masks = _iter_files(mask_dir, MASK_EXTENSIONS)
+    mask_lookup: dict[str, list[Path]] = {}
+    for mask in masks:
+        keys = {mask.stem, _canonical_stem(mask, MASK_SUFFIXES)}
+        for key in keys:
+            mask_lookup.setdefault(key.lower(), []).append(mask)
+
+    pairs: list[ImageMaskPair] = []
+    missing: list[str] = []
+    for image in images:
+        keys = [image.stem, _canonical_stem(image, IMAGE_SUFFIXES)]
+        candidates: list[Path] = []
+        for key in keys:
+            candidates.extend(mask_lookup.get(key.lower(), []))
+        unique = sorted(set(candidates))
+        if not unique:
+            missing.append(image.name)
+            continue
+        if len(unique) > 1:
+            names = ", ".join(path.name for path in unique)
+            raise ValueError(f"Ambiguous mask match for {image.name}: {names}")
+        pairs.append(ImageMaskPair(image=image, mask=unique[0], stem=_canonical_stem(image, IMAGE_SUFFIXES)))
+
+    if missing:
+        sample = ", ".join(missing[:5])
+        raise ValueError(f"Missing masks for {len(missing)} image(s): {sample}")
+    if not pairs:
+        raise ValueError(f"No image/mask pairs found in {image_dir} and {mask_dir}")
+    return pairs
+
+
+def discover_dataset(dataset_path: Path | str) -> DatasetSplits:
+    """Discover supported dataset layouts and return paired train/val splits."""
+
+    root = Path(dataset_path)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset path does not exist: {root}")
+
+    train_root = root / "train"
+    val_root = root / "val"
+    train_image_dir = _find_alias_folder(train_root, IMAGE_ALIASES)
+    train_mask_dir = _find_alias_folder(train_root, MASK_ALIASES)
+    val_image_dir = _find_alias_folder(val_root, IMAGE_ALIASES)
+    val_mask_dir = _find_alias_folder(val_root, MASK_ALIASES)
+
+    if train_image_dir and train_mask_dir:
+        train_pairs = pair_images_and_masks(train_image_dir, train_mask_dir)
+        val_pairs = pair_images_and_masks(val_image_dir, val_mask_dir) if val_image_dir and val_mask_dir else []
+        return DatasetSplits(train=train_pairs, val=val_pairs, explicit_val=bool(val_pairs))
+
+    image_dir = _find_alias_folder(root, IMAGE_ALIASES)
+    mask_dir = _find_alias_folder(root, MASK_ALIASES)
+    if image_dir and mask_dir:
+        return DatasetSplits(train=pair_images_and_masks(image_dir, mask_dir), val=[], explicit_val=False)
+
+    raise ValueError(
+        "Unsupported dataset layout. Expected images/masks or train/images, train/masks, val/images, val/masks."
+    )
+
+
+def load_array(path: Path | str) -> np.ndarray:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        return tifffile.imread(path)
+    if suffix in IMAGE_EXTENSIONS:
+        return imageio.imread(path)
+    raise ValueError(f"Unsupported image format: {path.suffix}")
+
+
+def load_image(path: Path | str) -> np.ndarray:
+    """Load an image as float32 channels-first C,Y,X without normalizing."""
+
+    arr = np.asarray(load_array(path))
+    if arr.ndim == 2:
+        out = arr[None, ...]
+    elif arr.ndim == 3:
+        if arr.shape[-1] in {1, 3, 4} and arr.shape[0] not in {1, 3, 4}:
+            out = np.moveaxis(arr[..., :3], -1, 0)
+        else:
+            out = arr
+    else:
+        raise ValueError(f"Unsupported image rank {arr.ndim} for {path}")
+    return np.ascontiguousarray(out.astype(np.float32, copy=False))
+
+
+def _collapse_mask_channels(arr: np.ndarray, path: Path) -> np.ndarray:
+    if arr.ndim != 3 or arr.shape[-1] not in {3, 4}:
+        return arr
+    channels = arr[..., :3]
+    if np.all(channels == channels[..., :1]):
+        return channels[..., 0]
+    raise ValueError(
+        f"Mask {path} has RGB channels that are not a duplicated label plane; "
+        "store masks as single-channel integer label images."
+    )
+
+
+def load_mask(path: Path | str) -> np.ndarray:
+    """Load an integer mask while preserving label values."""
+
+    path = Path(path)
+    if path.suffix.lower() in {".jpg", ".jpeg"}:
+        raise ValueError("JPEG masks are not supported because compression changes labels")
+    arr = np.asarray(load_array(path))
+    arr = _collapse_mask_channels(arr, path)
+    if arr.ndim != 2:
+        raise ValueError(f"Only 2D masks are supported in this backend milestone, got shape {arr.shape}")
+    if np.issubdtype(arr.dtype, np.floating):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"Mask {path} contains non-finite values")
+        if not np.allclose(arr, np.round(arr)):
+            raise ValueError(f"Mask {path} contains non-integer floating values")
+    return np.ascontiguousarray(arr.astype(np.int64, copy=False))
+
+
+def normalize_image(image: np.ndarray, normalization: dict | object | None = None) -> np.ndarray:
+    """Normalize channels independently with configurable conservative defaults."""
+
+    if normalization is None:
+        norm_type, low, high, eps = "percentile", 1.0, 99.8, 1e-6
+    elif isinstance(normalization, dict):
+        norm_type = normalization.get("type", "percentile")
+        low = float(normalization.get("low", 1.0))
+        high = float(normalization.get("high", 99.8))
+        eps = float(normalization.get("eps", 1e-6))
+    else:
+        norm_type = getattr(normalization, "type", "percentile")
+        low = float(getattr(normalization, "low", 1.0))
+        high = float(getattr(normalization, "high", 99.8))
+        eps = float(getattr(normalization, "eps", 1e-6))
+
+    img = image.astype(np.float32, copy=True)
+    if norm_type == "none":
+        return img
+    if norm_type == "minmax":
+        mins = img.reshape(img.shape[0], -1).min(axis=1)
+        maxs = img.reshape(img.shape[0], -1).max(axis=1)
+        for channel, mn, mx in zip(range(img.shape[0]), mins, maxs):
+            img[channel] = (img[channel] - mn) / max(float(mx - mn), eps)
+        return img
+    if norm_type == "zscore":
+        means = img.reshape(img.shape[0], -1).mean(axis=1)
+        stds = img.reshape(img.shape[0], -1).std(axis=1)
+        for channel, mean, std in zip(range(img.shape[0]), means, stds):
+            img[channel] = (img[channel] - mean) / max(float(std), eps)
+        return img
+    if norm_type != "percentile":
+        raise ValueError(f"Unsupported normalization type: {norm_type}")
+
+    for channel in range(img.shape[0]):
+        lo, hi = np.percentile(img[channel], [low, high])
+        img[channel] = np.clip((img[channel] - lo) / max(float(hi - lo), eps), 0.0, 1.0)
+    return img
+
+
+def read_class_names(dataset_path: Path | str) -> list[str] | None:
+    root = Path(dataset_path)
+    for name in ("classes.json", "labels.json"):
+        path = root / name
+        if not path.exists():
+            continue
+        data = json.loads(path.read_text())
+        if isinstance(data, list):
+            return [str(item) for item in data]
+        if isinstance(data, dict):
+            values = data.get("classes", data.get("labels", data))
+            if isinstance(values, list):
+                return [str(item) for item in values]
+            if isinstance(values, dict):
+                return [str(values[key]) for key in sorted(values)]
+    return None
