@@ -20,14 +20,18 @@ def _activation(name: str) -> nn.Module:
     raise ValueError(f"Unsupported activation: {name}")
 
 
-def _normalization(name: str, channels: int) -> nn.Module:
+def _is_3d(dimensions: str) -> bool:
+    return dimensions.lower() == "3d"
+
+
+def _normalization(name: str, channels: int, dimensions: str = "2d") -> nn.Module:
     name = name.lower()
     if name in {"none", "identity"}:
         return nn.Identity()
     if name == "batch":
-        return nn.BatchNorm2d(channels)
+        return nn.BatchNorm3d(channels) if _is_3d(dimensions) else nn.BatchNorm2d(channels)
     if name == "instance":
-        return nn.InstanceNorm2d(channels, affine=True)
+        return nn.InstanceNorm3d(channels, affine=True) if _is_3d(dimensions) else nn.InstanceNorm2d(channels, affine=True)
     if name == "group":
         groups = min(8, channels)
         while channels % groups != 0 and groups > 1:
@@ -45,16 +49,19 @@ class ConvBlock(nn.Module):
         normalization: str = "group",
         activation: str = "relu",
         dropout: float = 0.0,
+        dimensions: str = "2d",
     ) -> None:
         super().__init__()
+        conv = nn.Conv3d if _is_3d(dimensions) else nn.Conv2d
+        dropout_layer = nn.Dropout3d if _is_3d(dimensions) else nn.Dropout2d
         layers: list[nn.Module] = []
         current = in_channels
         for _ in range(convs_per_level):
-            layers.append(nn.Conv2d(current, out_channels, kernel_size=3, padding=1, bias=False))
-            layers.append(_normalization(normalization, out_channels))
+            layers.append(conv(current, out_channels, kernel_size=3, padding=1, bias=False))
+            layers.append(_normalization(normalization, out_channels, dimensions))
             layers.append(_activation(activation))
             if dropout > 0:
-                layers.append(nn.Dropout2d(dropout))
+                layers.append(dropout_layer(dropout))
             current = out_channels
         self.block = nn.Sequential(*layers)
 
@@ -73,28 +80,31 @@ class ResidualEncoderBlock(nn.Module):
         normalization: str = "group",
         activation: str = "relu",
         dropout: float = 0.0,
+        dimensions: str = "2d",
     ) -> None:
         super().__init__()
         if convs_per_level < 1:
             raise ValueError("convs_per_level must be at least 1")
+        conv = nn.Conv3d if _is_3d(dimensions) else nn.Conv2d
+        dropout_layer = nn.Dropout3d if _is_3d(dimensions) else nn.Dropout2d
         layers: list[nn.Module] = []
         current = in_channels
         for index in range(convs_per_level):
-            layers.append(nn.Conv2d(current, out_channels, kernel_size=3, padding=1, bias=False))
-            layers.append(_normalization(normalization, out_channels))
+            layers.append(conv(current, out_channels, kernel_size=3, padding=1, bias=False))
+            layers.append(_normalization(normalization, out_channels, dimensions))
             if index != convs_per_level - 1:
                 layers.append(_activation(activation))
                 if dropout > 0:
-                    layers.append(nn.Dropout2d(dropout))
+                    layers.append(dropout_layer(dropout))
             current = out_channels
         self.body = nn.Sequential(*layers)
         self.projection = (
             nn.Identity()
             if in_channels == out_channels
-            else nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            else conv(in_channels, out_channels, kernel_size=1, bias=False)
         )
         self.activation = _activation(activation)
-        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.dropout = dropout_layer(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.body(x) + self.projection(x)
@@ -105,6 +115,9 @@ class UNet2D(nn.Module):
     def __init__(self, config: ArchitectureConfig) -> None:
         super().__init__()
         self.config = config
+        is_3d = _is_3d(config.dimensions)
+        conv = nn.Conv3d if is_3d else nn.Conv2d
+        conv_transpose = nn.ConvTranspose3d if is_3d else nn.ConvTranspose2d
         channels = [config.base_channels * (2**level) for level in range(config.depth)]
         self.encoders = nn.ModuleList()
         in_channels = config.input_channels
@@ -118,15 +131,16 @@ class UNet2D(nn.Module):
                     normalization=config.normalization,
                     activation=config.activation,
                     dropout=config.dropout,
+                    dimensions=config.dimensions,
                 )
             )
             in_channels = out_channels
-        self.pool = nn.MaxPool2d(2)
+        self.pool = nn.MaxPool3d(2) if is_3d else nn.MaxPool2d(2)
         self.upconvs = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.deep_supervision_heads = nn.ModuleList()
         for level in range(config.depth - 1, 0, -1):
-            self.upconvs.append(nn.ConvTranspose2d(channels[level], channels[level - 1], kernel_size=2, stride=2))
+            self.upconvs.append(conv_transpose(channels[level], channels[level - 1], kernel_size=2, stride=2))
             self.decoders.append(
                 ConvBlock(
                     channels[level - 1] * 2,
@@ -135,11 +149,12 @@ class UNet2D(nn.Module):
                     normalization=config.normalization,
                     activation=config.activation,
                     dropout=config.dropout,
+                    dimensions=config.dimensions,
                 )
             )
             if config.deep_supervision and level > 1:
-                self.deep_supervision_heads.append(nn.Conv2d(channels[level - 1], config.output_channels, kernel_size=1))
-        self.out = nn.Conv2d(channels[0], config.output_channels, kernel_size=1)
+                self.deep_supervision_heads.append(conv(channels[level - 1], config.output_channels, kernel_size=1))
+        self.out = conv(channels[0], config.output_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
         skips: list[torch.Tensor] = []
@@ -154,8 +169,9 @@ class UNet2D(nn.Module):
             zip(self.upconvs, self.decoders, reversed(skips[:-1]), strict=True)
         ):
             x = upconv(x)
-            if x.shape[-2:] != skip.shape[-2:]:
-                x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            if x.shape[2:] != skip.shape[2:]:
+                mode = "trilinear" if _is_3d(self.config.dimensions) else "bilinear"
+                x = F.interpolate(x, size=skip.shape[2:], mode=mode, align_corners=False)
             x = torch.cat([skip, x], dim=1)
             x = decoder(x)
             if self.config.deep_supervision and decoder_index < len(self.decoders) - 1:

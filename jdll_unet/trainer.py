@@ -238,9 +238,10 @@ def _save_previews(
                 target_path = (preview_dir / f"{base}_target.png").resolve()
                 pred_path = (preview_dir / f"{base}_prediction.png").resolve()
                 overlay_path = (preview_dir / f"{base}_overlay.png").resolve()
-                image_rgb = _image_preview_rgb(images_cpu[idx])
-                target_rgb = _target_preview_rgb(task, target_cpu, idx)
-                pred_rgb = _prediction_preview_rgb(task, predictions[idx])
+                z_index = _preview_z_index(images_cpu[idx])
+                image_rgb = _image_preview_rgb(images_cpu[idx], z_index)
+                target_rgb = _target_preview_rgb(task, target_cpu, idx, z_index)
+                pred_rgb = _prediction_preview_rgb(task, predictions[idx], z_index)
                 overlay_rgb = _overlay_prediction(image_rgb, pred_rgb)
                 _atomic_image_write(image_path, image_rgb)
                 _atomic_image_write(target_path, target_rgb)
@@ -253,6 +254,7 @@ def _save_previews(
                         "target_path": str(target_path),
                         "prediction_path": str(pred_path),
                         "overlay_path": str(overlay_path),
+                        "z_index": z_index,
                     }
                 )
             if len(saved) >= preview_count:
@@ -280,7 +282,19 @@ def _normalize_uint8(array: np.ndarray) -> np.ndarray:
     return np.clip((arr - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
 
 
-def _image_preview_rgb(image: np.ndarray) -> np.ndarray:
+def _preview_z_index(image: np.ndarray) -> int | None:
+    return int(image.shape[1] // 2) if image.ndim == 4 else None
+
+
+def _slice_for_preview(array: np.ndarray, z_index: int | None) -> np.ndarray:
+    if z_index is not None and array.ndim >= 3:
+        return array[z_index]
+    return array
+
+
+def _image_preview_rgb(image: np.ndarray, z_index: int | None = None) -> np.ndarray:
+    if z_index is not None:
+        image = image[:, z_index]
     if image.shape[0] >= 3:
         channels = [_normalize_uint8(image[channel]) for channel in range(3)]
         return np.stack(channels, axis=-1)
@@ -312,18 +326,19 @@ def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarra
     return (probabilities[:, 0] >= 0.5).astype(np.uint8)
 
 
-def _target_preview_rgb(task: str, target: np.ndarray | dict[str, np.ndarray], index: int) -> np.ndarray:
+def _target_preview_rgb(task: str, target: np.ndarray | dict[str, np.ndarray], index: int, z_index: int | None = None) -> np.ndarray:
     if isinstance(target, dict):
         foreground = target.get("foreground")
         if foreground is None:
             raise ValueError("Instance preview target is missing foreground")
-        return _label_to_rgb((foreground[index, 0] > 0.5).astype(np.uint8))
+        return _label_to_rgb(_slice_for_preview((foreground[index, 0] > 0.5).astype(np.uint8), z_index))
     if task == "binary_semantic":
-        return _label_to_rgb((target[index, 0] > 0.5).astype(np.uint8))
-    return _label_to_rgb(target[index])
+        return _label_to_rgb(_slice_for_preview((target[index, 0] > 0.5).astype(np.uint8), z_index))
+    return _label_to_rgb(_slice_for_preview(target[index], z_index))
 
 
-def _prediction_preview_rgb(task: str, prediction: np.ndarray) -> np.ndarray:
+def _prediction_preview_rgb(task: str, prediction: np.ndarray, z_index: int | None = None) -> np.ndarray:
+    prediction = _slice_for_preview(prediction, z_index)
     if task == "binary_semantic":
         return _label_to_rgb(prediction.astype(np.uint8))
     return _label_to_rgb(prediction.astype(np.uint32))
@@ -365,7 +380,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     if detected_task == "unsupported":
         raise ValueError(str(detection.get("reason", "Unsupported annotation type")))
 
-    info = inspect_dataset(train_pairs + val_pairs)
+    architecture_probe = architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
+    dimensions = architecture_probe.dimensions
+    info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
     input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
@@ -436,6 +453,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         foreground_probability=foreground_probability,
         augmentation_overrides=train_config.augmentation,
         training=True,
+        dimensions=dimensions,
         seed=train_config.seed,
     )
     val_dataset = make_dataset(
@@ -449,6 +467,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         foreground_probability=0.0,
         augmentation_overrides={},
         training=False,
+        dimensions=dimensions,
         seed=train_config.seed + 10_000,
     )
     train_loader = DataLoader(
@@ -477,8 +496,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         train_config,
         detected_task,
         arch,
-        input_axes="cyx" if input_channels > 1 else "yx",
-        output_axes="yx",
+        input_axes=("czyx" if input_channels > 1 else "zyx") if dimensions == "3d" else ("cyx" if input_channels > 1 else "yx"),
+        output_axes="zyx" if dimensions == "3d" else "yx",
         label_values=label_values,
     )
     model_config["training"].update(
@@ -617,6 +636,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             learning_rate=lr_scheduler.current_lr,
             losses={f"val/{key}": value for key, value in epoch_record["val_losses"].items()},
             metrics={f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
+            last_checkpoint_path=str(output_dir / "weights_last.pt"),
+            best_checkpoint_path=str(output_dir / "weights_best.pt") if score >= best_score or (output_dir / "weights_best.pt").exists() else None,
         ):
             return _cancel_training(
                 callbacks,

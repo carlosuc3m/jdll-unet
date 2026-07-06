@@ -91,7 +91,7 @@ class TrainingConfig:
     input_channels: int | str = AUTO
     output_classes: int | str = AUTO
     model_normalization: str = "group"
-    patch_size: tuple[int, int] | str = AUTO
+    patch_size: tuple[int, ...] | str = AUTO
     batch_size: int | str = AUTO
     learning_rate: float | str = AUTO
     optimizer: str = "adamw"
@@ -177,16 +177,16 @@ def _optional_float(value: Any, name: str) -> float | None:
         raise ConfigError(f"{name} must be null, 'auto', or a number") from exc
 
 
-def _as_tuple2(value: Any) -> tuple[int, int] | str:
+def _as_spatial_tuple(value: Any) -> tuple[int, ...] | str:
     if value == AUTO:
         return AUTO
     if isinstance(value, int):
         parsed = (value, value)
-    elif isinstance(value, (list, tuple)) and len(value) == 2:
-        parsed = (int(value[0]), int(value[1]))
+    elif isinstance(value, (list, tuple)) and len(value) in {2, 3}:
+        parsed = tuple(int(item) for item in value)
     else:
-        raise ConfigError("patch_size must be 'auto', an int, or a length-2 sequence")
-    if parsed[0] <= 0 or parsed[1] <= 0:
+        raise ConfigError("patch_size must be 'auto', an int, or a length-2 or length-3 sequence")
+    if any(item <= 0 for item in parsed):
         raise ConfigError("patch_size values must be positive")
     return parsed
 
@@ -325,7 +325,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             model_normalization=_model_normalization(
                 raw.get("model_normalization", raw.get("network_normalization", raw.get("architecture_normalization", "group")))
             ),
-            patch_size=_as_tuple2(raw.get("patch_size", AUTO)),
+            patch_size=_as_spatial_tuple(raw.get("patch_size", AUTO)),
             batch_size=_auto_or_int(raw.get("batch_size", AUTO), "batch_size"),
             learning_rate=_auto_or_float(raw.get("learning_rate", AUTO), "learning_rate"),
             optimizer=str(raw.get("optimizer", "adamw")).lower(),
@@ -408,7 +408,11 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_lr_scheduler(parsed.lr_scheduler)
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
-    architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
+    arch = architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
+    if parsed.patch_size != AUTO:
+        expected_dims = 3 if arch.dimensions == "3d" else 2
+        if len(parsed.patch_size) != expected_dims:
+            raise ConfigError(f"patch_size for {arch.dimensions} models must have {expected_dims} value(s)")
     return parsed
 
 
@@ -440,8 +444,32 @@ def architecture_defaults(
 ) -> ArchitectureConfig:
     normalization = _model_normalization(normalization)
     name = architecture.lower()
-    dimensions = "2.5d" if "2.5" in name or "25d" in name else "2d"
+    dimensions = "3d" if name.startswith(("tiny-3d", "medium-3d")) else "2.5d" if "2.5" in name or "25d" in name else "2d"
     block_type = "residual" if name.startswith("resenc") or name.startswith("residual") else "conv"
+    if name.startswith("medium-3d"):
+        return ArchitectureConfig(
+            name=architecture,
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=24,
+            depth=3,
+            normalization=normalization,
+            dimensions=dimensions,
+            block_type=block_type,
+            deep_supervision=deep_supervision,
+        )
+    if name.startswith("tiny-3d"):
+        return ArchitectureConfig(
+            name=architecture,
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=12,
+            depth=3,
+            normalization=normalization,
+            dimensions=dimensions,
+            block_type=block_type,
+            deep_supervision=deep_supervision,
+        )
     if name.startswith("medium") or name.startswith("resenc-medium") or name.startswith("residual-medium"):
         return ArchitectureConfig(
             name=architecture,
@@ -469,15 +497,26 @@ def architecture_defaults(
     raise ConfigError(f"Unsupported architecture: {architecture}")
 
 
-def default_patch_size(architecture: str, image_shape: tuple[int, int] | None = None) -> tuple[int, int]:
-    preferred = (128, 128) if "medium" in architecture.lower() else (96, 96)
+def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = None) -> tuple[int, ...]:
+    name = architecture.lower()
+    if name.startswith("medium-3d"):
+        preferred = (16, 128, 128)
+    elif name.startswith("tiny-3d"):
+        preferred = (16, 96, 96)
+    else:
+        preferred = (128, 128) if "medium" in name else (96, 96)
     if image_shape is None:
         return preferred
-    return (min(preferred[0], int(image_shape[0])), min(preferred[1], int(image_shape[1])))
+    return tuple(min(preferred[index], int(image_shape[index])) for index in range(len(preferred)))
 
 
 def default_batch_size(architecture: str, device: torch.device) -> int:
-    if "medium" in architecture.lower():
+    name = architecture.lower()
+    if name.startswith(("tiny-3d", "medium-3d")):
+        if device.type == "cpu" or name.startswith("medium-3d"):
+            return 1
+        return 2
+    if "medium" in name:
         return 2 if device.type == "cpu" else 4
     return 4 if device.type == "cpu" else 8
 

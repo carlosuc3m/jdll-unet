@@ -177,6 +177,26 @@ def test_resenc_architecture_and_deep_supervision_outputs():
     assert "deep_supervision_loss" in components
 
 
+def test_3d_architecture_defaults_and_forward_pass():
+    tiny = architecture_defaults("tiny-3d", input_channels=1, output_channels=2)
+    medium = architecture_defaults("medium-3d", input_channels=1, output_channels=2)
+
+    assert tiny.dimensions == "3d"
+    assert tiny.base_channels == 12
+    assert tiny.depth == 3
+    assert medium.dimensions == "3d"
+    assert medium.base_channels == 24
+    assert medium.depth == 3
+
+    model = build_unet(tiny)
+    output = model(torch.zeros((1, 1, 8, 16, 16)))
+
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == (1, 2, 8, 16, 16)
+    assert any(isinstance(module, nn.Conv3d) for module in model.modules())
+    assert any(isinstance(module, nn.GroupNorm) for module in model.modules())
+
+
 def test_focal_loss_components_for_supported_tasks():
     binary_logits = torch.zeros((2, 1, 8, 8))
     binary_target = torch.zeros((2, 1, 8, 8))

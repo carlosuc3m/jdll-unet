@@ -17,7 +17,7 @@ from .targets import prepare_target
 @dataclass(slots=True)
 class DatasetInfo:
     input_channels: int
-    image_shape: tuple[int, int]
+    image_shape: tuple[int, ...]
     label_values: list[int]
 
 
@@ -37,17 +37,24 @@ def split_pairs(
     return train, val
 
 
-def inspect_dataset(pairs: list[ImageMaskPair]) -> DatasetInfo:
+def inspect_dataset(pairs: list[ImageMaskPair], dimensions: str = "2d") -> DatasetInfo:
     if not pairs:
         raise ValueError("Cannot inspect an empty dataset")
-    image = load_image(pairs[0].image)
+    image = load_image(pairs[0].image, dimensions=dimensions)
+    image_shape = tuple(int(item) for item in image.shape[1:])
     labels: set[int] = set()
     for pair in pairs:
-        mask = load_mask(pair.mask)
+        current_image = load_image(pair.image, dimensions=dimensions)
+        mask = load_mask(pair.mask, dimensions="3d" if dimensions == "3d" else "2d")
+        if tuple(current_image.shape[1:]) != tuple(mask.shape):
+            raise ValueError(
+                f"Image/mask spatial shape mismatch for {pair.image.name}: "
+                f"image={tuple(current_image.shape[1:])} mask={tuple(mask.shape)}"
+            )
         labels.update(int(v) for v in np.unique(mask) if int(v) != 0)
     return DatasetInfo(
         input_channels=int(image.shape[0]),
-        image_shape=(int(image.shape[-2]), int(image.shape[-1])),
+        image_shape=image_shape,
         label_values=sorted(labels),
     )
 
@@ -61,6 +68,7 @@ class JdllSegmentationDataset(Dataset):
         normalization: object | dict | None,
         augmentation: AugmentationConfig,
         training: bool,
+        dimensions: str = "2d",
         seed: int = 0,
     ) -> None:
         self.pairs = pairs
@@ -69,6 +77,7 @@ class JdllSegmentationDataset(Dataset):
         self.normalization = normalization
         self.augmentation = augmentation
         self.training = training
+        self.dimensions = dimensions
         self.seed = seed
 
     def __len__(self) -> int:
@@ -76,8 +85,8 @@ class JdllSegmentationDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
         pair = self.pairs[index]
-        image = normalize_image(load_image(pair.image), self.normalization)
-        mask = load_mask(pair.mask)
+        image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
+        mask = load_mask(pair.mask, dimensions="3d" if self.dimensions == "3d" else "2d")
         rng = np.random.default_rng(self.seed + index if not self.training else None)
         image, mask = apply_augmentation(image, mask, self.augmentation, rng=rng, training=self.training)
         target = prepare_target(self.task, mask, label_values=self.label_values)
@@ -93,11 +102,12 @@ def make_dataset(
     label_values: list[int] | None,
     normalization: object | dict | None,
     profile: str,
-    patch_size: tuple[int, int],
+    patch_size: tuple[int, ...],
     foreground_oversampling: bool,
     foreground_probability: float,
     augmentation_overrides: dict | None,
     training: bool,
+    dimensions: str,
     seed: int,
 ) -> JdllSegmentationDataset:
     aug = make_augmentation_config(
@@ -114,5 +124,6 @@ def make_dataset(
         normalization=normalization,
         augmentation=aug,
         training=training,
+        dimensions=dimensions,
         seed=seed,
     )

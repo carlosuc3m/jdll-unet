@@ -38,20 +38,25 @@ def _component_count(binary: np.ndarray) -> int:
         return int(count)
     seen = np.zeros(binary.shape, dtype=bool)
     count = 0
-    height, width = binary.shape
-    for y in range(height):
-        for x in range(width):
-            if not binary[y, x] or seen[y, x]:
-                continue
-            count += 1
-            stack = [(y, x)]
-            seen[y, x] = True
-            while stack:
-                cy, cx = stack.pop()
-                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                    if 0 <= ny < height and 0 <= nx < width and binary[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        stack.append((ny, nx))
+    offsets: list[tuple[int, ...]] = []
+    for axis in range(binary.ndim):
+        for delta in (-1, 1):
+            offset = [0] * binary.ndim
+            offset[axis] = delta
+            offsets.append(tuple(offset))
+    for start in np.ndindex(binary.shape):
+        if not binary[start] or seen[start]:
+            continue
+        count += 1
+        stack = [start]
+        seen[start] = True
+        while stack:
+            current = stack.pop()
+            for offset in offsets:
+                neighbor = tuple(coord + step for coord, step in zip(current, offset, strict=True))
+                if all(0 <= coord < limit for coord, limit in zip(neighbor, binary.shape, strict=True)) and binary[neighbor] and not seen[neighbor]:
+                    seen[neighbor] = True
+                    stack.append(neighbor)
     return count
 
 

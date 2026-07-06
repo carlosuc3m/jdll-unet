@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from jdll_unet.io import discover_dataset, load_mask
+from jdll_unet.io import discover_dataset, load_image, load_mask
 
 
 def test_dataset_pairing_accepts_aliases_and_suffixes(tmp_path: Path):
@@ -54,3 +54,27 @@ def test_rgb_mask_collapses_only_duplicate_channels(tmp_path: Path):
 
     with pytest.raises(ValueError, match="RGB channels"):
         load_mask(bad_path)
+
+
+def test_3d_tiff_stack_loading(tmp_path: Path):
+    image = np.zeros((5, 12, 13), dtype=np.float32)
+    mask = np.zeros((5, 12, 13), dtype=np.uint16)
+    mask[:, 3:8, 4:9] = 2
+    image_path = tmp_path / "volume.tif"
+    mask_path = tmp_path / "mask.tif"
+    tifffile.imwrite(image_path, image)
+    tifffile.imwrite(mask_path, mask)
+
+    loaded_image = load_image(image_path, dimensions="3d")
+    loaded_mask = load_mask(mask_path, dimensions="3d")
+
+    assert loaded_image.shape == (1, 5, 12, 13)
+    assert loaded_image.dtype == np.float32
+    assert loaded_mask.shape == (5, 12, 13)
+    assert loaded_mask.dtype == np.int64
+
+    rgb = np.zeros((12, 13, 3), dtype=np.uint8)
+    rgb_path = tmp_path / "rgb.tif"
+    tifffile.imwrite(rgb_path, rgb)
+    with pytest.raises(ValueError, match="2D RGB"):
+        load_image(rgb_path, dimensions="3d")

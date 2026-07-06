@@ -28,10 +28,14 @@ def multiclass_target(mask: np.ndarray, label_values: list[int] | None = None) -
 def boundary_target(mask: np.ndarray, width: int = 1) -> np.ndarray:
     labels = mask.astype(np.int64, copy=False)
     boundary = np.zeros(labels.shape, dtype=bool)
-    boundary[:-1, :] |= labels[:-1, :] != labels[1:, :]
-    boundary[1:, :] |= labels[:-1, :] != labels[1:, :]
-    boundary[:, :-1] |= labels[:, :-1] != labels[:, 1:]
-    boundary[:, 1:] |= labels[:, :-1] != labels[:, 1:]
+    for axis in range(labels.ndim):
+        before = [slice(None)] * labels.ndim
+        after = [slice(None)] * labels.ndim
+        before[axis] = slice(0, -1)
+        after[axis] = slice(1, None)
+        differences = labels[tuple(before)] != labels[tuple(after)]
+        boundary[tuple(before)] |= differences
+        boundary[tuple(after)] |= differences
     boundary &= labels != 0
     if width > 1 and ndi is not None:
         boundary = ndi.binary_dilation(boundary, iterations=int(width) - 1)

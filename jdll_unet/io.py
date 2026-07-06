@@ -142,11 +142,40 @@ def load_array(path: Path | str) -> np.ndarray:
     raise DataFormatError(f"Unsupported image format: {path.suffix}")
 
 
-def load_image(path: Path | str) -> np.ndarray:
-    """Load an image as float32 channels-first C,Y,X without normalizing."""
+def _looks_like_rgb_last_axis(arr: np.ndarray) -> bool:
+    return arr.ndim == 3 and arr.shape[-1] in {1, 3, 4} and arr.shape[0] not in {1, 3, 4}
+
+
+def load_image(path: Path | str, dimensions: str = "2d") -> np.ndarray:
+    """Load an image as float32 channels-first C,Y,X or C,Z,Y,X without normalizing."""
 
     arr = np.asarray(load_array(path))
-    if arr.ndim == 2:
+    dimensions = dimensions.lower()
+    if dimensions == "3d":
+        if arr.ndim == 3:
+            if _looks_like_rgb_last_axis(arr):
+                raise DataFormatError(
+                    f"Image {path} looks like a 2D RGB image, not a 3D volume. "
+                    "Use a TIFF stack with shape Z,Y,X or a multichannel volume with shape C,Z,Y,X or Z,Y,X,C."
+                )
+            if arr.shape[0] <= 1:
+                raise DataFormatError(f"3D image {path} must have a real Z dimension, got shape {arr.shape}")
+            out = arr[None, ...]
+        elif arr.ndim == 4:
+            first_is_channel = arr.shape[0] in {1, 2, 3, 4}
+            last_is_channel = arr.shape[-1] in {1, 2, 3, 4}
+            if first_is_channel and not last_is_channel:
+                out = arr
+            elif last_is_channel and not first_is_channel:
+                out = np.moveaxis(arr, -1, 0)
+            else:
+                raise DataFormatError(
+                    f"Ambiguous 3D multichannel image shape {arr.shape} for {path}; "
+                    "expected C,Z,Y,X or Z,Y,X,C."
+                )
+        else:
+            raise DataFormatError(f"Unsupported 3D image rank {arr.ndim} for {path}")
+    elif arr.ndim == 2:
         out = arr[None, ...]
     elif arr.ndim == 3:
         out = np.moveaxis(arr[..., :3], -1, 0) if arr.shape[-1] in {1, 3, 4} and arr.shape[0] not in {1, 3, 4} else arr
@@ -169,16 +198,23 @@ def _collapse_mask_channels(arr: np.ndarray, path: Path) -> np.ndarray:
     )
 
 
-def load_mask(path: Path | str) -> np.ndarray:
-    """Load an integer mask while preserving label values."""
+def load_mask(path: Path | str, dimensions: str | None = None) -> np.ndarray:
+    """Load a 2D or 3D integer mask while preserving label values."""
 
     path = Path(path)
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         raise DataFormatError("JPEG masks are not supported because compression changes labels")
     arr = np.asarray(load_array(path))
     arr = _collapse_mask_channels(arr, path)
-    if arr.ndim != 2:
-        raise DataFormatError(f"Only 2D masks are supported in this backend milestone, got shape {arr.shape}")
+    if dimensions == "2d" and arr.ndim != 2:
+        raise DataFormatError(f"2D masks must have shape Y,X, got shape {arr.shape}")
+    if dimensions == "3d":
+        if arr.ndim != 3:
+            raise DataFormatError(f"3D masks must have shape Z,Y,X, got shape {arr.shape}")
+        if arr.shape[-1] in {3, 4} and arr.shape[0] not in {1, 3, 4}:
+            raise DataFormatError(f"Mask {path} looks like a 2D RGB image, not a 3D label volume")
+    elif arr.ndim not in {2, 3}:
+        raise DataFormatError(f"Masks must be 2D or 3D integer label arrays, got shape {arr.shape}")
     if np.issubdtype(arr.dtype, np.floating):
         if not np.all(np.isfinite(arr)):
             raise DataFormatError(f"Mask {path} contains non-finite values")

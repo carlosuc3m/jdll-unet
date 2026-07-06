@@ -1,4 +1,4 @@
-"""Cheap nnU-Net-inspired 2D augmentation and patch sampling."""
+"""Cheap nnU-Net-inspired 2D/3D augmentation and patch sampling."""
 
 from __future__ import annotations
 
@@ -19,13 +19,15 @@ except Exception:  # pragma: no cover
 @dataclass(slots=True)
 class AugmentationConfig:
     profile: str = "fast"
-    patch_size: tuple[int, int] = (96, 96)
+    patch_size: tuple[int, ...] = (96, 96)
     foreground_oversampling: bool = True
     foreground_probability: float = 0.4
     flip_probability: float = 0.5
     rotate90_probability: float = 0.25
     brightness_probability: float = 0.3
     brightness_range: tuple[float, float] = (0.75, 1.25)
+    shift_probability: float = 0.15
+    shift_range: tuple[float, float] = (-0.1, 0.1)
     contrast_probability: float = 0.3
     contrast_range: tuple[float, float] = (0.75, 1.25)
     gamma_probability: float = 0.2
@@ -44,7 +46,7 @@ class AugmentationConfig:
 
 def make_augmentation_config(
     profile: str,
-    patch_size: tuple[int, int],
+    patch_size: tuple[int, ...],
     foreground_oversampling: bool,
     foreground_probability: float,
     overrides: dict[str, Any] | None = None,
@@ -76,47 +78,43 @@ def make_augmentation_config(
     return cfg
 
 
-def _pad_to_shape(image: np.ndarray, mask: np.ndarray, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    height, width = image.shape[-2:]
-    pad_y = max(0, shape[0] - height)
-    pad_x = max(0, shape[1] - width)
-    if pad_y == 0 and pad_x == 0:
+def _pad_to_shape(image: np.ndarray, mask: np.ndarray, shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    spatial_shape = image.shape[1:]
+    pads = [max(0, int(target) - int(current)) for target, current in zip(shape, spatial_shape, strict=True)]
+    if all(pad == 0 for pad in pads):
         return image, mask
-    before_y = pad_y // 2
-    after_y = pad_y - before_y
-    before_x = pad_x // 2
-    after_x = pad_x - before_x
-    image = np.pad(image, ((0, 0), (before_y, after_y), (before_x, after_x)), mode="reflect")
-    mask = np.pad(mask, ((before_y, after_y), (before_x, after_x)), mode="constant")
+    spatial_pads = [(pad // 2, pad - pad // 2) for pad in pads]
+    image = np.pad(image, ((0, 0), *spatial_pads), mode="reflect")
+    mask = np.pad(mask, tuple(spatial_pads), mode="constant")
     return image, mask
 
 
 def sample_patch(
     image: np.ndarray,
     mask: np.ndarray,
-    patch_size: tuple[int, int],
+    patch_size: tuple[int, ...],
     rng: np.random.Generator,
     foreground_oversampling: bool = True,
     foreground_probability: float = 0.4,
     center: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     image, mask = _pad_to_shape(image, mask, patch_size)
-    height, width = image.shape[-2:]
-    patch_h, patch_w = patch_size
+    spatial_shape = image.shape[1:]
     if center:
-        y0 = max(0, (height - patch_h) // 2)
-        x0 = max(0, (width - patch_w) // 2)
+        starts = [max(0, (dim - patch) // 2) for dim, patch in zip(spatial_shape, patch_size, strict=True)]
     elif foreground_oversampling and rng.random() < foreground_probability and np.any(mask != 0):
-        ys, xs = np.nonzero(mask != 0)
-        index = int(rng.integers(0, len(ys)))
-        cy, cx = int(ys[index]), int(xs[index])
-        y0 = int(np.clip(cy - patch_h // 2, 0, max(0, height - patch_h)))
-        x0 = int(np.clip(cx - patch_w // 2, 0, max(0, width - patch_w)))
+        coords = np.nonzero(mask != 0)
+        index = int(rng.integers(0, len(coords[0])))
+        center_coords = [int(axis_coords[index]) for axis_coords in coords]
+        starts = [
+            int(np.clip(coord - patch // 2, 0, max(0, dim - patch)))
+            for coord, dim, patch in zip(center_coords, spatial_shape, patch_size, strict=True)
+        ]
     else:
-        y0 = int(rng.integers(0, max(1, height - patch_h + 1)))
-        x0 = int(rng.integers(0, max(1, width - patch_w + 1)))
-    patch_img = image[:, y0 : y0 + patch_h, x0 : x0 + patch_w]
-    patch_mask = mask[y0 : y0 + patch_h, x0 : x0 + patch_w]
+        starts = [int(rng.integers(0, max(1, dim - patch + 1))) for dim, patch in zip(spatial_shape, patch_size, strict=True)]
+    slices = tuple(slice(start, start + patch) for start, patch in zip(starts, patch_size, strict=True))
+    patch_img = image[(slice(None), *slices)]
+    patch_mask = mask[slices]
     return np.ascontiguousarray(patch_img), np.ascontiguousarray(patch_mask)
 
 
@@ -145,11 +143,16 @@ def _low_resolution(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         return image
     factor = float(rng.uniform(0.5, 0.8))
     out = np.empty_like(image)
+    target_shape = image.shape[1:]
     for channel in range(image.shape[0]):
-        small = ndi.zoom(image[channel], factor, order=1)
-        zoom = (image.shape[1] / small.shape[0], image.shape[2] / small.shape[1])
+        small = ndi.zoom(image[channel], [factor] * image[channel].ndim, order=1)
+        zoom = tuple(target / max(current, 1) for target, current in zip(target_shape, small.shape, strict=True))
         restored = ndi.zoom(small, zoom, order=1)
-        out[channel] = restored[: image.shape[1], : image.shape[2]]
+        pads = [(0, max(0, target - current)) for target, current in zip(target_shape, restored.shape, strict=True)]
+        if any(pad_after > 0 for _pad_before, pad_after in pads):
+            restored = np.pad(restored, pads, mode="edge")
+        slices = tuple(slice(0, size) for size in target_shape)
+        out[channel] = restored[slices]
     return out
 
 
@@ -173,17 +176,15 @@ def apply_augmentation(
     if not training:
         return image.astype(np.float32, copy=False), mask.astype(np.int64, copy=False)
 
-    if rng.random() < cfg.flip_probability:
-        image = image[..., ::-1]
-        mask = mask[..., ::-1]
-    if rng.random() < cfg.flip_probability:
-        image = image[..., ::-1, :]
-        mask = mask[::-1, :]
+    for spatial_axis in range(mask.ndim):
+        if rng.random() < cfg.flip_probability:
+            image = np.flip(image, axis=spatial_axis + 1)
+            mask = np.flip(mask, axis=spatial_axis)
     if rng.random() < cfg.rotate90_probability and image.shape[-2] == image.shape[-1]:
         k = int(rng.integers(0, 4))
         image = np.rot90(image, k, axes=(-2, -1))
         mask = np.rot90(mask, k, axes=(-2, -1))
-    if cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
+    if mask.ndim == 2 and cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
         image, mask = _spatial_affine(image, mask, rng, cfg.rotation_degrees, cfg.scale_range)
     if cfg.lowres_probability > 0 and rng.random() < cfg.lowres_probability:
         image = _low_resolution(image, rng)
@@ -193,13 +194,17 @@ def apply_augmentation(
             image[channel] = ndi.gaussian_filter(image[channel], sigma=sigma)
     if rng.random() < cfg.brightness_probability:
         image = image * float(rng.uniform(*cfg.brightness_range))
+    if rng.random() < cfg.shift_probability:
+        image = image + float(rng.uniform(*cfg.shift_range))
     if rng.random() < cfg.contrast_probability:
-        mean = image.mean(axis=(-2, -1), keepdims=True)
+        spatial_axes = tuple(range(1, image.ndim))
+        mean = image.mean(axis=spatial_axes, keepdims=True)
         image = (image - mean) * float(rng.uniform(*cfg.contrast_range)) + mean
     if rng.random() < cfg.gamma_probability:
         gamma = float(rng.uniform(*cfg.gamma_range))
-        min_value = image.min(axis=(-2, -1), keepdims=True)
-        max_value = image.max(axis=(-2, -1), keepdims=True)
+        spatial_axes = tuple(range(1, image.ndim))
+        min_value = image.min(axis=spatial_axes, keepdims=True)
+        max_value = image.max(axis=spatial_axes, keepdims=True)
         denom = np.maximum(max_value - min_value, 1e-6)
         normalized = np.clip((image - min_value) / denom, 0.0, 1.0)
         image = np.power(normalized, gamma) * denom + min_value

@@ -10,7 +10,7 @@ points:
 from jdll_unet.appose_api import train, infer, detect_task
 ```
 
-The implementation supports lightweight 2D and 2.5D UNet training and
+The implementation supports lightweight 2D, 2.5D, and true 3D UNet training and
 inference for binary semantic, multiclass semantic, and instance-friendly
 segmentation datasets laid out as `images/` and `masks/`, or as explicit
 `train/images`, `train/masks`, `val/images`, and `val/masks` folders.
@@ -23,6 +23,8 @@ Available 2D architecture names:
 - `medium-2d`: wider/deeper baseline UNet for GPUs or longer CPU runs.
 - `resenc-tiny-2d`: tiny UNet with residual encoder blocks.
 - `resenc-medium-2d`: medium UNet with residual encoder blocks.
+- `tiny-3d`: true 3D UNet using `Conv3d` for volumetric TIFF stacks.
+- `medium-3d`: wider true 3D UNet for GPU or longer CPU runs.
 
 The `resenc-*` variants keep the UNet encoder-decoder shape but replace encoder
 conv blocks with residual blocks for better gradient flow. Deep supervision can
@@ -34,6 +36,11 @@ Convolutional UNet blocks use group normalization by default because it is
 stable for the small batches common in biomedical segmentation. Set
 `"model_normalization"` to `group`, `instance`, `batch`, or `none` to override
 the default. This is separate from the image-intensity `"normalization"` setting.
+
+True 3D models use image tensors shaped `C,Z,Y,X`, masks shaped `Z,Y,X`, and
+logits shaped `B,C,Z,Y,X`. Multipage TIFF/OME-TIFF image and label stacks are
+loaded as volumes for `tiny-3d` and `medium-3d`; RGB 2D images are rejected for
+true 3D models instead of being guessed as volumes.
 
 ## Install
 

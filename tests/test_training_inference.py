@@ -23,6 +23,22 @@ def _synthetic_dataset(root: Path, count: int = 4) -> None:
         tifffile.imwrite(masks / f"sample_{index}.tif", mask)
 
 
+def _synthetic_volume_dataset(root: Path, count: int = 3) -> None:
+    images = root / "images"
+    masks = root / "masks"
+    images.mkdir(parents=True)
+    masks.mkdir(parents=True)
+    zz, yy, xx = np.mgrid[:8, :16, :16]
+    for index in range(count):
+        cz = 3 + (index % 2)
+        cy = 7 + (index % 2)
+        cx = 7 + (index // 2)
+        mask = (((zz - cz) ** 2) / 5 + (yy - cy) ** 2 + (xx - cx) ** 2 <= 4**2).astype(np.uint8)
+        image = (mask.astype(np.float32) * 160 + np.random.default_rng(index).normal(15, 2, mask.shape)).astype(np.float32)
+        tifffile.imwrite(images / f"volume_{index}.tif", image)
+        tifffile.imwrite(masks / f"volume_{index}.tif", mask)
+
+
 def test_tiny_training_and_inference_smoke(tmp_path: Path):
     dataset = tmp_path / "dataset"
     _synthetic_dataset(dataset)
@@ -195,3 +211,54 @@ def test_resenc_deep_supervision_training_smoke(tmp_path: Path):
         {"image_path": str(dataset / "images" / "sample_0.tif")},
     )
     assert inference["outputs"]["foreground_probability"].shape == (32, 32)
+
+
+def test_tiny_3d_training_and_inference_smoke(tmp_path: Path):
+    dataset = tmp_path / "volume_dataset"
+    _synthetic_volume_dataset(dataset)
+    output_dir = tmp_path / "volume_model"
+
+    result = train(
+        {
+            "model_name": "volume-smoke",
+            "output_dir": str(output_dir),
+            "dataset_path": str(dataset),
+            "architecture": "tiny-3d",
+            "device": "cpu",
+            "epochs": 1,
+            "seed": 456,
+            "patch_size": [8, 16, 16],
+            "batch_size": 1,
+            "learning_rate": 0.001,
+            "preview_count": 1,
+            "augmentation": {
+                "flip_probability": 0.0,
+                "rotate90_probability": 0.0,
+                "brightness_probability": 0.0,
+                "contrast_probability": 0.0,
+                "gamma_probability": 0.0,
+                "noise_probability": 0.0,
+            },
+        }
+    )
+
+    assert result["task"] == "binary_semantic"
+    assert result["config"]["architecture_config"]["dimensions"] == "3d"
+    assert result["config"]["training"]["patch_size"] == [8, 16, 16]
+    assert result["config"]["input_axes"] == "zyx"
+    assert result["config"]["output_axes"] == "zyx"
+    assert Path(result["latest_preview_path"]).exists()
+    preview = json.loads(Path(result["latest_preview_path"]).read_text())
+    assert preview["items"][0]["z_index"] == 4
+
+    checkpoint = torch.load(output_dir / "weights_last.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["architecture_config"]["dimensions"] == "3d"
+
+    inference = infer(
+        {"model_path": str(output_dir / "model.pt"), "device": "cpu", "tile_size": [8, 16, 16]},
+        {"image_path": str(dataset / "images" / "volume_0.tif")},
+    )
+
+    assert inference["metadata"]["input_shape"] == [1, 8, 16, 16]
+    assert inference["outputs"]["foreground_probability"].shape == (8, 16, 16)
+    assert inference["outputs"]["mask"].shape == (8, 16, 16)

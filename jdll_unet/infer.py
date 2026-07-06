@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -78,14 +79,15 @@ def load_model(model_path: str | Path, device: str | torch.device = "cpu") -> tu
     return model, config
 
 
-def _parse_tile_size(value: Any) -> tuple[int, int]:
+def _parse_tile_size(value: Any, dimensions: str) -> tuple[int, ...]:
+    expected = 3 if dimensions == "3d" else 2
     if isinstance(value, int):
-        tile_size = (value, value)
-    elif isinstance(value, (list, tuple)) and len(value) == 2:
-        tile_size = (int(value[0]), int(value[1]))
+        tile_size = tuple([value] * expected)
+    elif isinstance(value, (list, tuple)) and len(value) == expected:
+        tile_size = tuple(int(item) for item in value)
     else:
-        raise InferenceError("tile_size must be an int or a length-2 sequence")
-    if tile_size[0] <= 0 or tile_size[1] <= 0:
+        raise InferenceError(f"tile_size must be an int or a length-{expected} sequence")
+    if any(item <= 0 for item in tile_size):
         raise InferenceError("tile_size values must be positive")
     return tile_size
 
@@ -97,14 +99,13 @@ def _parse_overlap(value: Any) -> float:
     return overlap
 
 
-def _pad_image(image: np.ndarray, patch_size: tuple[int, int]) -> tuple[np.ndarray, tuple[int, int]]:
-    height, width = image.shape[-2:]
-    pad_y = max(0, patch_size[0] - height)
-    pad_x = max(0, patch_size[1] - width)
-    if pad_y == 0 and pad_x == 0:
-        return image, (height, width)
-    padded = np.pad(image, ((0, 0), (0, pad_y), (0, pad_x)), mode="edge")
-    return padded, (height, width)
+def _pad_image(image: np.ndarray, patch_size: tuple[int, ...]) -> tuple[np.ndarray, tuple[int, ...]]:
+    spatial_shape = tuple(int(item) for item in image.shape[1:])
+    pads = [max(0, patch - size) for patch, size in zip(patch_size, spatial_shape, strict=True)]
+    if all(pad == 0 for pad in pads):
+        return image, spatial_shape
+    padded = np.pad(image, ((0, 0), *((0, pad) for pad in pads)), mode="edge")
+    return padded, spatial_shape
 
 
 def _starts(length: int, tile: int, stride: int) -> list[int]:
@@ -121,36 +122,48 @@ def tiled_predict(
     model: torch.nn.Module,
     image: np.ndarray,
     device: torch.device,
-    tile_size: tuple[int, int],
+    tile_size: tuple[int, ...],
     overlap: float = 0.25,
 ) -> np.ndarray:
     image, original_shape = _pad_image(image, tile_size)
-    _channels, height, width = image.shape
-    stride_y = max(1, int(tile_size[0] * (1.0 - overlap)))
-    stride_x = max(1, int(tile_size[1] * (1.0 - overlap)))
-    ys = _starts(height, tile_size[0], stride_y)
-    xs = _starts(width, tile_size[1], stride_x)
+    spatial_shape = tuple(int(item) for item in image.shape[1:])
+    strides = tuple(max(1, int(tile * (1.0 - overlap))) for tile in tile_size)
+    starts_by_axis = [
+        _starts(length, tile, stride)
+        for length, tile, stride in zip(spatial_shape, tile_size, strides, strict=True)
+    ]
     output_channels = int(model.config.output_channels)
-    accum = torch.zeros((output_channels, height, width), dtype=torch.float32, device=device)
-    counts = torch.zeros((1, height, width), dtype=torch.float32, device=device)
+    accum = torch.zeros((output_channels, *spatial_shape), dtype=torch.float32, device=device)
+    counts = torch.zeros((1, *spatial_shape), dtype=torch.float32, device=device)
     with torch.inference_mode():
-        for y in ys:
-            for x in xs:
-                patch = image[:, y : y + tile_size[0], x : x + tile_size[1]]
-                patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
-                logits = primary_logits(model(patch_t))[0]
-                if logits.shape[-2:] != tuple(tile_size):
-                    logits = F.interpolate(logits[None], size=tile_size, mode="bilinear", align_corners=False)[0]
-                accum[:, y : y + tile_size[0], x : x + tile_size[1]] += logits
-                counts[:, y : y + tile_size[0], x : x + tile_size[1]] += 1.0
+        for starts in product(*starts_by_axis):
+            spatial_slices = tuple(slice(start, start + tile) for start, tile in zip(starts, tile_size, strict=True))
+            patch = image[(slice(None), *spatial_slices)]
+            patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
+            logits = primary_logits(model(patch_t))[0]
+            if logits.shape[1:] != tuple(tile_size):
+                mode = "trilinear" if len(tile_size) == 3 else "bilinear"
+                logits = F.interpolate(logits[None], size=tile_size, mode=mode, align_corners=False)[0]
+            accum[(slice(None), *spatial_slices)] += logits
+            counts[(slice(None), *spatial_slices)] += 1.0
     logits = (accum / counts.clamp_min(1.0)).detach().cpu().numpy()
-    return logits[:, : original_shape[0], : original_shape[1]]
+    crop = tuple(slice(0, size) for size in original_shape)
+    return logits[(slice(None), *crop)]
 
 
-def _load_input(inputs: dict[str, Any] | np.ndarray) -> np.ndarray:
+def _load_input(inputs: dict[str, Any] | np.ndarray, dimensions: str) -> np.ndarray:
     if isinstance(inputs, np.ndarray):
         image = inputs
-        if image.ndim == 2:
+        if dimensions == "3d":
+            if image.ndim == 3:
+                if image.shape[-1] in {1, 3, 4} and image.shape[0] not in {1, 3, 4}:
+                    raise InferenceError(f"3D model input looks like a 2D RGB image, got shape {image.shape}")
+                out = image[None].astype(np.float32, copy=False)
+            elif image.ndim == 4:
+                out = image.astype(np.float32, copy=False)
+            else:
+                raise InferenceError(f"Unsupported 3D input image shape: {image.shape}")
+        elif image.ndim == 2:
             out = image[None].astype(np.float32, copy=False)
         elif image.ndim == 3 and image.shape[-1] in {1, 3, 4}:
             out = np.moveaxis(image[..., :3], -1, 0).astype(np.float32, copy=False)
@@ -162,9 +175,9 @@ def _load_input(inputs: dict[str, Any] | np.ndarray) -> np.ndarray:
             raise InferenceError("Inference input contains non-finite values")
         return np.ascontiguousarray(out)
     if "image" in inputs:
-        return _load_input(np.asarray(inputs["image"]))
+        return _load_input(np.asarray(inputs["image"]), dimensions)
     if "image_path" in inputs:
-        return load_image(inputs["image_path"])
+        return load_image(inputs["image_path"], dimensions=dimensions)
     raise InferenceError("Inference inputs must contain 'image' or 'image_path'")
 
 
@@ -172,6 +185,10 @@ def _validate_input_channels(image: np.ndarray, model_config: dict[str, Any]) ->
     expected = int(model_config.get("input_channels", image.shape[0]))
     if image.shape[0] != expected:
         raise InferenceError(f"Model expects {expected} input channel(s), got {image.shape[0]}")
+    dimensions = (model_config.get("architecture_config") or {}).get("dimensions", "2d")
+    expected_rank = 4 if dimensions == "3d" else 3
+    if image.ndim != expected_rank:
+        raise InferenceError(f"Model expects {dimensions} input rank {expected_rank}, got shape {image.shape}")
 
 
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
@@ -184,12 +201,13 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         raise InferenceError("Inference config requires model_path, model_folder, or checkpoint")
     device = resolve_device(str(config.get("device", "cpu")))
     model, model_config = load_model(model_path, device)
-    image = normalize_image(_load_input(inputs), model_config.get("normalization"))
+    dimensions = str((model_config.get("architecture_config") or {}).get("dimensions", "2d"))
+    image = normalize_image(_load_input(inputs, dimensions), model_config.get("normalization"))
     _validate_input_channels(image, model_config)
     task_name = str(model_config["task"])
     train_cfg = model_config.get("training", {})
-    tile_size = config.get("tile_size") or train_cfg.get("patch_size") or [128, 128]
-    tile_size = _parse_tile_size(tile_size)
+    tile_size = config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
+    tile_size = _parse_tile_size(tile_size, dimensions)
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
     logits = tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
 

@@ -26,8 +26,8 @@ def binary_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e
 def multiclass_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     probs = torch.softmax(logits, dim=1)
     classes = logits.shape[1]
-    one_hot = F.one_hot(target.long().clamp_min(0), num_classes=classes).permute(0, 3, 1, 2).float()
-    dims = (0, 2, 3)
+    one_hot = F.one_hot(target.long().clamp_min(0), num_classes=classes).movedim(-1, 1).float()
+    dims = (0, *range(2, probs.ndim))
     intersection = (probs * one_hot).sum(dim=dims)
     denom = probs.sum(dim=dims) + one_hot.sum(dim=dims)
     dice = (2 * intersection + eps) / (denom + eps)
@@ -95,7 +95,7 @@ def compute_loss(
 
 
 def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) -> Target:
-    size = logits.shape[-2:]
+    size = logits.shape[2:]
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
         return F.interpolate(target[:, None].float(), size=size, mode="nearest")[:, 0].long()
