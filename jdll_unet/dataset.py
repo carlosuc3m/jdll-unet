@@ -9,7 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .augment import AugmentationConfig, apply_augmentation, make_augmentation_config
+from .augment import AugmentationConfig, EmptyPatchError, apply_augmentation, make_augmentation_config
+from .errors import DatasetError
 from .io import ImageMaskPair, load_image, load_mask, normalize_image
 from .targets import prepare_target
 
@@ -19,6 +20,7 @@ class DatasetInfo:
     input_channels: int
     image_shape: tuple[int, ...]
     label_values: list[int]
+    empty_mask_count: int
 
 
 def split_pairs(
@@ -43,6 +45,7 @@ def inspect_dataset(pairs: list[ImageMaskPair], dimensions: str = "2d") -> Datas
     image = load_image(pairs[0].image, dimensions=dimensions)
     image_shape = tuple(int(item) for item in image.shape[1:])
     labels: set[int] = set()
+    empty_mask_count = 0
     for pair in pairs:
         current_image = load_image(pair.image, dimensions=dimensions)
         mask = load_mask(pair.mask, dimensions="3d" if dimensions == "3d" else "2d")
@@ -52,11 +55,25 @@ def inspect_dataset(pairs: list[ImageMaskPair], dimensions: str = "2d") -> Datas
                 f"image={tuple(current_image.shape[1:])} mask={tuple(mask.shape)}"
             )
         labels.update(int(v) for v in np.unique(mask) if int(v) != 0)
+        empty_mask_count += int(not np.any(mask != 0))
     return DatasetInfo(
         input_channels=int(image.shape[0]),
         image_shape=image_shape,
         label_values=sorted(labels),
+        empty_mask_count=empty_mask_count,
     )
+
+
+def partition_empty_pairs(
+    pairs: list[ImageMaskPair], dimensions: str = "2d"
+) -> tuple[list[ImageMaskPair], list[ImageMaskPair]]:
+    nonempty: list[ImageMaskPair] = []
+    empty: list[ImageMaskPair] = []
+    mask_dimensions = "3d" if dimensions == "3d" else "2d"
+    for pair in pairs:
+        target = nonempty if np.any(load_mask(pair.mask, dimensions=mask_dimensions) != 0) else empty
+        target.append(pair)
+    return nonempty, empty
 
 
 class JdllSegmentationDataset(Dataset):
@@ -84,11 +101,19 @@ class JdllSegmentationDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
-        pair = self.pairs[index]
-        image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
-        mask = load_mask(pair.mask, dimensions="3d" if self.dimensions == "3d" else "2d")
         rng = np.random.default_rng(self.seed + index if not self.training else None)
-        image, mask = apply_augmentation(image, mask, self.augmentation, rng=rng, training=self.training)
+        candidates = range(len(self.pairs)) if self.training else range(1)
+        for offset in candidates:
+            pair = self.pairs[(index + offset) % len(self.pairs)]
+            image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
+            mask = load_mask(pair.mask, dimensions="3d" if self.dimensions == "3d" else "2d")
+            try:
+                image, mask = apply_augmentation(image, mask, self.augmentation, rng=rng, training=self.training)
+                break
+            except EmptyPatchError:
+                continue
+        else:
+            raise DatasetError("No foreground patch could be sampled from any training image")
         target = prepare_target(self.task, mask, label_values=self.label_values)
         image_t = torch.from_numpy(image)
         if isinstance(target, dict):

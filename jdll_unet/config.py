@@ -100,6 +100,10 @@ class TrainingConfig:
     validation_fraction: float = 0.15
     foreground_oversampling: bool | str = AUTO
     foreground_probability: float | str = AUTO
+    skip_empty_images: bool = True
+    skip_empty_patches: bool = True
+    empty_patch_max_retries: int = 8
+    include_empty_patches_after_max_retries: bool = False
     augmentation_profile: str = AUTO
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
@@ -336,6 +340,13 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             validation_fraction=float(raw.get("validation_fraction", 0.15)),
             foreground_oversampling=_auto_or_bool(raw.get("foreground_oversampling", AUTO), "foreground_oversampling"),
             foreground_probability=_auto_or_float(raw.get("foreground_probability", AUTO), "foreground_probability"),
+            skip_empty_images=_coerce_bool(raw.get("skip_empty_images", True), "skip_empty_images"),
+            skip_empty_patches=_coerce_bool(raw.get("skip_empty_patches", True), "skip_empty_patches"),
+            empty_patch_max_retries=int(raw.get("empty_patch_max_retries", 8)),
+            include_empty_patches_after_max_retries=_coerce_bool(
+                raw.get("include_empty_patches_after_max_retries", False),
+                "include_empty_patches_after_max_retries",
+            ),
             augmentation_profile=str(raw.get("augmentation_profile", AUTO)),
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
@@ -398,6 +409,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("auto_focal_sample_limit must be at least 1")
     if parsed.foreground_probability != AUTO and not 0 <= float(parsed.foreground_probability) <= 1:
         raise ConfigError("foreground_probability must be in [0, 1]")
+    if parsed.empty_patch_max_retries < 0:
+        raise ConfigError("empty_patch_max_retries cannot be negative")
     _validate_auto_positive_int(parsed.input_channels, "input_channels")
     _validate_auto_positive_int(parsed.output_classes, "output_classes")
     _validate_auto_positive_int(parsed.batch_size, "batch_size")

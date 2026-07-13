@@ -33,8 +33,8 @@ from .config import (
     resolve_device,
     write_json,
 )
-from .dataset import inspect_dataset, make_dataset, split_pairs
-from .errors import ModelLoadError
+from .dataset import inspect_dataset, make_dataset, partition_empty_pairs, split_pairs
+from .errors import DatasetError, ModelLoadError
 from .io import ImageMaskPair, discover_dataset, load_mask
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
@@ -383,6 +383,21 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     architecture_probe = architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     dimensions = architecture_probe.dimensions
     info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
+    nonempty_train_pairs, empty_train_pairs = partition_empty_pairs(train_pairs, dimensions=dimensions)
+    _nonempty_val_pairs, empty_val_pairs = partition_empty_pairs(val_pairs, dimensions=dimensions)
+    if train_config.skip_empty_images:
+        train_pairs = nonempty_train_pairs
+    if not train_pairs or not nonempty_train_pairs:
+        raise DatasetError("All training masks are empty; at least one foreground annotation is required")
+    if empty_train_pairs:
+        action = "skipped" if train_config.skip_empty_images else "retained"
+        message = f"Empty training masks: {len(empty_train_pairs)} image(s) {action}."
+        logger.warning(message)
+        callbacks.emit("warning", message=message)
+    if empty_val_pairs:
+        message = f"Empty validation masks: {len(empty_val_pairs)} image(s) retained."
+        logger.warning(message)
+        callbacks.emit("warning", message=message)
     input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
@@ -456,6 +471,11 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         dimensions=dimensions,
         seed=train_config.seed,
     )
+    train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
+    train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
+    train_dataset.augmentation.include_empty_patches_after_max_retries = (
+        train_config.include_empty_patches_after_max_retries
+    )
     val_dataset = make_dataset(
         val_pairs,
         detected_task,
@@ -509,6 +529,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "model_normalization": train_config.model_normalization,
             "foreground_oversampling": foreground_oversampling,
             "foreground_probability": foreground_probability,
+            "skip_empty_images": train_config.skip_empty_images,
+            "skip_empty_patches": train_config.skip_empty_patches,
+            "empty_patch_max_retries": train_config.empty_patch_max_retries,
+            "include_empty_patches_after_max_retries": train_config.include_empty_patches_after_max_retries,
+            "empty_training_images": len(empty_train_pairs),
+            "empty_validation_images": len(empty_val_pairs),
             "augmentation_profile": augmentation_profile,
             "mixed_precision": mixed_precision,
             "deep_supervision": deep_supervision,

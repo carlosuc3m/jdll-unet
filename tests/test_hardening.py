@@ -44,6 +44,19 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
     assert focal_config.loss_weights["boundary_focal"] == 0.1
     assert focal_config.focal_alpha == 0.75
     assert focal_config.auto_focal is True
+    empty_policy = parse_training_config(
+        {
+            **_base_config(tmp_path),
+            "skip_empty_images": "false",
+            "skip_empty_patches": "true",
+            "empty_patch_max_retries": 3,
+            "include_empty_patches_after_max_retries": "true",
+        }
+    )
+    assert empty_policy.skip_empty_images is False
+    assert empty_policy.skip_empty_patches is True
+    assert empty_policy.empty_patch_max_retries == 3
+    assert empty_policy.include_empty_patches_after_max_retries is True
 
     with pytest.raises(ConfigError, match="foreground_probability"):
         parse_training_config({**_base_config(tmp_path), "foreground_probability": 2.0})
@@ -62,6 +75,9 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
 
     with pytest.raises(ConfigError, match="focal_alpha"):
         parse_training_config({**_base_config(tmp_path), "focal_alpha": 1.5})
+
+    with pytest.raises(ConfigError, match="empty_patch_max_retries"):
+        parse_training_config({**_base_config(tmp_path), "empty_patch_max_retries": -1})
 
 
 def test_write_json_is_readable_after_atomic_write(tmp_path: Path):

@@ -75,6 +75,25 @@ Training writes `config.json`, `weights_best.pt`, `weights_last.pt`,
 `model.pt`, `training.log`, `metrics.json`, and optional previews into the
 model folder.
 
+## Empty Training Samples
+
+Training excludes images with empty masks and rejects empty sampled patches by
+default. Validation images and patches are always retained, including empty
+ones, and their counts are logged. Configure the training policy with:
+
+```python
+"skip_empty_images": True,
+"skip_empty_patches": True,
+"empty_patch_max_retries": 8,
+"include_empty_patches_after_max_retries": False,
+```
+
+After the initial patch attempt, the sampler retries up to
+`empty_patch_max_retries` times. If those attempts are empty and
+`include_empty_patches_after_max_retries` is false, sampling continues from the
+next training image. If it is true, the final empty patch is used. Training
+fails clearly when every training mask is empty.
+
 ## Learning Rate Scheduling
 
 Training uses polynomial decay by default:

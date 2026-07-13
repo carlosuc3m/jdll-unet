@@ -22,6 +22,9 @@ class AugmentationConfig:
     patch_size: tuple[int, ...] = (96, 96)
     foreground_oversampling: bool = True
     foreground_probability: float = 0.4
+    skip_empty_patches: bool = True
+    empty_patch_max_retries: int = 8
+    include_empty_patches_after_max_retries: bool = False
     flip_probability: float = 0.5
     rotate90_probability: float = 0.25
     brightness_probability: float = 0.3
@@ -97,25 +100,42 @@ def sample_patch(
     foreground_oversampling: bool = True,
     foreground_probability: float = 0.4,
     center: bool = False,
+    skip_empty: bool = False,
+    max_retries: int = 0,
+    include_empty_after_max_retries: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     image, mask = _pad_to_shape(image, mask, patch_size)
     spatial_shape = image.shape[1:]
-    if center:
-        starts = [max(0, (dim - patch) // 2) for dim, patch in zip(spatial_shape, patch_size, strict=True)]
-    elif foreground_oversampling and rng.random() < foreground_probability and np.any(mask != 0):
-        coords = np.nonzero(mask != 0)
-        index = int(rng.integers(0, len(coords[0])))
-        center_coords = [int(axis_coords[index]) for axis_coords in coords]
-        starts = [
-            int(np.clip(coord - patch // 2, 0, max(0, dim - patch)))
-            for coord, dim, patch in zip(center_coords, spatial_shape, patch_size, strict=True)
-        ]
-    else:
-        starts = [int(rng.integers(0, max(1, dim - patch + 1))) for dim, patch in zip(spatial_shape, patch_size, strict=True)]
-    slices = tuple(slice(start, start + patch) for start, patch in zip(starts, patch_size, strict=True))
-    patch_img = image[(slice(None), *slices)]
-    patch_mask = mask[slices]
-    return np.ascontiguousarray(patch_img), np.ascontiguousarray(patch_mask)
+    last_patch: tuple[np.ndarray, np.ndarray] | None = None
+    for _attempt in range(max_retries + 1):
+        if center:
+            starts = [max(0, (dim - patch) // 2) for dim, patch in zip(spatial_shape, patch_size, strict=True)]
+        elif foreground_oversampling and rng.random() < foreground_probability and np.any(mask != 0):
+            coords = np.nonzero(mask != 0)
+            index = int(rng.integers(0, len(coords[0])))
+            center_coords = [int(axis_coords[index]) for axis_coords in coords]
+            starts = [
+                int(np.clip(coord - patch // 2, 0, max(0, dim - patch)))
+                for coord, dim, patch in zip(center_coords, spatial_shape, patch_size, strict=True)
+            ]
+        else:
+            starts = [
+                int(rng.integers(0, max(1, dim - patch + 1)))
+                for dim, patch in zip(spatial_shape, patch_size, strict=True)
+            ]
+        slices = tuple(slice(start, start + patch) for start, patch in zip(starts, patch_size, strict=True))
+        last_patch = image[(slice(None), *slices)], mask[slices]
+        if not skip_empty or np.any(last_patch[1] != 0):
+            return np.ascontiguousarray(last_patch[0]), np.ascontiguousarray(last_patch[1])
+
+    assert last_patch is not None
+    if include_empty_after_max_retries:
+        return np.ascontiguousarray(last_patch[0]), np.ascontiguousarray(last_patch[1])
+    raise EmptyPatchError("No foreground patch found within the configured retry limit")
+
+
+class EmptyPatchError(RuntimeError):
+    """Signal that patch sampling should continue with another training image."""
 
 
 def _spatial_affine(
@@ -172,6 +192,9 @@ def apply_augmentation(
         foreground_oversampling=cfg.foreground_oversampling,
         foreground_probability=cfg.foreground_probability,
         center=not training,
+        skip_empty=training and cfg.skip_empty_patches,
+        max_retries=cfg.empty_patch_max_retries if training and cfg.skip_empty_patches else 0,
+        include_empty_after_max_retries=cfg.include_empty_patches_after_max_retries,
     )
     if not training:
         return image.astype(np.float32, copy=False), mask.astype(np.int64, copy=False)

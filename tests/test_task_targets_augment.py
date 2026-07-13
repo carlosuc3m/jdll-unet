@@ -3,9 +3,13 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-from jdll_unet.augment import apply_augmentation, make_augmentation_config
+from jdll_unet.augment import EmptyPatchError, apply_augmentation, make_augmentation_config, sample_patch
+from jdll_unet.dataset import make_dataset, partition_empty_pairs
+from jdll_unet.errors import DatasetError
+from jdll_unet.io import ImageMaskPair
 from jdll_unet.targets import binary_target, instance_targets, multiclass_target
 from jdll_unet.task_detect import detect_task
+from jdll_unet.trainer import train
 
 
 def _write_dataset(root: Path, masks: list[np.ndarray]) -> None:
@@ -138,3 +142,103 @@ def test_3d_augmentation_keeps_shape_and_types():
     assert aug_mask.shape == (6, 16, 16)
     assert aug_image.dtype == np.float32
     assert np.issubdtype(aug_mask.dtype, np.integer)
+
+
+def test_empty_patch_retry_policy():
+    image = np.zeros((1, 16, 16), dtype=np.float32)
+    mask = np.zeros((16, 16), dtype=np.int64)
+
+    with np.testing.assert_raises(EmptyPatchError):
+        sample_patch(
+            image,
+            mask,
+            (8, 8),
+            np.random.default_rng(1),
+            skip_empty=True,
+            max_retries=2,
+            include_empty_after_max_retries=False,
+        )
+
+    _, accepted_mask = sample_patch(
+        image,
+        mask,
+        (8, 8),
+        np.random.default_rng(1),
+        skip_empty=True,
+        max_retries=2,
+        include_empty_after_max_retries=True,
+    )
+    assert not np.any(accepted_mask)
+
+
+def test_training_dataset_moves_to_next_image_after_empty_patch(tmp_path: Path):
+    empty_mask = np.zeros((16, 16), dtype=np.uint16)
+    positive_mask = np.ones((16, 16), dtype=np.uint16)
+    _write_dataset(tmp_path, [empty_mask, positive_mask])
+    pairs = [
+        ImageMaskPair(tmp_path / "images" / f"sample_{index}.tif", tmp_path / "masks" / f"sample_{index}.tif", f"sample_{index}")
+        for index in range(2)
+    ]
+    nonempty, empty = partition_empty_pairs(pairs)
+    assert nonempty == [pairs[1]]
+    assert empty == [pairs[0]]
+
+    dataset = make_dataset(
+        pairs,
+        task="binary_semantic",
+        label_values=[1],
+        normalization=None,
+        profile="fast",
+        patch_size=(8, 8),
+        foreground_oversampling=False,
+        foreground_probability=0.0,
+        augmentation_overrides={
+            "skip_empty_patches": True,
+            "empty_patch_max_retries": 1,
+            "include_empty_patches_after_max_retries": False,
+        },
+        training=True,
+        dimensions="2d",
+        seed=3,
+    )
+
+    _, target = dataset[0]
+    assert target.sum().item() == 64
+
+
+def test_validation_keeps_empty_patch(tmp_path: Path):
+    _write_dataset(tmp_path, [np.zeros((16, 16), dtype=np.uint16)])
+    pair = ImageMaskPair(tmp_path / "images/sample_0.tif", tmp_path / "masks/sample_0.tif", "sample_0")
+    dataset = make_dataset(
+        [pair],
+        task="binary_semantic",
+        label_values=[1],
+        normalization=None,
+        profile="fast",
+        patch_size=(8, 8),
+        foreground_oversampling=False,
+        foreground_probability=0.0,
+        augmentation_overrides={},
+        training=False,
+        dimensions="2d",
+        seed=3,
+    )
+
+    _, target = dataset[0]
+    assert target.sum().item() == 0
+
+
+def test_training_fails_clearly_when_all_masks_are_empty(tmp_path: Path):
+    dataset_path = tmp_path / "dataset"
+    _write_dataset(dataset_path, [np.zeros((16, 16), dtype=np.uint16)] * 2)
+
+    with np.testing.assert_raises_regex(DatasetError, "All training masks are empty"):
+        train(
+            {
+                "model_name": "all-empty",
+                "output_dir": tmp_path / "model",
+                "dataset_path": dataset_path,
+                "epochs": 1,
+                "patch_size": [8, 8],
+            }
+        )
