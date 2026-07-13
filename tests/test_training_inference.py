@@ -148,7 +148,7 @@ def test_instance_scale_normalization_rejects_3d(tmp_path: Path):
     dataset = tmp_path / "instance_volume_dataset"
     _synthetic_volume_dataset(dataset, count=2)
 
-    with pytest.raises(ConfigError, match="supports 2D models only"):
+    with pytest.raises(ConfigError, match="supports 2D and 2.5D models only"):
         train(
             {
                 "model_name": "unsupported-instance-scale-3d",
@@ -325,3 +325,54 @@ def test_tiny_3d_training_and_inference_smoke(tmp_path: Path):
     assert inference["metadata"]["input_shape"] == [1, 8, 16, 16]
     assert inference["outputs"]["foreground_probability"].shape == (8, 16, 16)
     assert inference["outputs"]["mask"].shape == (8, 16, 16)
+
+
+def test_25d_instance_training_and_full_volume_inference(tmp_path: Path):
+    dataset = tmp_path / "instance_25d_dataset"
+    images = dataset / "images"
+    masks = dataset / "masks"
+    images.mkdir(parents=True)
+    masks.mkdir(parents=True)
+    for volume_index in range(3):
+        mask = np.zeros((5, 32, 32), dtype=np.uint16)
+        mask[1:4, 6:12, 6:12] = 1
+        mask[1:4, 19:25, 19:25] = 2
+        image = mask.astype(np.float32) * 100 + np.random.default_rng(volume_index).normal(10, 1, mask.shape)
+        tifffile.imwrite(images / f"volume_{volume_index}.tif", image.astype(np.float32))
+        tifffile.imwrite(masks / f"volume_{volume_index}.tif", mask)
+
+    output_dir = tmp_path / "instance_25d_model"
+    result = train(
+        {
+            "model_name": "instance-25d",
+            "output_dir": output_dir,
+            "dataset_path": dataset,
+            "task": "instance_friendly",
+            "architecture": "resenc-tiny-2.5d",
+            "context_slices": 3,
+            "device": "cpu",
+            "epochs": 1,
+            "patch_size": [24, 24],
+            "batch_size": 2,
+            "preview_count": 0,
+            "augmentation": {
+                "flip_probability": 0.0,
+                "rotate90_probability": 0.0,
+                "brightness_probability": 0.0,
+                "contrast_probability": 0.0,
+                "gamma_probability": 0.0,
+                "noise_probability": 0.0,
+            },
+        }
+    )
+
+    assert result["config"]["architecture_config"]["dimensions"] == "2.5d"
+    assert result["config"]["architecture_config"]["input_channels"] == 3
+    assert result["config"]["architecture_config"]["context_slices"] == 3
+    inference = infer(
+        {"model_path": result["model_path"], "device": "cpu", "object_size": 7.0, "tile_size": [24, 24]},
+        {"image_path": images / "volume_0.tif"},
+    )
+    assert inference["outputs"]["foreground_probability"].shape == (5, 32, 32)
+    assert inference["outputs"]["boundary_probability"].shape == (5, 32, 32)
+    assert inference["outputs"]["labels"].shape == (5, 32, 32)

@@ -18,6 +18,91 @@ class InstanceSizeEstimate:
     available_instances: int
 
 
+@dataclass(frozen=True, slots=True)
+class InstanceLabelRepair:
+    labels: np.ndarray
+    original_labels: int
+    repaired_components: int
+
+
+def canonicalize_instance_volume(mask: np.ndarray) -> InstanceLabelRepair:
+    """Convert binary/disconnected 3D labels into unique connected instance IDs."""
+
+    if mask.ndim != 3:
+        raise ValueError("Instance volume canonicalization requires a Z,Y,X mask")
+    source_labels = [int(value) for value in np.unique(mask) if int(value) != 0]
+    output = np.zeros(mask.shape, dtype=np.int64)
+    next_label = max(source_labels, default=0) + 1
+    repaired = 0
+    structure = ndi.generate_binary_structure(3, 1)
+    for source_label in source_labels:
+        components, count = ndi.label(mask == source_label, structure=structure)
+        for component in range(1, int(count) + 1):
+            assigned = source_label if component == 1 else next_label
+            if component > 1:
+                next_label += 1
+                repaired += 1
+            output[components == component] = assigned
+    return InstanceLabelRepair(output, len(source_labels), repaired)
+
+
+def estimate_volume_instance_size(
+    mask: np.ndarray,
+    max_instances: int = 21,
+    exclude_xy_border: bool = True,
+    min_instance_area: int = 4,
+    seed: int = 0,
+) -> tuple[InstanceSizeEstimate | None, InstanceLabelRepair]:
+    """Estimate one XY object diameter for a complete instance volume."""
+
+    repair = canonicalize_instance_volume(mask)
+    z_size, height, width = mask.shape
+    interior: list[float] = []
+    z_border: list[float] = []
+    for label in (int(value) for value in np.unique(repair.labels) if int(value) != 0):
+        object_mask = repair.labels == label
+        zz = np.nonzero(object_mask)[0]
+        touches_z = zz.min() == 0 or zz.max() == z_size - 1
+        if touches_z:
+            areas = [(int(z), int(np.count_nonzero(object_mask[z]))) for z in np.unique(zz)]
+            selected_z = max(areas, key=lambda item: item[1])[0]
+        else:
+            center = (int(zz.min()) + int(zz.max())) / 2.0
+            candidates = sorted(
+                np.unique(zz), key=lambda z: (abs(float(z) - center), -np.count_nonzero(object_mask[z]))
+            )
+            selected_z = int(candidates[0])
+        plane_y, plane_x = np.nonzero(object_mask[selected_z])
+        area = len(plane_y)
+        if area < min_instance_area:
+            continue
+        if exclude_xy_border and (
+            plane_y.min() == 0
+            or plane_x.min() == 0
+            or plane_y.max() == height - 1
+            or plane_x.max() == width - 1
+        ):
+            continue
+        diameter = math.sqrt(4.0 * area / math.pi)
+        (z_border if touches_z else interior).append(diameter)
+    rng = np.random.default_rng(seed)
+    selected: list[float] = []
+    for candidates in (interior, z_border):
+        remaining = max_instances - len(selected)
+        if remaining <= 0:
+            break
+        if len(candidates) <= remaining:
+            selected.extend(candidates)
+        else:
+            indices = rng.choice(len(candidates), size=remaining, replace=False)
+            selected.extend(candidates[int(index)] for index in indices)
+    available = len(interior) + len(z_border)
+    estimate = None
+    if selected:
+        estimate = InstanceSizeEstimate(float(np.median(selected)), len(selected), available)
+    return estimate, repair
+
+
 def _instance_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
     labels = [int(value) for value in np.unique(mask) if int(value) != 0]
     if labels == [1]:

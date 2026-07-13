@@ -74,7 +74,7 @@ class InstanceScaleNormalizationConfig:
 
 @dataclass(slots=True)
 class ArchitectureConfig:
-    name: str = "tiny-2d"
+    name: str = "resenc-tiny-2d"
     input_channels: int = 1
     output_channels: int = 1
     base_channels: int = 16
@@ -85,7 +85,7 @@ class ArchitectureConfig:
     dropout: float = 0.0
     dimensions: str = "2d"
     context_slices: int = 3
-    block_type: str = "conv"
+    block_type: str = "residual"
     deep_supervision: bool = False
 
 
@@ -96,7 +96,7 @@ class TrainingConfig:
     dataset_path: Path
     starting_point: str = "scratch"
     base_model: Path | None = None
-    architecture: str = "tiny-2d"
+    architecture: str = "resenc-tiny-2d"
     device: str = "cpu"
     epochs: int = 100
     seed: int = 42
@@ -125,6 +125,7 @@ class TrainingConfig:
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
     deep_supervision: bool | str = False
+    context_slices: int = 3
     focal_gamma: float = 2.0
     focal_alpha: float | None = None
     auto_focal: bool = False
@@ -335,7 +336,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             dataset_path=Path(raw["dataset_path"]),
             starting_point=str(raw.get("starting_point", "scratch")),
             base_model=_path_or_none(raw.get("base_model")),
-            architecture=str(raw.get("architecture", "tiny-2d")),
+            architecture=str(raw.get("architecture", "resenc-tiny-2d")),
             device=str(raw.get("device", "cpu")),
             epochs=int(raw.get("epochs", 100)),
             seed=int(raw.get("seed", 42)),
@@ -371,6 +372,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", False), "deep_supervision"),
+            context_slices=int(raw.get("context_slices", 3)),
             focal_gamma=float(raw.get("focal_gamma", 2.0)),
             focal_alpha=_optional_float(raw.get("focal_alpha"), "focal_alpha"),
             auto_focal=_coerce_bool(raw.get("auto_focal", False), "auto_focal"),
@@ -431,6 +433,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("foreground_probability must be in [0, 1]")
     if parsed.empty_patch_max_retries < 0:
         raise ConfigError("empty_patch_max_retries cannot be negative")
+    if parsed.context_slices < 1 or parsed.context_slices % 2 == 0:
+        raise ConfigError("context_slices must be a positive odd integer")
     _validate_auto_positive_int(parsed.input_channels, "input_channels")
     _validate_auto_positive_int(parsed.output_classes, "output_classes")
     _validate_auto_positive_int(parsed.batch_size, "batch_size")
@@ -475,6 +479,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
     arch = architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
+    if arch.dimensions == "2.5d" and parsed.context_slices < 3:
+        raise ConfigError("2.5D models require context_slices to be at least 3")
     if parsed.patch_size != AUTO:
         expected_dims = 3 if arch.dimensions == "3d" else 2
         if len(parsed.patch_size) != expected_dims:

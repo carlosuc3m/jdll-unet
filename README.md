@@ -26,6 +26,12 @@ Available 2D architecture names:
 - `tiny-3d`: true 3D UNet using `Conv3d` for volumetric TIFF stacks.
 - `medium-3d`: wider true 3D UNet for GPU or longer CPU runs.
 
+The default architecture is `resenc-tiny-2d`. Genuine 2.5D variants are also
+available as `tiny-2.5d`, `medium-2.5d`, `resenc-tiny-2.5d`, and
+`resenc-medium-2.5d`. They use a 2D UNet with an odd number of neighboring Z
+slices flattened into input channels; configure the total with
+`"context_slices": 3`. Missing context beyond either Z boundary is zero padded.
+
 The `resenc-*` variants keep the UNet encoder-decoder shape but replace encoder
 conv blocks with residual blocks for better gradient flow. Deep supervision can
 be enabled with `"deep_supervision": true`; the trainer then applies auxiliary
@@ -59,7 +65,7 @@ result = train(
         "output_dir": "models/unet/cells",
         "dataset_path": "datasets/cells",
         "starting_point": "scratch",
-        "architecture": "tiny-2d",
+        "architecture": "resenc-tiny-2d",
         "deep_supervision": False,
         "model_normalization": "group",
         "lr_scheduler": {"type": "poly"},
@@ -135,8 +141,17 @@ result = infer(
 )
 ```
 
-This normalization currently supports 2D instance models only. Semantic,
-2.5D, and 3D scale policies are intentionally unchanged.
+For 2.5D instance models, object identities are canonicalized per volume with
+efficient 3D connected components. Disconnected regions sharing an annotation
+ID receive fresh in-memory IDs. Up to 21 objects are measured per volume,
+prioritizing objects that do not touch a Z boundary; Z-boundary objects supply
+their largest available cross-section only when needed. One volume-level XY
+scale is shared by all center slices. Context channels receive one synchronized
+XY crop and transform, while validation uses every Z plane without jitter.
+
+2.5D inference accepts one approximate XY `object_size` for the volume and
+returns `Z,Y,X` probabilities and labels. True 3D scale normalization remains
+intentionally unsupported.
 
 ## Learning Rate Scheduling
 

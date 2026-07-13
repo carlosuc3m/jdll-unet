@@ -40,7 +40,7 @@ from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .postprocess import postprocess_instance
-from .scale import aggregate_instance_statistics, estimate_instance_size
+from .scale import aggregate_instance_statistics, estimate_instance_size, estimate_volume_instance_size
 from .schedulers import LearningRateScheduler
 from .targets import boundary_target, target_output_channels
 from .task_detect import detect_task_from_pairs
@@ -399,14 +399,15 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         message = f"Empty validation masks: {len(empty_val_pairs)} image(s) retained."
         logger.warning(message)
         callbacks.emit("warning", message=message)
-    input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
+    source_input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
+    input_channels = source_input_channels * train_config.context_slices if dimensions == "2.5d" else source_input_channels
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
     if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
         output_channels = int(train_config.output_classes)
 
     patch_size = (
-        default_patch_size(train_config.architecture, info.image_shape)
+        default_patch_size(train_config.architecture, info.image_shape[-2:] if dimensions == "2.5d" else info.image_shape)
         if train_config.patch_size == AUTO
         else train_config.patch_size
     )
@@ -418,21 +419,38 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     training_scale_estimates = []
     validation_scale_estimates = []
     fallback_instance_size: float | None = None
+    repaired_instance_components = 0
     if instance_scale_enabled:
-        if dimensions != "2d":
-            raise ConfigError("Instance scale normalization currently supports 2D models only")
+        if dimensions not in {"2d", "2.5d"}:
+            raise ConfigError("Instance scale normalization currently supports 2D and 2.5D models only")
         for split_pairs_, destination, estimates, seed_offset in (
             (train_pairs, train_instance_sizes, training_scale_estimates, 0),
             (val_pairs, val_instance_sizes, validation_scale_estimates, 100_000),
         ):
             for index, pair in enumerate(split_pairs_):
-                estimate = estimate_instance_size(
-                    load_mask(pair.mask),
-                    max_instances=scale_cfg.max_instances_per_image,
-                    exclude_border=scale_cfg.exclude_border_instances,
-                    min_instance_area=scale_cfg.min_instance_area,
-                    seed=train_config.seed + seed_offset + index,
-                )
+                if dimensions == "2.5d":
+                    estimate, repair = estimate_volume_instance_size(
+                        load_mask(pair.mask, dimensions="2.5d"),
+                        max_instances=scale_cfg.max_instances_per_image,
+                        exclude_xy_border=scale_cfg.exclude_border_instances,
+                        min_instance_area=scale_cfg.min_instance_area,
+                        seed=train_config.seed + seed_offset + index,
+                    )
+                    repaired_instance_components += repair.repaired_components
+                    if repair.repaired_components:
+                        logger.warning(
+                            "Canonicalized %s disconnected instance component(s) in %s",
+                            repair.repaired_components,
+                            pair.mask.name,
+                        )
+                else:
+                    estimate = estimate_instance_size(
+                        load_mask(pair.mask),
+                        max_instances=scale_cfg.max_instances_per_image,
+                        exclude_border=scale_cfg.exclude_border_instances,
+                        min_instance_area=scale_cfg.min_instance_area,
+                        seed=train_config.seed + seed_offset + index,
+                    )
                 if estimate is not None:
                     destination[pair.stem] = estimate.median_diameter_px
                     estimates.append(estimate)
@@ -468,6 +486,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 "validation": aggregate_instance_statistics(validation_scale_estimates),
                 "training_images_without_valid_instances": len(train_pairs) - len(train_instance_sizes),
                 "validation_images_without_valid_instances": len(val_pairs) - len(val_instance_sizes),
+                "disconnected_instance_components_relabelled": repaired_instance_components,
                 "canonical_scale": {
                     "median": float(np.median(canonical_scales)),
                     "minimum": float(canonical_scales.min()),
@@ -530,6 +549,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         normalization=train_config.model_normalization,
         deep_supervision=deep_supervision,
     )
+    arch.context_slices = train_config.context_slices
     model = build_unet(arch).to(device)
     if train_config.starting_point in {"fine_tune", "finetune"} and train_config.base_model is not None:
         _load_base_model(model, train_config.base_model, device, logger)
@@ -549,6 +569,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         seed=train_config.seed,
         instance_sizes=train_instance_sizes,
         fallback_instance_size=fallback_instance_size,
+        context_slices=train_config.context_slices,
     )
     train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
     train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
@@ -576,6 +597,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         seed=train_config.seed + 10_000,
         instance_sizes=val_instance_sizes,
         fallback_instance_size=fallback_instance_size,
+        context_slices=train_config.context_slices,
     )
     if instance_scale_enabled:
         val_dataset.augmentation.instance_scale_enabled = True
@@ -608,8 +630,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         train_config,
         detected_task,
         arch,
-        input_axes=("czyx" if input_channels > 1 else "zyx") if dimensions == "3d" else ("cyx" if input_channels > 1 else "yx"),
-        output_axes="zyx" if dimensions == "3d" else "yx",
+        input_axes=("czyx" if source_input_channels > 1 else "zyx")
+        if dimensions in {"3d", "2.5d"}
+        else ("cyx" if source_input_channels > 1 else "yx"),
+        output_axes="zyx" if dimensions in {"3d", "2.5d"} else "yx",
         label_values=label_values,
     )
     model_config["training"].update(

@@ -151,7 +151,7 @@ def load_image(path: Path | str, dimensions: str = "2d") -> np.ndarray:
 
     arr = np.asarray(load_array(path))
     dimensions = dimensions.lower()
-    if dimensions == "3d":
+    if dimensions in {"3d", "2.5d"}:
         if arr.ndim == 3:
             if _looks_like_rgb_last_axis(arr):
                 raise DataFormatError(
@@ -208,7 +208,7 @@ def load_mask(path: Path | str, dimensions: str | None = None) -> np.ndarray:
     arr = _collapse_mask_channels(arr, path)
     if dimensions == "2d" and arr.ndim != 2:
         raise DataFormatError(f"2D masks must have shape Y,X, got shape {arr.shape}")
-    if dimensions == "3d":
+    if dimensions in {"3d", "2.5d"}:
         if arr.ndim != 3:
             raise DataFormatError(f"3D masks must have shape Z,Y,X, got shape {arr.shape}")
         if arr.shape[-1] in {3, 4} and arr.shape[0] not in {1, 3, 4}:

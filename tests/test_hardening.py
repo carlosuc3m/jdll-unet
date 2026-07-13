@@ -27,6 +27,8 @@ def _base_config(tmp_path: Path) -> dict:
 def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
     config = parse_training_config({**_base_config(tmp_path), "save_every_epoch": "false"})
     assert config.save_every_epoch is False
+    assert config.architecture == "resenc-tiny-2d"
+    assert config.context_slices == 3
     assert config.model_normalization == "group"
     assert config.loss_weights["focal"] == 0.0
     assert config.loss_weights["boundary_focal"] == 0.0
@@ -96,6 +98,9 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
         parse_training_config(
             {**_base_config(tmp_path), "instance_scale_normalization": {"training_scale_jitter": [2.0, 0.5]}}
         )
+
+    with pytest.raises(ConfigError, match="context_slices"):
+        parse_training_config({**_base_config(tmp_path), "architecture": "resenc-tiny-2.5d", "context_slices": 2})
 
 
 def test_write_json_is_readable_after_atomic_write(tmp_path: Path):

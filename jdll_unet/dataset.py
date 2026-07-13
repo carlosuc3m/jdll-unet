@@ -48,7 +48,7 @@ def inspect_dataset(pairs: list[ImageMaskPair], dimensions: str = "2d") -> Datas
     empty_mask_count = 0
     for pair in pairs:
         current_image = load_image(pair.image, dimensions=dimensions)
-        mask = load_mask(pair.mask, dimensions="3d" if dimensions == "3d" else "2d")
+        mask = load_mask(pair.mask, dimensions=dimensions if dimensions in {"3d", "2.5d"} else "2d")
         if tuple(current_image.shape[1:]) != tuple(mask.shape):
             raise ValueError(
                 f"Image/mask spatial shape mismatch for {pair.image.name}: "
@@ -69,7 +69,7 @@ def partition_empty_pairs(
 ) -> tuple[list[ImageMaskPair], list[ImageMaskPair]]:
     nonempty: list[ImageMaskPair] = []
     empty: list[ImageMaskPair] = []
-    mask_dimensions = "3d" if dimensions == "3d" else "2d"
+    mask_dimensions = dimensions if dimensions in {"3d", "2.5d"} else "2d"
     for pair in pairs:
         target = nonempty if np.any(load_mask(pair.mask, dimensions=mask_dimensions) != 0) else empty
         target.append(pair)
@@ -89,6 +89,7 @@ class JdllSegmentationDataset(Dataset):
         seed: int = 0,
         instance_sizes: dict[str, float] | None = None,
         fallback_instance_size: float | None = None,
+        context_slices: int = 3,
     ) -> None:
         self.pairs = pairs
         self.task = task
@@ -100,17 +101,38 @@ class JdllSegmentationDataset(Dataset):
         self.seed = seed
         self.instance_sizes = instance_sizes or {}
         self.fallback_instance_size = fallback_instance_size
+        self.context_slices = context_slices
+        self.items: list[tuple[int, int | None]] = []
+        if dimensions == "2.5d":
+            for pair_index, pair in enumerate(pairs):
+                depth = load_mask(pair.mask, dimensions="2.5d").shape[0]
+                self.items.extend((pair_index, z) for z in range(depth))
+        else:
+            self.items = [(index, None) for index in range(len(pairs))]
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.items)
+
+    def _load_item(self, item_index: int) -> tuple[ImageMaskPair, np.ndarray, np.ndarray]:
+        pair_index, center_z = self.items[item_index]
+        pair = self.pairs[pair_index]
+        image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
+        mask = load_mask(pair.mask, dimensions=self.dimensions if self.dimensions in {"3d", "2.5d"} else "2d")
+        if self.dimensions != "2.5d":
+            return pair, image, mask
+        assert center_z is not None
+        radius = self.context_slices // 2
+        channels: list[np.ndarray] = []
+        for modality in range(image.shape[0]):
+            for z in range(center_z - radius, center_z + radius + 1):
+                channels.append(image[modality, z] if 0 <= z < image.shape[1] else np.zeros(image.shape[2:], dtype=image.dtype))
+        return pair, np.ascontiguousarray(np.stack(channels)), mask[center_z]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
         rng = np.random.default_rng(self.seed + index if not self.training else None)
-        candidates = range(len(self.pairs)) if self.training else range(1)
+        candidates = range(len(self.items)) if self.training else range(1)
         for offset in candidates:
-            pair = self.pairs[(index + offset) % len(self.pairs)]
-            image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
-            mask = load_mask(pair.mask, dimensions="3d" if self.dimensions == "3d" else "2d")
+            pair, image, mask = self._load_item((index + offset) % len(self.items))
             object_diameter = self.instance_sizes.get(pair.stem, self.fallback_instance_size)
             try:
                 image, mask = apply_augmentation(
@@ -148,6 +170,7 @@ def make_dataset(
     seed: int,
     instance_sizes: dict[str, float] | None = None,
     fallback_instance_size: float | None = None,
+    context_slices: int = 3,
 ) -> JdllSegmentationDataset:
     aug = make_augmentation_config(
         profile=profile,
@@ -167,4 +190,5 @@ def make_dataset(
         seed=seed,
         instance_sizes=instance_sizes,
         fallback_instance_size=fallback_instance_size,
+        context_slices=context_slices,
     )

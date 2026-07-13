@@ -7,7 +7,12 @@ from jdll_unet.augment import EmptyPatchError, apply_augmentation, make_augmenta
 from jdll_unet.dataset import make_dataset, partition_empty_pairs
 from jdll_unet.errors import DatasetError
 from jdll_unet.io import ImageMaskPair
-from jdll_unet.scale import estimate_instance_size, resize_2d_pair
+from jdll_unet.scale import (
+    canonicalize_instance_volume,
+    estimate_instance_size,
+    estimate_volume_instance_size,
+    resize_2d_pair,
+)
 from jdll_unet.targets import binary_target, instance_targets, multiclass_target
 from jdll_unet.task_detect import detect_task
 from jdll_unet.trainer import train
@@ -296,3 +301,50 @@ def test_instance_scale_crop_reaches_canonical_diameter():
     )
     scaled_diameter = np.sqrt(4 * np.count_nonzero(scaled_mask) / np.pi)
     assert np.isclose(scaled_diameter, 16.0, atol=1.5)
+
+
+def test_volume_instance_repair_and_prioritized_size_estimation():
+    mask = np.zeros((7, 40, 40), dtype=np.int64)
+    mask[2:5, 5:11, 5:11] = 1
+    mask[2:5, 25:31, 25:31] = 1
+    mask[:3, 16:22, 16:22] = 2
+
+    repair = canonicalize_instance_volume(mask)
+    assert repair.repaired_components == 1
+    assert set(np.unique(repair.labels)) == {0, 1, 2, 3}
+
+    estimate, _ = estimate_volume_instance_size(mask, max_instances=2, seed=4)
+    assert estimate is not None
+    assert estimate.sampled_instances == 2
+    assert np.isclose(estimate.median_diameter_px, 6.77, atol=0.01)
+
+
+def test_25d_context_stack_uses_modality_major_zero_padding(tmp_path: Path):
+    image_path = tmp_path / "volume.tif"
+    mask_path = tmp_path / "mask.tif"
+    image = np.stack([np.full((8, 8), value, dtype=np.float32) for value in (1, 2, 3)])
+    mask = np.zeros((3, 8, 8), dtype=np.uint16)
+    tifffile.imwrite(image_path, image, photometric="minisblack")
+    tifffile.imwrite(mask_path, mask, photometric="minisblack")
+    pair = ImageMaskPair(image_path, mask_path, "volume")
+    dataset = make_dataset(
+        [pair],
+        task="binary_semantic",
+        label_values=[1],
+        normalization={"type": "none"},
+        profile="fast",
+        patch_size=(8, 8),
+        foreground_oversampling=False,
+        foreground_probability=0.0,
+        augmentation_overrides={},
+        training=False,
+        dimensions="2.5d",
+        seed=1,
+        context_slices=3,
+    )
+
+    context, _ = dataset[0]
+    assert context.shape == (3, 8, 8)
+    assert np.all(context[0].numpy() == 0)
+    assert np.all(context[1].numpy() == 1)
+    assert np.all(context[2].numpy() == 2)

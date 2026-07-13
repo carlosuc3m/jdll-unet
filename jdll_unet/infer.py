@@ -155,7 +155,7 @@ def tiled_predict(
 def _load_input(inputs: dict[str, Any] | np.ndarray, dimensions: str) -> np.ndarray:
     if isinstance(inputs, np.ndarray):
         image = inputs
-        if dimensions == "3d":
+        if dimensions in {"3d", "2.5d"}:
             if image.ndim == 3:
                 if image.shape[-1] in {1, 3, 4} and image.shape[0] not in {1, 3, 4}:
                     raise InferenceError(f"3D model input looks like a 2D RGB image, got shape {image.shape}")
@@ -184,16 +184,46 @@ def _load_input(inputs: dict[str, Any] | np.ndarray, dimensions: str) -> np.ndar
 
 def _validate_input_channels(image: np.ndarray, model_config: dict[str, Any]) -> None:
     expected = int(model_config.get("input_channels", image.shape[0]))
-    if image.shape[0] != expected:
-        raise InferenceError(f"Model expects {expected} input channel(s), got {image.shape[0]}")
     dimensions = (model_config.get("architecture_config") or {}).get("dimensions", "2d")
-    expected_rank = 4 if dimensions == "3d" else 3
+    context_slices = int((model_config.get("architecture_config") or {}).get("context_slices", 3))
+    expected_source = expected // context_slices if dimensions == "2.5d" else expected
+    if image.shape[0] != expected_source:
+        raise InferenceError(f"Model expects {expected} input channel(s), got {image.shape[0]}")
+    expected_rank = 4 if dimensions in {"3d", "2.5d"} else 3
     if image.ndim != expected_rank:
         raise InferenceError(f"Model expects {dimensions} input rank {expected_rank}, got shape {image.shape}")
 
 
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
+
+
+def _context_stack(volume: np.ndarray, center_z: int, context_slices: int) -> np.ndarray:
+    radius = context_slices // 2
+    channels: list[np.ndarray] = []
+    for modality in range(volume.shape[0]):
+        for z in range(center_z - radius, center_z + radius + 1):
+            channels.append(
+                volume[modality, z]
+                if 0 <= z < volume.shape[1]
+                else np.zeros(volume.shape[2:], dtype=volume.dtype)
+            )
+    return np.ascontiguousarray(np.stack(channels))
+
+
+def _predict_25d(
+    model: torch.nn.Module,
+    volume: np.ndarray,
+    device: torch.device,
+    tile_size: tuple[int, int],
+    overlap: float,
+    context_slices: int,
+) -> np.ndarray:
+    predictions = [
+        tiled_predict(model, _context_stack(volume, z, context_slices), device, tile_size, overlap)
+        for z in range(volume.shape[1])
+    ]
+    return np.ascontiguousarray(np.stack(predictions, axis=1))
 
 
 def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any = None) -> dict[str, Any]:
@@ -215,8 +245,8 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
     instance_scale_enabled = task_name == "instance_friendly" and bool(scale_cfg.get("enabled", False))
     if instance_scale_enabled:
-        if dimensions != "2d":
-            raise InferenceError("Instance scale normalization currently supports 2D models only")
+        if dimensions not in {"2d", "2.5d"}:
+            raise InferenceError("Instance scale normalization currently supports 2D and 2.5D models only")
         object_size = config.get("object_size", config.get("object_diameter"))
         if object_size is None and isinstance(inputs, dict):
             object_size = inputs.get("object_size", inputs.get("object_diameter"))
@@ -237,9 +267,19 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
                 float(scale_cfg.get("max_effective_scale", 4.0)),
             )
         )
-        scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in original_spatial_shape)
-        image = np.ascontiguousarray(resize_2d_channels(image, scaled_shape))
-    logits = tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
+        scale_source_shape = original_spatial_shape[-2:] if dimensions == "2.5d" else original_spatial_shape
+        scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in scale_source_shape)
+        if dimensions == "2.5d":
+            flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
+            image = resize_2d_channels(flattened, scaled_shape).reshape(image.shape[0], image.shape[1], *scaled_shape)
+        else:
+            image = np.ascontiguousarray(resize_2d_channels(image, scaled_shape))
+    context_slices = int((model_config.get("architecture_config") or {}).get("context_slices", 3))
+    logits = (
+        _predict_25d(model, image, device, tile_size, overlap, context_slices)
+        if dimensions == "2.5d"
+        else tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
+    )
 
     post_cfg = dict(model_config.get("postprocessing", {}))
     post_overrides = config.get("postprocessing", {})
@@ -258,7 +298,12 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     elif task_name == "instance_friendly":
         probabilities = _sigmoid(logits)
         if instance_scale_enabled and probabilities.shape[1:] != original_spatial_shape:
-            probabilities = resize_2d_channels(probabilities, original_spatial_shape)
+            if dimensions == "2.5d":
+                channels, depth = probabilities.shape[:2]
+                restored = resize_2d_channels(probabilities.reshape(channels * depth, *probabilities.shape[2:]), original_spatial_shape[1:])
+                probabilities = restored.reshape(channels, depth, *original_spatial_shape[1:])
+            else:
+                probabilities = resize_2d_channels(probabilities, original_spatial_shape)
         outputs = {
             "foreground_probability": probabilities[0],
             "boundary_probability": probabilities[1],
@@ -278,7 +323,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "task": task_name,
         "model_path": str(model_path),
         "input_shape": list(image.shape),
-        "original_input_shape": [int(model_config.get("input_channels", image.shape[0])), *original_spatial_shape],
+        "original_input_shape": [int(image.shape[0]), *original_spatial_shape],
         "instance_scale_factor": inference_scale,
         "output_keys": sorted(outputs),
     }

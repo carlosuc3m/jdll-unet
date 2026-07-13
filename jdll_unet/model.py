@@ -184,7 +184,7 @@ class UNet2D(nn.Module):
 
 
 def build_unet(
-    architecture: str | ArchitectureConfig = "tiny-2d",
+    architecture: str | ArchitectureConfig = "resenc-tiny-2d",
     input_channels: int = 1,
     output_channels: int = 1,
     normalization: str = "group",
