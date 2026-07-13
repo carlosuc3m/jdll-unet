@@ -59,6 +59,20 @@ class LRSchedulerConfig:
 
 
 @dataclass(slots=True)
+class InstanceScaleNormalizationConfig:
+    enabled: bool = True
+    target_object_fraction: float = 0.25
+    object_size_measure: str = "equivalent_diameter"
+    max_instances_per_image: int = 21
+    exclude_border_instances: bool = True
+    min_instance_area: int = 4
+    training_scale_jitter: tuple[float, float] = (0.5, 2.0)
+    jitter_distribution: str = "log_uniform"
+    min_effective_scale: float = 0.25
+    max_effective_scale: float = 4.0
+
+
+@dataclass(slots=True)
 class ArchitectureConfig:
     name: str = "tiny-2d"
     input_channels: int = 1
@@ -97,6 +111,9 @@ class TrainingConfig:
     optimizer: str = "adamw"
     weight_decay: float = 1e-5
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+    instance_scale_normalization: InstanceScaleNormalizationConfig = field(
+        default_factory=InstanceScaleNormalizationConfig
+    )
     validation_fraction: float = 0.15
     foreground_oversampling: bool | str = AUTO
     foreground_probability: float | str = AUTO
@@ -337,6 +354,9 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             lr_scheduler=_lr_scheduler_config(
                 raw.get("lr_scheduler", raw.get("learning_rate_scheduler", raw.get("scheduler")))
             ),
+            instance_scale_normalization=_nested_dataclass(
+                InstanceScaleNormalizationConfig, raw.get("instance_scale_normalization")
+            ),
             validation_fraction=float(raw.get("validation_fraction", 0.15)),
             foreground_oversampling=_auto_or_bool(raw.get("foreground_oversampling", AUTO), "foreground_oversampling"),
             foreground_probability=_auto_or_float(raw.get("foreground_probability", AUTO), "foreground_probability"),
@@ -419,6 +439,39 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_auto_positive_float(parsed.learning_rate, "learning_rate")
     parsed.model_normalization = _model_normalization(parsed.model_normalization)
     _validate_lr_scheduler(parsed.lr_scheduler)
+    scale_cfg = parsed.instance_scale_normalization
+    scale_cfg.enabled = _coerce_bool(scale_cfg.enabled, "instance_scale_normalization.enabled")
+    scale_cfg.exclude_border_instances = _coerce_bool(
+        scale_cfg.exclude_border_instances, "instance_scale_normalization.exclude_border_instances"
+    )
+    try:
+        scale_cfg.target_object_fraction = float(scale_cfg.target_object_fraction)
+        scale_cfg.max_instances_per_image = int(scale_cfg.max_instances_per_image)
+        scale_cfg.min_instance_area = int(scale_cfg.min_instance_area)
+        scale_cfg.min_effective_scale = float(scale_cfg.min_effective_scale)
+        scale_cfg.max_effective_scale = float(scale_cfg.max_effective_scale)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("instance_scale_normalization numeric options must be valid numbers") from exc
+    if not 0 < scale_cfg.target_object_fraction < 1:
+        raise ConfigError("instance_scale_normalization.target_object_fraction must be in (0, 1)")
+    if scale_cfg.object_size_measure != "equivalent_diameter":
+        raise ConfigError("instance_scale_normalization.object_size_measure must be 'equivalent_diameter'")
+    if int(scale_cfg.max_instances_per_image) < 1:
+        raise ConfigError("instance_scale_normalization.max_instances_per_image must be at least 1")
+    if int(scale_cfg.min_instance_area) < 1:
+        raise ConfigError("instance_scale_normalization.min_instance_area must be at least 1")
+    try:
+        scale_cfg.training_scale_jitter = tuple(float(item) for item in scale_cfg.training_scale_jitter)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "instance_scale_normalization.training_scale_jitter must contain two positive ordered values"
+        ) from exc
+    if len(scale_cfg.training_scale_jitter) != 2 or not 0 < scale_cfg.training_scale_jitter[0] <= scale_cfg.training_scale_jitter[1]:
+        raise ConfigError("instance_scale_normalization.training_scale_jitter must contain two positive ordered values")
+    if scale_cfg.jitter_distribution != "log_uniform":
+        raise ConfigError("instance_scale_normalization.jitter_distribution must be 'log_uniform'")
+    if not 0 < float(scale_cfg.min_effective_scale) <= float(scale_cfg.max_effective_scale):
+        raise ConfigError("instance_scale_normalization effective scale bounds must be positive and ordered")
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
     arch = architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)

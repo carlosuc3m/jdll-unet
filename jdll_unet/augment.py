@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .scale import resize_2d_pair_to_shape
+
 try:  # pragma: no cover
     from scipy import ndimage as ndi
 except Exception:  # pragma: no cover
@@ -25,6 +27,11 @@ class AugmentationConfig:
     skip_empty_patches: bool = True
     empty_patch_max_retries: int = 8
     include_empty_patches_after_max_retries: bool = False
+    instance_scale_enabled: bool = False
+    target_object_diameter_px: float = 0.0
+    training_scale_jitter: tuple[float, float] = (0.5, 2.0)
+    min_effective_scale: float = 0.25
+    max_effective_scale: float = 4.0
     flip_probability: float = 0.5
     rotate90_probability: float = 0.25
     brightness_probability: float = 0.3
@@ -182,20 +189,46 @@ def apply_augmentation(
     cfg: AugmentationConfig,
     rng: np.random.Generator | None = None,
     training: bool = True,
+    object_diameter_px: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rng = rng or np.random.default_rng()
-    image, mask = sample_patch(
-        image,
-        mask,
-        cfg.patch_size,
-        rng,
-        foreground_oversampling=cfg.foreground_oversampling,
-        foreground_probability=cfg.foreground_probability,
-        center=not training,
-        skip_empty=training and cfg.skip_empty_patches,
-        max_retries=cfg.empty_patch_max_retries if training and cfg.skip_empty_patches else 0,
-        include_empty_after_max_retries=cfg.include_empty_patches_after_max_retries,
-    )
+    if cfg.instance_scale_enabled:
+        if mask.ndim != 2:
+            raise ValueError("Instance scale normalization currently supports 2D data only")
+        if object_diameter_px is None or object_diameter_px <= 0:
+            raise ValueError("A positive object diameter estimate is required for instance scale normalization")
+        jitter = 1.0
+        if training:
+            low, high = cfg.training_scale_jitter
+            jitter = float(np.exp(rng.uniform(np.log(low), np.log(high))))
+        scale = float(np.clip(cfg.target_object_diameter_px / object_diameter_px * jitter, cfg.min_effective_scale, cfg.max_effective_scale))
+        source_patch_size = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
+        image, mask = sample_patch(
+            image,
+            mask,
+            source_patch_size,
+            rng,
+            foreground_oversampling=cfg.foreground_oversampling,
+            foreground_probability=cfg.foreground_probability,
+            center=not training,
+            skip_empty=training and cfg.skip_empty_patches,
+            max_retries=cfg.empty_patch_max_retries if training and cfg.skip_empty_patches else 0,
+            include_empty_after_max_retries=cfg.include_empty_patches_after_max_retries,
+        )
+        image, mask = resize_2d_pair_to_shape(image, mask, cfg.patch_size)
+    else:
+        image, mask = sample_patch(
+            image,
+            mask,
+            cfg.patch_size,
+            rng,
+            foreground_oversampling=cfg.foreground_oversampling,
+            foreground_probability=cfg.foreground_probability,
+            center=not training,
+            skip_empty=training and cfg.skip_empty_patches,
+            max_retries=cfg.empty_patch_max_retries if training and cfg.skip_empty_patches else 0,
+            include_empty_after_max_retries=cfg.include_empty_patches_after_max_retries,
+        )
     if not training:
         return image.astype(np.float32, copy=False), mask.astype(np.int64, copy=False)
 

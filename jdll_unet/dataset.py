@@ -87,6 +87,8 @@ class JdllSegmentationDataset(Dataset):
         training: bool,
         dimensions: str = "2d",
         seed: int = 0,
+        instance_sizes: dict[str, float] | None = None,
+        fallback_instance_size: float | None = None,
     ) -> None:
         self.pairs = pairs
         self.task = task
@@ -96,6 +98,8 @@ class JdllSegmentationDataset(Dataset):
         self.training = training
         self.dimensions = dimensions
         self.seed = seed
+        self.instance_sizes = instance_sizes or {}
+        self.fallback_instance_size = fallback_instance_size
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -107,8 +111,16 @@ class JdllSegmentationDataset(Dataset):
             pair = self.pairs[(index + offset) % len(self.pairs)]
             image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
             mask = load_mask(pair.mask, dimensions="3d" if self.dimensions == "3d" else "2d")
+            object_diameter = self.instance_sizes.get(pair.stem, self.fallback_instance_size)
             try:
-                image, mask = apply_augmentation(image, mask, self.augmentation, rng=rng, training=self.training)
+                image, mask = apply_augmentation(
+                    image,
+                    mask,
+                    self.augmentation,
+                    rng=rng,
+                    training=self.training,
+                    object_diameter_px=object_diameter,
+                )
                 break
             except EmptyPatchError:
                 continue
@@ -134,6 +146,8 @@ def make_dataset(
     training: bool,
     dimensions: str,
     seed: int,
+    instance_sizes: dict[str, float] | None = None,
+    fallback_instance_size: float | None = None,
 ) -> JdllSegmentationDataset:
     aug = make_augmentation_config(
         profile=profile,
@@ -151,4 +165,6 @@ def make_dataset(
         training=training,
         dimensions=dimensions,
         seed=seed,
+        instance_sizes=instance_sizes,
+        fallback_instance_size=fallback_instance_size,
     )

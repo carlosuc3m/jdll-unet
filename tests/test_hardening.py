@@ -57,6 +57,19 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
     assert empty_policy.skip_empty_patches is True
     assert empty_policy.empty_patch_max_retries == 3
     assert empty_policy.include_empty_patches_after_max_retries is True
+    scale_policy = parse_training_config(
+        {
+            **_base_config(tmp_path),
+            "instance_scale_normalization": {
+                "enabled": "true",
+                "target_object_fraction": 0.3,
+                "training_scale_jitter": [0.6, 1.8],
+            },
+        }
+    ).instance_scale_normalization
+    assert scale_policy.enabled is True
+    assert scale_policy.target_object_fraction == 0.3
+    assert scale_policy.training_scale_jitter == (0.6, 1.8)
 
     with pytest.raises(ConfigError, match="foreground_probability"):
         parse_training_config({**_base_config(tmp_path), "foreground_probability": 2.0})
@@ -78,6 +91,11 @@ def test_config_coerces_booleans_and_rejects_bad_ranges(tmp_path: Path):
 
     with pytest.raises(ConfigError, match="empty_patch_max_retries"):
         parse_training_config({**_base_config(tmp_path), "empty_patch_max_retries": -1})
+
+    with pytest.raises(ConfigError, match="training_scale_jitter"):
+        parse_training_config(
+            {**_base_config(tmp_path), "instance_scale_normalization": {"training_scale_jitter": [2.0, 0.5]}}
+        )
 
 
 def test_write_json_is_readable_after_atomic_write(tmp_path: Path):

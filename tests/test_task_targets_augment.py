@@ -7,6 +7,7 @@ from jdll_unet.augment import EmptyPatchError, apply_augmentation, make_augmenta
 from jdll_unet.dataset import make_dataset, partition_empty_pairs
 from jdll_unet.errors import DatasetError
 from jdll_unet.io import ImageMaskPair
+from jdll_unet.scale import estimate_instance_size, resize_2d_pair
 from jdll_unet.targets import binary_target, instance_targets, multiclass_target
 from jdll_unet.task_detect import detect_task
 from jdll_unet.trainer import train
@@ -242,3 +243,56 @@ def test_training_fails_clearly_when_all_masks_are_empty(tmp_path: Path):
                 "patch_size": [8, 8],
             }
         )
+
+
+def test_instance_size_estimation_and_label_safe_resize():
+    mask = np.zeros((80, 80), dtype=np.int64)
+    for index in range(25):
+        y = 4 + (index // 5) * 14
+        x = 4 + (index % 5) * 14
+        mask[y : y + 6, x : x + 6] = index + 1
+    mask[:5, 30:35] = 99
+    estimate = estimate_instance_size(mask, max_instances=21, exclude_border=True, seed=7)
+
+    assert estimate is not None
+    assert estimate.available_instances == 25
+    assert estimate.sampled_instances == 21
+    assert np.isclose(estimate.median_diameter_px, 6.77, atol=0.01)
+
+    image = mask[None].astype(np.float32)
+    resized_image, resized_mask = resize_2d_pair(image, mask, 0.5)
+    assert resized_image.shape == (1, 40, 40)
+    assert resized_mask.shape == (40, 40)
+    assert set(np.unique(resized_mask)).issubset(set(np.unique(mask)))
+
+
+def test_instance_scale_crop_reaches_canonical_diameter():
+    yy, xx = np.mgrid[:64, :64]
+    mask = (((yy - 32) ** 2 + (xx - 32) ** 2) <= 5**2).astype(np.int64)
+    image = mask[None].astype(np.float32)
+    measured = estimate_instance_size(mask, exclude_border=True)
+    assert measured is not None
+    cfg = make_augmentation_config(
+        "fast",
+        patch_size=(32, 32),
+        foreground_oversampling=True,
+        foreground_probability=1.0,
+        overrides={
+            "instance_scale_enabled": True,
+            "target_object_diameter_px": 16.0,
+            "training_scale_jitter": (1.0, 1.0),
+            "flip_probability": 0.0,
+            "rotate90_probability": 0.0,
+        },
+    )
+
+    _, scaled_mask = apply_augmentation(
+        image,
+        mask,
+        cfg,
+        rng=np.random.default_rng(5),
+        training=True,
+        object_diameter_px=measured.median_diameter_px,
+    )
+    scaled_diameter = np.sqrt(4 * np.count_nonzero(scaled_mask) / np.pi)
+    assert np.isclose(scaled_diameter, 16.0, atol=1.5)

@@ -94,6 +94,50 @@ After the initial patch attempt, the sampler retries up to
 next training image. If it is true, the final empty patch is used. Training
 fails clearly when every training mask is empty.
 
+## 2D Instance Scale Normalization
+
+`instance_friendly` 2D models normalize each image toward a canonical median
+instance diameter by default. Training masks are measured using the median
+equivalent diameter of up to 21 reproducibly sampled instances. Border-touching
+and tiny instances are excluded by default. Binary masks are split into
+connected components; instance-ID masks use their label IDs.
+
+```python
+"instance_scale_normalization": {
+    "enabled": True,
+    "target_object_fraction": 0.25,
+    "object_size_measure": "equivalent_diameter",
+    "max_instances_per_image": 21,
+    "exclude_border_instances": True,
+    "min_instance_area": 4,
+    "training_scale_jitter": [0.5, 2.0],
+    "jitter_distribution": "log_uniform",
+    "min_effective_scale": 0.25,
+    "max_effective_scale": 4.0,
+}
+```
+
+The target diameter is `target_object_fraction * min(patch_size)`. Training
+draws log-uniform scale jitter and extracts the corresponding crop directly
+from the original image before resizing it to the fixed patch size. Validation
+uses its reproducibly sampled mask median without jitter. Dataset-derived
+measurements are written separately to `dataset_statistics.json`.
+
+Inference requires the approximate median object diameter in native input
+pixels. It rescales the image to the model's canonical object size, performs
+tiled prediction, restores foreground and boundary probabilities to the
+original geometry, and then creates instance labels:
+
+```python
+result = infer(
+    {"model_path": "models/cells/model.pt", "object_size": 18},
+    {"image_path": "images/cells.tif"},
+)
+```
+
+This normalization currently supports 2D instance models only. Semantic,
+2.5D, and 3D scale policies are intentionally unchanged.
+
 ## Learning Rate Scheduling
 
 Training uses polynomial decay by default:

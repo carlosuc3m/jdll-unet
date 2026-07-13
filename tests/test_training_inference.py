@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 import torch
 
 from jdll_unet.appose_api import infer, train
+from jdll_unet.errors import ConfigError, InferenceError
 
 
 def _synthetic_dataset(root: Path, count: int = 4) -> None:
@@ -97,6 +99,67 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
     assert inference["metadata"]["task"] == "binary_semantic"
     assert inference["outputs"]["foreground_probability"].shape == (32, 32)
     assert inference["outputs"]["mask"].shape == (32, 32)
+
+
+def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
+    dataset = tmp_path / "instance_dataset"
+    _synthetic_dataset(dataset)
+    output_dir = tmp_path / "instance_model"
+
+    result = train(
+        {
+            "model_name": "instance-scale",
+            "output_dir": output_dir,
+            "dataset_path": dataset,
+            "task": "instance_friendly",
+            "architecture": "tiny-2d",
+            "device": "cpu",
+            "epochs": 1,
+            "seed": 9,
+            "patch_size": [32, 32],
+            "batch_size": 2,
+            "preview_count": 0,
+            "instance_scale_normalization": {
+                "target_object_fraction": 0.25,
+                "training_scale_jitter": [0.5, 2.0],
+            },
+        }
+    )
+
+    statistics_path = Path(result["dataset_statistics_path"])
+    statistics = json.loads(statistics_path.read_text())
+    assert statistics["instance_scale_statistics"]["training"]["images_measured"] > 0
+    assert result["config"]["training"]["instance_scale_normalization"]["target_object_fraction"] == 0.25
+
+    inference = infer(
+        {"model_path": result["model_path"], "device": "cpu", "object_size": 12.0},
+        {"image_path": dataset / "images/sample_0.tif"},
+    )
+    assert inference["outputs"]["foreground_probability"].shape == (32, 32)
+    assert inference["outputs"]["boundary_probability"].shape == (32, 32)
+    assert inference["outputs"]["labels"].shape == (32, 32)
+    assert np.isclose(inference["metadata"]["instance_scale_factor"], 2 / 3)
+
+    with pytest.raises(InferenceError, match="object_size"):
+        infer({"model_path": result["model_path"], "device": "cpu"}, {"image_path": dataset / "images/sample_0.tif"})
+
+
+def test_instance_scale_normalization_rejects_3d(tmp_path: Path):
+    dataset = tmp_path / "instance_volume_dataset"
+    _synthetic_volume_dataset(dataset, count=2)
+
+    with pytest.raises(ConfigError, match="supports 2D models only"):
+        train(
+            {
+                "model_name": "unsupported-instance-scale-3d",
+                "output_dir": tmp_path / "unsupported_model",
+                "dataset_path": dataset,
+                "task": "instance_friendly",
+                "architecture": "tiny-3d",
+                "epochs": 1,
+                "patch_size": [8, 16, 16],
+            }
+        )
 
 
 def test_training_emits_callback_events_and_png_previews(tmp_path: Path):

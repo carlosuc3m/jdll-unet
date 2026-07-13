@@ -19,6 +19,7 @@ from .io import load_image, normalize_image
 from .losses import primary_logits
 from .model import build_unet
 from .postprocess import postprocess_binary, postprocess_instance, postprocess_multiclass
+from .scale import resize_2d_channels
 
 
 def _model_cache_size() -> int:
@@ -204,11 +205,40 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     dimensions = str((model_config.get("architecture_config") or {}).get("dimensions", "2d"))
     image = normalize_image(_load_input(inputs, dimensions), model_config.get("normalization"))
     _validate_input_channels(image, model_config)
+    original_spatial_shape = tuple(int(item) for item in image.shape[1:])
     task_name = str(model_config["task"])
     train_cfg = model_config.get("training", {})
     tile_size = config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
     tile_size = _parse_tile_size(tile_size, dimensions)
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
+    inference_scale = 1.0
+    scale_cfg = train_cfg.get("instance_scale_normalization", {})
+    instance_scale_enabled = task_name == "instance_friendly" and bool(scale_cfg.get("enabled", False))
+    if instance_scale_enabled:
+        if dimensions != "2d":
+            raise InferenceError("Instance scale normalization currently supports 2D models only")
+        object_size = config.get("object_size", config.get("object_diameter"))
+        if object_size is None and isinstance(inputs, dict):
+            object_size = inputs.get("object_size", inputs.get("object_diameter"))
+        if object_size is None:
+            raise InferenceError("Scale-normalized instance inference requires approximate object_size in pixels")
+        try:
+            object_size = float(object_size)
+        except (TypeError, ValueError) as exc:
+            raise InferenceError("object_size must be a positive number in input pixels") from exc
+        if object_size <= 0 or not np.isfinite(object_size):
+            raise InferenceError("object_size must be a positive finite number in input pixels")
+        training_patch = _parse_tile_size(train_cfg.get("patch_size", tile_size), dimensions)
+        target_diameter = float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch)
+        inference_scale = float(
+            np.clip(
+                target_diameter / object_size,
+                float(scale_cfg.get("min_effective_scale", 0.25)),
+                float(scale_cfg.get("max_effective_scale", 4.0)),
+            )
+        )
+        scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in original_spatial_shape)
+        image = np.ascontiguousarray(resize_2d_channels(image, scaled_shape))
     logits = tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
 
     post_cfg = dict(model_config.get("postprocessing", {}))
@@ -227,6 +257,8 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         outputs.update(postprocess_multiclass(probabilities, min_object_size=int(post_cfg.get("min_object_size", 0))))
     elif task_name == "instance_friendly":
         probabilities = _sigmoid(logits)
+        if instance_scale_enabled and probabilities.shape[1:] != original_spatial_shape:
+            probabilities = resize_2d_channels(probabilities, original_spatial_shape)
         outputs = {
             "foreground_probability": probabilities[0],
             "boundary_probability": probabilities[1],
@@ -246,6 +278,8 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "task": task_name,
         "model_path": str(model_path),
         "input_shape": list(image.shape),
+        "original_input_shape": [int(model_config.get("input_channels", image.shape[0])), *original_spatial_shape],
+        "instance_scale_factor": inference_scale,
         "output_keys": sorted(outputs),
     }
     CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)

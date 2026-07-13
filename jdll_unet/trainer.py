@@ -34,12 +34,13 @@ from .config import (
     write_json,
 )
 from .dataset import inspect_dataset, make_dataset, partition_empty_pairs, split_pairs
-from .errors import DatasetError, ModelLoadError
+from .errors import ConfigError, DatasetError, ModelLoadError
 from .io import ImageMaskPair, discover_dataset, load_mask
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .postprocess import postprocess_instance
+from .scale import aggregate_instance_statistics, estimate_instance_size
 from .schedulers import LearningRateScheduler
 from .targets import boundary_target, target_output_channels
 from .task_detect import detect_task_from_pairs
@@ -410,6 +411,82 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         else train_config.patch_size
     )
     assert isinstance(patch_size, tuple)
+    scale_cfg = train_config.instance_scale_normalization
+    instance_scale_enabled = detected_task == "instance_friendly" and scale_cfg.enabled
+    train_instance_sizes: dict[str, float] = {}
+    val_instance_sizes: dict[str, float] = {}
+    training_scale_estimates = []
+    validation_scale_estimates = []
+    fallback_instance_size: float | None = None
+    if instance_scale_enabled:
+        if dimensions != "2d":
+            raise ConfigError("Instance scale normalization currently supports 2D models only")
+        for split_pairs_, destination, estimates, seed_offset in (
+            (train_pairs, train_instance_sizes, training_scale_estimates, 0),
+            (val_pairs, val_instance_sizes, validation_scale_estimates, 100_000),
+        ):
+            for index, pair in enumerate(split_pairs_):
+                estimate = estimate_instance_size(
+                    load_mask(pair.mask),
+                    max_instances=scale_cfg.max_instances_per_image,
+                    exclude_border=scale_cfg.exclude_border_instances,
+                    min_instance_area=scale_cfg.min_instance_area,
+                    seed=train_config.seed + seed_offset + index,
+                )
+                if estimate is not None:
+                    destination[pair.stem] = estimate.median_diameter_px
+                    estimates.append(estimate)
+                    logger.info(
+                        "Instance size split=%s image=%s sampled=%s available=%s median_diameter_px=%.3f",
+                        "training" if seed_offset == 0 else "validation",
+                        pair.image.name,
+                        estimate.sampled_instances,
+                        estimate.available_instances,
+                        estimate.median_diameter_px,
+                    )
+                else:
+                    logger.warning(
+                        "No valid instances for scale estimation split=%s image=%s; training median fallback will be used",
+                        "training" if seed_offset == 0 else "validation",
+                        pair.image.name,
+                    )
+        if not training_scale_estimates:
+            raise DatasetError(
+                "Instance scale normalization could not measure any valid training instances; "
+                "check masks or disable border exclusion"
+            )
+        fallback_instance_size = float(
+            np.median([estimate.median_diameter_px for estimate in training_scale_estimates])
+        )
+        target_diameter = float(scale_cfg.target_object_fraction * min(patch_size))
+        canonical_scales = np.asarray(
+            [target_diameter / estimate.median_diameter_px for estimate in training_scale_estimates], dtype=np.float64
+        )
+        dataset_statistics = {
+            "instance_scale_statistics": {
+                "training": aggregate_instance_statistics(training_scale_estimates),
+                "validation": aggregate_instance_statistics(validation_scale_estimates),
+                "training_images_without_valid_instances": len(train_pairs) - len(train_instance_sizes),
+                "validation_images_without_valid_instances": len(val_pairs) - len(val_instance_sizes),
+                "canonical_scale": {
+                    "median": float(np.median(canonical_scales)),
+                    "minimum": float(canonical_scales.min()),
+                    "maximum": float(canonical_scales.max()),
+                    "images_below_minimum_clamp": int(np.count_nonzero(canonical_scales < scale_cfg.min_effective_scale)),
+                    "images_above_maximum_clamp": int(np.count_nonzero(canonical_scales > scale_cfg.max_effective_scale)),
+                },
+            }
+        }
+        write_json(output_dir / "dataset_statistics.json", dataset_statistics)
+        logger.info(
+            "Instance scale normalization enabled: target_diameter_px=%.3f training_median_px=%.3f "
+            "jitter=%s effective_scale=[%.3f, %.3f]",
+            target_diameter,
+            fallback_instance_size,
+            scale_cfg.training_scale_jitter,
+            scale_cfg.min_effective_scale,
+            scale_cfg.max_effective_scale,
+        )
     batch_size = default_batch_size(train_config.architecture, device) if train_config.batch_size == AUTO else int(train_config.batch_size)
     learning_rate = (
         default_learning_rate(train_config.optimizer)
@@ -470,12 +547,20 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         training=True,
         dimensions=dimensions,
         seed=train_config.seed,
+        instance_sizes=train_instance_sizes,
+        fallback_instance_size=fallback_instance_size,
     )
     train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
     train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
     train_dataset.augmentation.include_empty_patches_after_max_retries = (
         train_config.include_empty_patches_after_max_retries
     )
+    if instance_scale_enabled:
+        train_dataset.augmentation.instance_scale_enabled = True
+        train_dataset.augmentation.target_object_diameter_px = float(scale_cfg.target_object_fraction * min(patch_size))
+        train_dataset.augmentation.training_scale_jitter = scale_cfg.training_scale_jitter
+        train_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
+        train_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
     val_dataset = make_dataset(
         val_pairs,
         detected_task,
@@ -489,7 +574,14 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         training=False,
         dimensions=dimensions,
         seed=train_config.seed + 10_000,
+        instance_sizes=val_instance_sizes,
+        fallback_instance_size=fallback_instance_size,
     )
+    if instance_scale_enabled:
+        val_dataset.augmentation.instance_scale_enabled = True
+        val_dataset.augmentation.target_object_diameter_px = float(scale_cfg.target_object_fraction * min(patch_size))
+        val_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
+        val_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -732,6 +824,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "lr_scheduler": lr_scheduler.state_dict(),
         "metrics_path": str(output_dir / "metrics.json"),
         "config_path": str(output_dir / "config.json"),
+        "dataset_statistics_path": str(output_dir / "dataset_statistics.json") if instance_scale_enabled else None,
         "latest_preview_path": latest_preview_path,
         "config": model_config,
     }
