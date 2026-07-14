@@ -16,6 +16,7 @@ class InstanceSizeEstimate:
     median_diameter_px: float
     sampled_instances: int
     available_instances: int
+    median_principal_axes: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ def estimate_volume_instance_size(
     exclude_xy_border: bool = True,
     min_instance_area: int = 4,
     seed: int = 0,
+    measure: str = "equivalent_sphere_diameter",
 ) -> tuple[InstanceSizeEstimate | None, InstanceLabelRepair]:
     """Estimate one XY object diameter for a complete instance volume."""
 
@@ -83,7 +85,12 @@ def estimate_volume_instance_size(
             or plane_x.max() == width - 1
         ):
             continue
-        diameter = math.sqrt(4.0 * area / math.pi)
+        if measure == "principal_axes":
+            coords = np.column_stack((plane_y, plane_x)).astype(np.float64)
+            axes = 2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(coords.T)), 0.0)) if len(coords) > 1 else np.zeros(2)
+            diameter = float(np.median(axes))
+        else:
+            diameter = math.sqrt(4.0 * area / math.pi)
         (z_border if touches_z else interior).append(diameter)
     rng = np.random.default_rng(seed)
     selected: list[float] = []
@@ -117,6 +124,7 @@ def estimate_instance_size(
     exclude_border: bool = True,
     min_instance_area: int = 4,
     seed: int = 0,
+    measure: str = "equivalent_sphere_diameter",
 ) -> InstanceSizeEstimate | None:
     """Estimate median equivalent diameter from a reproducible instance sample."""
 
@@ -132,7 +140,12 @@ def estimate_instance_size(
             continue
         if exclude_border and (yy.min() == 0 or xx.min() == 0 or yy.max() == height - 1 or xx.max() == width - 1):
             continue
-        measurements.append(math.sqrt(4.0 * area / math.pi))
+        if measure == "principal_axes":
+            coords = np.column_stack((yy, xx)).astype(np.float64)
+            axes = 2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(coords.T)), 0.0)) if len(coords) > 1 else np.zeros(2)
+            measurements.append(float(np.median(axes)))
+        else:
+            measurements.append(math.sqrt(4.0 * area / math.pi))
     available = len(measurements)
     if available == 0:
         return None
@@ -147,12 +160,67 @@ def estimate_instance_size(
     )
 
 
+def estimate_3d_instance_size(
+    mask: np.ndarray,
+    spacing: tuple[float, float, float],
+    max_instances: int = 21,
+    exclude_border: bool = True,
+    min_instance_voxels: int = 4,
+    seed: int = 0,
+    measure: str = "equivalent_sphere_diameter",
+) -> tuple[InstanceSizeEstimate | None, InstanceLabelRepair]:
+    """Estimate physical 3D instance size, preferring complete objects."""
+
+    repair = canonicalize_instance_volume(mask)
+    complete: list[tuple[float, tuple[float, ...]]] = []
+    border: list[tuple[float, tuple[float, ...]]] = []
+    shape = np.asarray(mask.shape)
+    voxel_volume = float(np.prod(spacing))
+    for label in (int(value) for value in np.unique(repair.labels) if int(value) != 0):
+        coords = np.argwhere(repair.labels == label)
+        if len(coords) < min_instance_voxels:
+            continue
+        touches = bool(np.any(coords.min(axis=0) == 0) or np.any(coords.max(axis=0) == shape - 1))
+        physical = coords.astype(np.float64) * np.asarray(spacing)
+        axes = tuple(float(value) for value in (2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(physical.T)), 0.0))))
+        volume = len(coords) * voxel_volume
+        diameter = 2.0 * (3.0 * volume / (4.0 * math.pi)) ** (1.0 / 3.0)
+        (border if touches else complete).append((diameter, axes))
+    selected: list[tuple[float, tuple[float, ...]]] = []
+    rng = np.random.default_rng(seed)
+    for candidates in (complete, border):
+        remaining = max_instances - len(selected)
+        if remaining <= 0:
+            break
+        indexes = np.arange(len(candidates)) if len(candidates) <= remaining else rng.choice(len(candidates), remaining, replace=False)
+        selected.extend(candidates[int(index)] for index in indexes)
+    if not selected and border:
+        selected = border[:max_instances]
+    if not selected:
+        return None, repair
+    values = [float(np.median(axes)) if measure == "principal_axes" else diameter for diameter, axes in selected]
+    median_axes = tuple(float(value) for value in np.median(np.asarray([axes for _diameter, axes in selected]), axis=0))
+    return InstanceSizeEstimate(float(np.median(values)), len(selected), len(complete) + len(border), median_axes), repair
+
+
+def resize_3d_pair_to_shape(
+    image: np.ndarray, mask: np.ndarray, target: tuple[int, int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    if target == mask.shape:
+        return image, mask
+    image_t = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32, copy=False)))
+    mask_t = torch.from_numpy(np.ascontiguousarray(mask[None, None].astype(np.float32, copy=False)))
+    resized_image = F.interpolate(image_t, size=target, mode="trilinear", align_corners=False)[0].numpy()
+    resized_mask = F.interpolate(mask_t, size=target, mode="nearest")[0, 0].numpy().astype(mask.dtype, copy=False)
+    return np.ascontiguousarray(resized_image), np.ascontiguousarray(resized_mask)
+
+
 def resize_2d_pair(image: np.ndarray, mask: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
     """Resize an image/mask pair while preserving image values and integer labels."""
 
     if scale <= 0 or not np.isfinite(scale):
         raise ValueError("scale must be a finite positive number")
-    target = tuple(max(1, int(round(size * scale))) for size in mask.shape)
+    target = (max(1, int(round(mask.shape[0] * scale))), max(1, int(round(mask.shape[1] * scale))))
     return resize_2d_pair_to_shape(image, mask, target)
 
 

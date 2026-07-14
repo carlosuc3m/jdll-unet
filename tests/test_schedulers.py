@@ -16,13 +16,14 @@ def test_poly_scheduler_decays_to_min_lr():
         optimizer,
         LRSchedulerConfig(type="poly", min_lr=0.001, poly_power=1.0),
         total_steps=4,
+        total_epochs=4,
     )
 
-    scheduler.step_batch()
+    scheduler.step_epoch(0.0)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.00775)
-    scheduler.step_batch()
-    scheduler.step_batch()
-    scheduler.step_batch()
+    scheduler.step_epoch(0.0)
+    scheduler.step_epoch(0.0)
+    scheduler.step_epoch(0.0)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
 
 

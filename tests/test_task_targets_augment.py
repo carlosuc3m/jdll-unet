@@ -95,7 +95,8 @@ def test_target_generation():
     assert multiclass.dtype == np.int64
     assert set(np.unique(multiclass)) == {0, 1, 2, 3}
     instance = instance_targets(mask)
-    assert sorted(instance) == ["boundary", "foreground"]
+    assert sorted(instance) == ["boundary", "distance", "foreground", "instances"]
+    assert instance["distance"].max() == 1
     assert instance["foreground"].shape == (1, 3, 3)
     assert instance["boundary"].shape == (1, 3, 3)
 
@@ -245,6 +246,7 @@ def test_training_fails_clearly_when_all_masks_are_empty(tmp_path: Path):
                 "output_dir": tmp_path / "model",
                 "dataset_path": dataset_path,
                 "epochs": 1,
+                "steps_per_epoch": 1,
                 "patch_size": [8, 8],
             }
         )

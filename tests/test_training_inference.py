@@ -7,7 +7,7 @@ import tifffile
 import torch
 
 from jdll_unet.appose_api import infer, train
-from jdll_unet.errors import ConfigError, InferenceError
+from jdll_unet.errors import InferenceError
 
 
 def _synthetic_dataset(root: Path, count: int = 4) -> None:
@@ -55,6 +55,7 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
             "architecture": "tiny-2d",
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "seed": 123,
             "patch_size": [32, 32],
             "batch_size": 2,
@@ -115,6 +116,7 @@ def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
             "architecture": "tiny-2d",
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "seed": 9,
             "patch_size": [32, 32],
             "batch_size": 2,
@@ -144,22 +146,26 @@ def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
         infer({"model_path": result["model_path"], "device": "cpu"}, {"image_path": dataset / "images/sample_0.tif"})
 
 
-def test_instance_scale_normalization_rejects_3d(tmp_path: Path):
+def test_instance_scale_normalization_supports_3d(tmp_path: Path):
     dataset = tmp_path / "instance_volume_dataset"
     _synthetic_volume_dataset(dataset, count=2)
 
-    with pytest.raises(ConfigError, match="supports 2D and 2.5D models only"):
-        train(
-            {
-                "model_name": "unsupported-instance-scale-3d",
-                "output_dir": tmp_path / "unsupported_model",
-                "dataset_path": dataset,
-                "task": "instance_friendly",
-                "architecture": "tiny-3d",
-                "epochs": 1,
-                "patch_size": [8, 16, 16],
-            }
-        )
+    result = train(
+        {
+            "model_name": "instance-scale-3d",
+            "output_dir": tmp_path / "instance_model",
+            "dataset_path": dataset,
+            "task": "instance_friendly",
+            "architecture": "resenc-tiny-3d",
+            "epochs": 1,
+            "steps_per_epoch": 1,
+            "effective_batch_size": 1,
+            "patch_size": [8, 16, 16],
+            "preview_count": 0,
+            "validation": {"mode": "light"},
+        }
+    )
+    assert result["config"]["architecture_config"]["output_channels"] == 3
 
 
 def test_training_emits_callback_events_and_png_previews(tmp_path: Path):
@@ -176,6 +182,7 @@ def test_training_emits_callback_events_and_png_previews(tmp_path: Path):
             "architecture": "tiny-2d",
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "seed": 111,
             "patch_size": [32, 32],
             "batch_size": 2,
@@ -223,6 +230,7 @@ def test_training_callback_can_cancel(tmp_path: Path):
             "architecture": "tiny-2d",
             "device": "cpu",
             "epochs": 2,
+            "steps_per_epoch": 1,
             "seed": 222,
             "patch_size": [32, 32],
             "batch_size": 2,
@@ -250,6 +258,7 @@ def test_resenc_deep_supervision_training_smoke(tmp_path: Path):
             "deep_supervision": True,
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "seed": 321,
             "patch_size": [32, 32],
             "batch_size": 2,
@@ -289,6 +298,7 @@ def test_tiny_3d_training_and_inference_smoke(tmp_path: Path):
             "architecture": "tiny-3d",
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "seed": 456,
             "patch_size": [8, 16, 16],
             "batch_size": 1,
@@ -352,6 +362,7 @@ def test_25d_instance_training_and_full_volume_inference(tmp_path: Path):
             "context_slices": 3,
             "device": "cpu",
             "epochs": 1,
+            "steps_per_epoch": 1,
             "patch_size": [24, 24],
             "batch_size": 2,
             "preview_count": 0,

@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 from .augment import AugmentationConfig, EmptyPatchError, apply_augmentation, make_augmentation_config
 from .errors import DatasetError
 from .io import ImageMaskPair, load_image, load_mask, normalize_image
+from .planning import resample_image_mask, resolve_context_stride
 from .targets import prepare_target
 
 
@@ -90,6 +91,12 @@ class JdllSegmentationDataset(Dataset):
         instance_sizes: dict[str, float] | None = None,
         fallback_instance_size: float | None = None,
         context_slices: int = 3,
+        context_stride_policy: str = "adjacent",
+        context_stride: int = 1,
+        context_target_spacing: float | None = None,
+        case_spacings: dict[str, tuple[float, float, float]] | None = None,
+        target_spacing: tuple[float, float, float] | None = None,
+        sample_count: int | None = None,
     ) -> None:
         self.pairs = pairs
         self.task = task
@@ -102,6 +109,12 @@ class JdllSegmentationDataset(Dataset):
         self.instance_sizes = instance_sizes or {}
         self.fallback_instance_size = fallback_instance_size
         self.context_slices = context_slices
+        self.context_stride_policy = context_stride_policy
+        self.context_stride = context_stride
+        self.context_target_spacing = context_target_spacing
+        self.case_spacings = case_spacings or {}
+        self.target_spacing = target_spacing
+        self.sample_count = sample_count
         self.items: list[tuple[int, int | None]] = []
         if dimensions == "2.5d":
             for pair_index, pair in enumerate(pairs):
@@ -111,25 +124,36 @@ class JdllSegmentationDataset(Dataset):
             self.items = [(index, None) for index in range(len(pairs))]
 
     def __len__(self) -> int:
-        return len(self.items)
+        return self.sample_count if self.training and self.sample_count is not None else len(self.items)
 
     def _load_item(self, item_index: int) -> tuple[ImageMaskPair, np.ndarray, np.ndarray]:
-        pair_index, center_z = self.items[item_index]
+        pair_index, center_z = self.items[item_index % len(self.items)]
         pair = self.pairs[pair_index]
         image = normalize_image(load_image(pair.image, dimensions=self.dimensions), self.normalization)
         mask = load_mask(pair.mask, dimensions=self.dimensions if self.dimensions in {"3d", "2.5d"} else "2d")
+        spacing = self.case_spacings.get(pair.stem)
+        if self.dimensions == "3d" and spacing is not None and self.target_spacing is not None:
+            image, mask = resample_image_mask(image, mask, spacing, self.target_spacing)
         if self.dimensions != "2.5d":
             return pair, image, mask
         assert center_z is not None
         radius = self.context_slices // 2
+        stride = resolve_context_stride(
+            self.context_stride_policy,
+            fixed_stride=self.context_stride,
+            target_spacing=self.context_target_spacing,
+            z_spacing=(spacing or (1.0, 1.0, 1.0))[0],
+        )
         channels: list[np.ndarray] = []
         for modality in range(image.shape[0]):
-            for z in range(center_z - radius, center_z + radius + 1):
+            for z in range(center_z - radius * stride, center_z + radius * stride + 1, stride):
                 channels.append(image[modality, z] if 0 <= z < image.shape[1] else np.zeros(image.shape[2:], dtype=image.dtype))
         return pair, np.ascontiguousarray(np.stack(channels)), mask[center_z]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
-        rng = np.random.default_rng(self.seed + index if not self.training else None)
+        rng = np.random.default_rng(self.seed + index)
+        if self.training:
+            index = int(rng.integers(0, len(self.items)))
         candidates = range(len(self.items)) if self.training else range(1)
         for offset in candidates:
             pair, image, mask = self._load_item((index + offset) % len(self.items))
@@ -142,13 +166,19 @@ class JdllSegmentationDataset(Dataset):
                     rng=rng,
                     training=self.training,
                     object_diameter_px=object_diameter,
+                    spacing=(
+                        self.target_spacing
+                        if self.dimensions == "3d"
+                        else (self.case_spacings.get(pair.stem, (1.0, 1.0, 1.0))[-2:] if self.dimensions == "2.5d" else None)
+                    ),
                 )
                 break
             except EmptyPatchError:
                 continue
         else:
             raise DatasetError("No foreground patch could be sampled from any training image")
-        target = prepare_target(self.task, mask, label_values=self.label_values)
+        spacing = self.target_spacing if self.dimensions == "3d" else None
+        target = prepare_target(self.task, mask, label_values=self.label_values, spacing=spacing)
         image_t = torch.from_numpy(image)
         if isinstance(target, dict):
             return image_t, {key: torch.from_numpy(value) for key, value in target.items()}
@@ -171,6 +201,12 @@ def make_dataset(
     instance_sizes: dict[str, float] | None = None,
     fallback_instance_size: float | None = None,
     context_slices: int = 3,
+    context_stride_policy: str = "adjacent",
+    context_stride: int = 1,
+    context_target_spacing: float | None = None,
+    case_spacings: dict[str, tuple[float, float, float]] | None = None,
+    target_spacing: tuple[float, float, float] | None = None,
+    sample_count: int | None = None,
 ) -> JdllSegmentationDataset:
     aug = make_augmentation_config(
         profile=profile,
@@ -191,4 +227,10 @@ def make_dataset(
         instance_sizes=instance_sizes,
         fallback_instance_size=fallback_instance_size,
         context_slices=context_slices,
+        context_stride_policy=context_stride_policy,
+        context_stride=context_stride,
+        context_target_spacing=context_target_spacing,
+        case_spacings=case_spacings,
+        target_spacing=target_spacing,
+        sample_count=sample_count,
     )

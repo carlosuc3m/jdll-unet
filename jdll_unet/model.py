@@ -50,6 +50,7 @@ class ConvBlock(nn.Module):
         activation: str = "relu",
         dropout: float = 0.0,
         dimensions: str = "2d",
+        kernel_size: int | tuple[int, ...] = 3,
     ) -> None:
         super().__init__()
         conv = nn.Conv3d if _is_3d(dimensions) else nn.Conv2d
@@ -57,7 +58,8 @@ class ConvBlock(nn.Module):
         layers: list[nn.Module] = []
         current = in_channels
         for _ in range(convs_per_level):
-            layers.append(conv(current, out_channels, kernel_size=3, padding=1, bias=False))
+            padding = tuple(value // 2 for value in kernel_size) if isinstance(kernel_size, (list, tuple)) else kernel_size // 2
+            layers.append(conv(current, out_channels, kernel_size=kernel_size, padding=padding, bias=False))  # type: ignore[arg-type]
             layers.append(_normalization(normalization, out_channels, dimensions))
             layers.append(_activation(activation))
             if dropout > 0:
@@ -81,6 +83,7 @@ class ResidualEncoderBlock(nn.Module):
         activation: str = "relu",
         dropout: float = 0.0,
         dimensions: str = "2d",
+        kernel_size: int | tuple[int, ...] = 3,
     ) -> None:
         super().__init__()
         if convs_per_level < 1:
@@ -90,7 +93,8 @@ class ResidualEncoderBlock(nn.Module):
         layers: list[nn.Module] = []
         current = in_channels
         for index in range(convs_per_level):
-            layers.append(conv(current, out_channels, kernel_size=3, padding=1, bias=False))
+            padding = tuple(value // 2 for value in kernel_size) if isinstance(kernel_size, (list, tuple)) else kernel_size // 2
+            layers.append(conv(current, out_channels, kernel_size=kernel_size, padding=padding, bias=False))  # type: ignore[arg-type]
             layers.append(_normalization(normalization, out_channels, dimensions))
             if index != convs_per_level - 1:
                 layers.append(_activation(activation))
@@ -118,29 +122,38 @@ class UNet2D(nn.Module):
         is_3d = _is_3d(config.dimensions)
         conv = nn.Conv3d if is_3d else nn.Conv2d
         conv_transpose = nn.ConvTranspose3d if is_3d else nn.ConvTranspose2d
-        channels = [config.base_channels * (2**level) for level in range(config.depth)]
+        channels = list(config.channels) if config.channels else [config.base_channels * (2**level) for level in range(config.depth)]
+        spatial_dims = 3 if is_3d else 2
+        kernels = list(config.kernels) if config.kernels else [(3,) * spatial_dims] * len(channels)
+        strides = list(config.strides) if config.strides else [(2,) * spatial_dims] * (len(channels) - 1)
+        blocks = list(config.encoder_blocks) if config.encoder_blocks else [config.convs_per_level] * len(channels)
         self.encoders = nn.ModuleList()
         in_channels = config.input_channels
         encoder_block = ResidualEncoderBlock if config.block_type == "residual" else ConvBlock
-        for out_channels in channels:
+        for level, out_channels in enumerate(channels):
             self.encoders.append(
                 encoder_block(
                     in_channels,
                     out_channels,
-                    convs_per_level=config.convs_per_level,
+                    convs_per_level=blocks[level],
                     normalization=config.normalization,
                     activation=config.activation,
                     dropout=config.dropout,
                     dimensions=config.dimensions,
+                    kernel_size=kernels[level],
                 )
             )
             in_channels = out_channels
-        self.pool = nn.MaxPool3d(2) if is_3d else nn.MaxPool2d(2)
+        pool_cls = nn.MaxPool3d if is_3d else nn.MaxPool2d
+        self.pools = nn.ModuleList(pool_cls(kernel_size=stride, stride=stride) for stride in strides)
         self.upconvs = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.deep_supervision_heads = nn.ModuleList()
         for level in range(config.depth - 1, 0, -1):
-            self.upconvs.append(conv_transpose(channels[level], channels[level - 1], kernel_size=2, stride=2))
+            stride = strides[level - 1]
+            self.upconvs.append(
+                conv_transpose(channels[level], channels[level - 1], kernel_size=stride, stride=stride)  # type: ignore[arg-type]
+            )
             self.decoders.append(
                 ConvBlock(
                     channels[level - 1] * 2,
@@ -150,6 +163,7 @@ class UNet2D(nn.Module):
                     activation=config.activation,
                     dropout=config.dropout,
                     dimensions=config.dimensions,
+                    kernel_size=kernels[level - 1],
                 )
             )
             if config.deep_supervision and level > 1:
@@ -162,7 +176,7 @@ class UNet2D(nn.Module):
             x = encoder(x)
             skips.append(x)
             if index != len(self.encoders) - 1:
-                x = self.pool(x)
+                x = self.pools[index](x)
         auxiliary_outputs: list[torch.Tensor] = []
         head_index = 0
         for decoder_index, (upconv, decoder, skip) in enumerate(
@@ -180,7 +194,7 @@ class UNet2D(nn.Module):
         primary = self.out(x)
         if not self.config.deep_supervision:
             return primary
-        return [primary, *auxiliary_outputs]
+        return [primary, *reversed(auxiliary_outputs)]
 
 
 def build_unet(

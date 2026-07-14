@@ -1,4 +1,4 @@
-# ISSUE: Fixed Training Steps Per Epoch
+# RESOLVED: Fixed Training Steps Per Epoch
 
 ## Problem
 
@@ -41,9 +41,11 @@ explicitly.
 - Test tiny datasets, highly unequal volume depths, multiple workers, resumed
   training, and deterministic seeded runs.
 
-## Current Scope
+## Resolution
 
-Do not change epoch semantics as part of the initial 2.5D context-stack and
-scale-normalization implementation. Address this issue as a separate training
-sampler change so its optimization and reproducibility effects can be tested in
-isolation.
+Training now samples cases, center slices, patches, scales, and augmentations
+from a deterministic index-derived random stream. The automatic optimizer-step
+budget is `max(250, ceil(10 * training_cases / effective_batch_size))`.
+Microbatch accumulation is counted separately, callbacks report optimizer
+steps, polynomial scheduling advances by epoch, and validation remains finite
+and deterministic.

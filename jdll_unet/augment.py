@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .scale import resize_2d_pair_to_shape
+from .scale import resize_2d_pair_to_shape, resize_3d_pair_to_shape
 
 try:  # pragma: no cover
     from scipy import ndimage as ndi
@@ -156,23 +156,37 @@ def _spatial_affine(
     scale = float(rng.uniform(*scale_range))
     cos_a = math.cos(angle) * scale
     sin_a = math.sin(angle) * scale
-    theta = torch.tensor([[[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]]], dtype=torch.float32)
+    if mask.ndim == 2:
+        theta = torch.tensor([[[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]]], dtype=torch.float32)
+    elif mask.ndim == 3:
+        # Rotate/scale in the high-resolution YX plane without mixing sparse Z samples.
+        theta = torch.tensor(
+            [[[cos_a, -sin_a, 0.0, 0.0], [sin_a, cos_a, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]],
+            dtype=torch.float32,
+        )
+    else:
+        raise ValueError("Spatial affine supports 2D and 3D arrays")
     image_t = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32, copy=False)))
     mask_t = torch.from_numpy(np.ascontiguousarray(mask[None, None].astype(np.float32, copy=False)))
-    grid = F.affine_grid(theta, image_t.shape, align_corners=False)
+    grid = F.affine_grid(theta, list(image_t.shape), align_corners=False)
     image_out = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="border", align_corners=False)
     mask_out = F.grid_sample(mask_t, grid, mode="nearest", padding_mode="zeros", align_corners=False)
     return image_out[0].numpy(), mask_out[0, 0].numpy().astype(mask.dtype, copy=False)
 
 
-def _low_resolution(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _low_resolution(
+    image: np.ndarray, rng: np.random.Generator, spacing: tuple[float, ...] | None = None
+) -> np.ndarray:
     if ndi is None:
         return image
     factor = float(rng.uniform(0.5, 0.8))
     out = np.empty_like(image)
     target_shape = image.shape[1:]
+    axis_factors = [factor] * image[0].ndim
+    if spacing is not None and len(spacing) == 3 and spacing[0] / min(spacing) >= 2:
+        axis_factors[0] = 1.0
     for channel in range(image.shape[0]):
-        small = ndi.zoom(image[channel], [factor] * image[channel].ndim, order=1)
+        small = ndi.zoom(image[channel], axis_factors, order=1)
         zoom = tuple(target / max(current, 1) for target, current in zip(target_shape, small.shape, strict=True))
         restored = ndi.zoom(small, zoom, order=1)
         pads = [(0, max(0, target - current)) for target, current in zip(target_shape, restored.shape, strict=True)]
@@ -183,6 +197,32 @@ def _low_resolution(image: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return out
 
 
+def _elastic_deform(
+    image: np.ndarray,
+    mask: np.ndarray,
+    rng: np.random.Generator,
+    spacing: tuple[float, ...] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if ndi is None:
+        return image, mask
+    physical_spacing = np.asarray(spacing or (1.0,) * mask.ndim, dtype=np.float64)
+    physical_extent = np.asarray(mask.shape) * physical_spacing
+    alpha_physical = 0.06 * float(physical_extent.min())
+    sigma_physical = max(float(physical_spacing.max()), 0.08 * float(physical_extent.min()))
+    displacements = []
+    for axis in range(mask.ndim):
+        noise = rng.normal(size=mask.shape)
+        sigma_voxels = tuple(max(0.5, sigma_physical / value) for value in physical_spacing)
+        smooth = ndi.gaussian_filter(noise, sigma=sigma_voxels, mode="reflect")
+        maximum = max(float(np.max(np.abs(smooth))), 1e-6)
+        displacements.append(smooth / maximum * (alpha_physical / physical_spacing[axis]))
+    coordinates = np.meshgrid(*(np.arange(size, dtype=np.float64) for size in mask.shape), indexing="ij")
+    warped = tuple(coordinates[axis] + displacements[axis] for axis in range(mask.ndim))
+    image_out = np.stack([ndi.map_coordinates(channel, warped, order=1, mode="nearest") for channel in image])
+    mask_out = ndi.map_coordinates(mask, warped, order=0, mode="constant", cval=0)
+    return np.ascontiguousarray(image_out), np.ascontiguousarray(mask_out.astype(mask.dtype, copy=False))
+
+
 def apply_augmentation(
     image: np.ndarray,
     mask: np.ndarray,
@@ -190,11 +230,10 @@ def apply_augmentation(
     rng: np.random.Generator | None = None,
     training: bool = True,
     object_diameter_px: float | None = None,
+    spacing: tuple[float, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rng = rng or np.random.default_rng()
     if cfg.instance_scale_enabled:
-        if mask.ndim != 2:
-            raise ValueError("Instance scale normalization currently supports 2D data only")
         if object_diameter_px is None or object_diameter_px <= 0:
             raise ValueError("A positive object diameter estimate is required for instance scale normalization")
         jitter = 1.0
@@ -215,7 +254,12 @@ def apply_augmentation(
             max_retries=cfg.empty_patch_max_retries if training and cfg.skip_empty_patches else 0,
             include_empty_after_max_retries=cfg.include_empty_patches_after_max_retries,
         )
-        image, mask = resize_2d_pair_to_shape(image, mask, cfg.patch_size)
+        if mask.ndim == 2:
+            image, mask = resize_2d_pair_to_shape(image, mask, cast(tuple[int, int], cfg.patch_size))
+        elif mask.ndim == 3:
+            image, mask = resize_3d_pair_to_shape(image, mask, cast(tuple[int, int, int], cfg.patch_size))
+        else:
+            raise ValueError("Instance scale normalization supports 2D and 3D masks")
     else:
         image, mask = sample_patch(
             image,
@@ -240,14 +284,18 @@ def apply_augmentation(
         k = int(rng.integers(0, 4))
         image = np.rot90(image, k, axes=(-2, -1))
         mask = np.rot90(mask, k, axes=(-2, -1))
-    if mask.ndim == 2 and cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
+    if cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
         image, mask = _spatial_affine(image, mask, rng, cfg.rotation_degrees, cfg.scale_range)
     if cfg.lowres_probability > 0 and rng.random() < cfg.lowres_probability:
-        image = _low_resolution(image, rng)
+        image = _low_resolution(image, rng, spacing)
+    if cfg.elastic_probability > 0 and rng.random() < cfg.elastic_probability:
+        image, mask = _elastic_deform(image, mask, rng, spacing)
     if cfg.blur_probability > 0 and rng.random() < cfg.blur_probability and ndi is not None:
         sigma = float(rng.uniform(*cfg.blur_sigma))
         for channel in range(image.shape[0]):
-            image[channel] = ndi.gaussian_filter(image[channel], sigma=sigma)
+            # Do not over-blur a coarse Z axis; in-plane filtering remains isotropic.
+            per_axis_sigma = (min(0.5, sigma), sigma, sigma) if mask.ndim == 3 else sigma
+            image[channel] = ndi.gaussian_filter(image[channel], sigma=per_axis_sigma)
     if rng.random() < cfg.brightness_probability:
         image = image * float(rng.uniform(*cfg.brightness_range))
     if rng.random() < cfg.shift_probability:

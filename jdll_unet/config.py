@@ -5,15 +5,16 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import torch
 
 from .errors import ConfigError
 
 AUTO = "auto"
+T = TypeVar("T")
 SUPPORTED_TASKS = {"auto", "binary_semantic", "multiclass_semantic", "instance_friendly", "classes", "objects"}
 SUPPORTED_AUGMENTATION_PROFILES = {"auto", "fast", "light-balanced", "balanced", "strong"}
 SUPPORTED_LR_SCHEDULERS = {"poly", "cosine", "plateau", "none", "constant"}
@@ -25,6 +26,8 @@ DEFAULT_LOSS_WEIGHTS = {
     "focal": 0.0,
     "boundary": 0.5,
     "boundary_focal": 0.0,
+    "distance": 1.0,
+    "distance_background": 0.05,
 }
 
 
@@ -46,6 +49,15 @@ class PostprocessingConfig:
     min_object_size: int = 0
     fill_holes: bool = False
     connected_components: bool = True
+    method: str = "distance_boundary_watershed"
+    seed_distance_threshold: float = 0.35
+    seed_boundary_threshold: float = 0.5
+    seed_h: float = 0.1
+    min_seed_size: int = 3
+    boundary_weight: float = 1.0
+    connectivity: str = "face"
+    min_object_size_physical: float | None = None
+    min_seed_size_physical: float | None = None
 
 
 @dataclass(slots=True)
@@ -62,7 +74,7 @@ class LRSchedulerConfig:
 class InstanceScaleNormalizationConfig:
     enabled: bool = True
     target_object_fraction: float = 0.25
-    object_size_measure: str = "equivalent_diameter"
+    object_size_measure: str = "equivalent_sphere_diameter"
     max_instances_per_image: int = 21
     exclude_border_instances: bool = True
     min_instance_area: int = 4
@@ -70,6 +82,33 @@ class InstanceScaleNormalizationConfig:
     jitter_distribution: str = "log_uniform"
     min_effective_scale: float = 0.25
     max_effective_scale: float = 4.0
+
+
+@dataclass(slots=True)
+class SpacingConfig:
+    default_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    known_fraction_threshold: float = 0.5
+    target_spacing: str | tuple[float, float, float] = AUTO
+    anisotropy_threshold: float = 3.0
+    kernel_anisotropy_threshold: float = 2.0
+    max_upsampling: float = 3.0
+    minimum_feature_map_size: int = 4
+
+
+@dataclass(slots=True)
+class ContextConfig:
+    stride_policy: str = "nearest_physical"
+    stride: int = 1
+    spacing: str | float = AUTO
+
+
+@dataclass(slots=True)
+class ValidationConfig:
+    mode: str = "full"
+    light_every: int = 1
+    full_every: int = 5
+    light_steps: int = 50
+    early_stopping_patience: int = 20
 
 
 @dataclass(slots=True)
@@ -87,6 +126,11 @@ class ArchitectureConfig:
     context_slices: int = 3
     block_type: str = "residual"
     deep_supervision: bool = False
+    channels: tuple[int, ...] = ()
+    encoder_blocks: tuple[int, ...] = ()
+    kernels: tuple[tuple[int, ...], ...] = ()
+    strides: tuple[tuple[int, ...], ...] = ()
+    reference_memory_gb: int = 4
 
 
 @dataclass(slots=True)
@@ -126,6 +170,14 @@ class TrainingConfig:
     mixed_precision: bool | str = AUTO
     deep_supervision: bool | str = False
     context_slices: int = 3
+    context: ContextConfig = field(default_factory=ContextConfig)
+    spacing: SpacingConfig = field(default_factory=SpacingConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
+    effective_batch_size: int = 4
+    steps_per_epoch: int | str = AUTO
+    minimum_steps_per_epoch: int = 250
+    expected_patches_per_case: int = 10
+    memory_fraction: float = 0.8
     focal_gamma: float = 2.0
     focal_alpha: float | None = None
     auto_focal: bool = False
@@ -203,7 +255,7 @@ def _as_spatial_tuple(value: Any) -> tuple[int, ...] | str:
     if value == AUTO:
         return AUTO
     if isinstance(value, int):
-        parsed = (value, value)
+        parsed: tuple[int, ...] = (value, value)
     elif isinstance(value, (list, tuple)) and len(value) in {2, 3}:
         parsed = tuple(int(item) for item in value)
     else:
@@ -213,13 +265,13 @@ def _as_spatial_tuple(value: Any) -> tuple[int, ...] | str:
     return parsed
 
 
-def _nested_dataclass(cls: type, value: Any):
+def _nested_dataclass(cls: type[T], value: Any) -> T:
     if isinstance(value, cls):
         return value
     if value is None:
         return cls()
     if isinstance(value, Mapping):
-        valid = {field.name for field in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        valid = {item.name for item in fields(cast(Any, cls))}
         unknown = sorted(set(value) - valid)
         if unknown:
             raise ConfigError(f"Unknown {cls.__name__} field(s): {', '.join(unknown)}")
@@ -235,7 +287,7 @@ def _lr_scheduler_config(value: Any) -> LRSchedulerConfig:
     if isinstance(value, str):
         return LRSchedulerConfig(type=value)
     if isinstance(value, Mapping):
-        valid = {field.name for field in LRSchedulerConfig.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        valid = {field.name for field in LRSchedulerConfig.__dataclass_fields__.values()}
         unknown = sorted(set(value) - valid)
         if unknown:
             raise ConfigError(f"Unknown LRSchedulerConfig field(s): {', '.join(unknown)}")
@@ -281,6 +333,19 @@ def _validate_postprocessing(config: PostprocessingConfig) -> None:
         raise ConfigError("postprocessing.threshold must be in [0, 1]")
     if config.min_object_size < 0:
         raise ConfigError("postprocessing.min_object_size cannot be negative")
+    if config.method not in {"distance_boundary_watershed", "connected_components"}:
+        raise ConfigError("Unsupported postprocessing.method")
+    if config.connectivity not in {"face", "full"}:
+        raise ConfigError("postprocessing.connectivity must be 'face' or 'full'")
+    for name in ("seed_distance_threshold", "seed_boundary_threshold", "seed_h"):
+        if not 0 <= float(getattr(config, name)) <= 1:
+            raise ConfigError(f"postprocessing.{name} must be in [0, 1]")
+    if config.min_seed_size < 1 or config.boundary_weight < 0:
+        raise ConfigError("postprocessing seed size and boundary weight are invalid")
+    for name in ("min_object_size_physical", "min_seed_size_physical"):
+        value = getattr(config, name)
+        if value is not None and float(value) < 0:
+            raise ConfigError(f"postprocessing.{name} cannot be negative")
 
 
 def _validate_lr_scheduler(config: LRSchedulerConfig) -> None:
@@ -373,6 +438,14 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", False), "deep_supervision"),
             context_slices=int(raw.get("context_slices", 3)),
+            context=_nested_dataclass(ContextConfig, raw.get("context")),
+            spacing=_nested_dataclass(SpacingConfig, raw.get("spacing")),
+            validation=_nested_dataclass(ValidationConfig, raw.get("validation")),
+            effective_batch_size=int(raw.get("effective_batch_size", 4)),
+            steps_per_epoch=_auto_or_int(raw.get("steps_per_epoch", AUTO), "steps_per_epoch"),
+            minimum_steps_per_epoch=int(raw.get("minimum_steps_per_epoch", 250)),
+            expected_patches_per_case=int(raw.get("expected_patches_per_case", 10)),
+            memory_fraction=float(raw.get("memory_fraction", 0.8)),
             focal_gamma=float(raw.get("focal_gamma", 2.0)),
             focal_alpha=_optional_float(raw.get("focal_alpha"), "focal_alpha"),
             auto_focal=_coerce_bool(raw.get("auto_focal", False), "auto_focal"),
@@ -435,6 +508,33 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("empty_patch_max_retries cannot be negative")
     if parsed.context_slices < 1 or parsed.context_slices % 2 == 0:
         raise ConfigError("context_slices must be a positive odd integer")
+    if parsed.context.stride_policy not in {"adjacent", "fixed_stride", "nearest_physical"}:
+        raise ConfigError("context.stride_policy must be adjacent, fixed_stride, or nearest_physical")
+    if int(parsed.context.stride) < 1:
+        raise ConfigError("context.stride must be at least 1")
+    if parsed.context.spacing != AUTO and float(parsed.context.spacing) <= 0:
+        raise ConfigError("context.spacing must be 'auto' or positive")
+    if parsed.effective_batch_size < 1 or parsed.minimum_steps_per_epoch < 1 or parsed.expected_patches_per_case < 1:
+        raise ConfigError("effective batch and training-step settings must be positive")
+    if not 0 < parsed.memory_fraction <= 1:
+        raise ConfigError("memory_fraction must be in (0, 1]")
+    _validate_auto_positive_int(parsed.steps_per_epoch, "steps_per_epoch")
+    spacing = parsed.spacing
+    parsed_default_spacing = tuple(float(value) for value in spacing.default_spacing)
+    if len(parsed_default_spacing) != 3 or any(value <= 0 for value in parsed_default_spacing):
+        raise ConfigError("spacing.default_spacing must contain three positive Z,Y,X values")
+    spacing.default_spacing = parsed_default_spacing
+    if not 0 <= spacing.known_fraction_threshold <= 1:
+        raise ConfigError("spacing.known_fraction_threshold must be in [0, 1]")
+    if spacing.anisotropy_threshold <= 1 or spacing.kernel_anisotropy_threshold <= 1:
+        raise ConfigError("spacing anisotropy thresholds must be greater than 1")
+    if spacing.max_upsampling < 1 or spacing.minimum_feature_map_size < 2:
+        raise ConfigError("spacing safeguards are invalid")
+    validation = parsed.validation
+    if validation.mode not in {"light", "full"}:
+        raise ConfigError("validation.mode must be 'light' or 'full'")
+    if min(validation.light_every, validation.full_every, validation.light_steps, validation.early_stopping_patience) < 1:
+        raise ConfigError("validation intervals, steps, and patience must be positive")
     _validate_auto_positive_int(parsed.input_channels, "input_channels")
     _validate_auto_positive_int(parsed.output_classes, "output_classes")
     _validate_auto_positive_int(parsed.batch_size, "batch_size")
@@ -458,20 +558,23 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("instance_scale_normalization numeric options must be valid numbers") from exc
     if not 0 < scale_cfg.target_object_fraction < 1:
         raise ConfigError("instance_scale_normalization.target_object_fraction must be in (0, 1)")
-    if scale_cfg.object_size_measure != "equivalent_diameter":
-        raise ConfigError("instance_scale_normalization.object_size_measure must be 'equivalent_diameter'")
+    aliases = {"equivalent_diameter": "equivalent_sphere_diameter"}
+    scale_cfg.object_size_measure = aliases.get(scale_cfg.object_size_measure, scale_cfg.object_size_measure)
+    if scale_cfg.object_size_measure not in {"equivalent_sphere_diameter", "principal_axes"}:
+        raise ConfigError("instance_scale_normalization.object_size_measure must be equivalent_sphere_diameter or principal_axes")
     if int(scale_cfg.max_instances_per_image) < 1:
         raise ConfigError("instance_scale_normalization.max_instances_per_image must be at least 1")
     if int(scale_cfg.min_instance_area) < 1:
         raise ConfigError("instance_scale_normalization.min_instance_area must be at least 1")
     try:
-        scale_cfg.training_scale_jitter = tuple(float(item) for item in scale_cfg.training_scale_jitter)
+        parsed_jitter = tuple(float(item) for item in scale_cfg.training_scale_jitter)
     except (TypeError, ValueError) as exc:
         raise ConfigError(
             "instance_scale_normalization.training_scale_jitter must contain two positive ordered values"
         ) from exc
-    if len(scale_cfg.training_scale_jitter) != 2 or not 0 < scale_cfg.training_scale_jitter[0] <= scale_cfg.training_scale_jitter[1]:
+    if len(parsed_jitter) != 2 or not 0 < parsed_jitter[0] <= parsed_jitter[1]:
         raise ConfigError("instance_scale_normalization.training_scale_jitter must contain two positive ordered values")
+    scale_cfg.training_scale_jitter = parsed_jitter
     if scale_cfg.jitter_distribution != "log_uniform":
         raise ConfigError("instance_scale_normalization.jitter_distribution must be 'log_uniform'")
     if not 0 < float(scale_cfg.min_effective_scale) <= float(scale_cfg.max_effective_scale):
@@ -515,68 +618,57 @@ def architecture_defaults(
     deep_supervision: bool = False,
 ) -> ArchitectureConfig:
     normalization = _model_normalization(normalization)
-    name = architecture.lower()
-    dimensions = "3d" if name.startswith(("tiny-3d", "medium-3d")) else "2.5d" if "2.5" in name or "25d" in name else "2d"
-    block_type = "residual" if name.startswith("resenc") or name.startswith("residual") else "conv"
-    if name.startswith("medium-3d"):
-        return ArchitectureConfig(
-            name=architecture,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            base_channels=24,
-            depth=3,
-            normalization=normalization,
-            dimensions=dimensions,
-            block_type=block_type,
-            deep_supervision=deep_supervision,
-        )
-    if name.startswith("tiny-3d"):
-        return ArchitectureConfig(
-            name=architecture,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            base_channels=12,
-            depth=3,
-            normalization=normalization,
-            dimensions=dimensions,
-            block_type=block_type,
-            deep_supervision=deep_supervision,
-        )
-    if name.startswith("medium") or name.startswith("resenc-medium") or name.startswith("residual-medium"):
-        return ArchitectureConfig(
-            name=architecture,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            base_channels=32,
-            depth=4,
-            normalization=normalization,
-            dimensions=dimensions,
-            block_type=block_type,
-            deep_supervision=deep_supervision,
-        )
-    if name.startswith("tiny") or name.startswith("resenc-tiny") or name.startswith("residual-tiny"):
-        return ArchitectureConfig(
-            name=architecture,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            base_channels=16,
-            depth=3,
-            normalization=normalization,
-            dimensions=dimensions,
-            block_type=block_type,
-            deep_supervision=deep_supervision,
-        )
-    raise ConfigError(f"Unsupported architecture: {architecture}")
+    name = architecture.lower().replace("25d", "2.5d")
+    dimensions = "3d" if name.endswith("-3d") else "2.5d" if name.endswith("-2.5d") else "2d"
+    stripped = name.removeprefix("resenc-").removeprefix("residual-")
+    preset = stripped.split("-")[0]
+    presets = {
+        "tiny": ((16, 32, 64, 128), (1, 2, 2, 2), 4),
+        "medium": ((24, 48, 96, 192, 320), (1, 2, 2, 2, 2), 8),
+        "big": ((32, 64, 128, 256, 320), (1, 3, 4, 4, 4), 16),
+        "large": ((32, 64, 128, 256, 384, 512), (1, 3, 4, 6, 6, 6), 24),
+    }
+    if preset not in presets:
+        raise ConfigError(f"Unsupported architecture: {architecture}")
+    channels, blocks, memory = presets[preset]
+    legacy_3d = {
+        "tiny-3d": ((12, 24, 48), (2, 2, 2), 4),
+        "medium-3d": ((24, 48, 96), (2, 2, 2), 8),
+    }
+    if name in legacy_3d:
+        channels, blocks, memory = legacy_3d[name]
+    # Legacy non-resenc names remain loadable, while all new preset names default to ResEnc.
+    block_type = "conv" if name in {"tiny-2d", "medium-2d", "tiny-3d", "medium-3d", "tiny-2.5d", "medium-2.5d"} else "residual"
+    return ArchitectureConfig(
+        name=architecture,
+        input_channels=input_channels,
+        output_channels=output_channels,
+        base_channels=channels[0],
+        depth=len(channels),
+        convs_per_level=2,
+        normalization=normalization,
+        dimensions=dimensions,
+        block_type=block_type,
+        deep_supervision=deep_supervision,
+        channels=channels,
+        encoder_blocks=blocks,
+        reference_memory_gb=memory,
+    )
 
 
 def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = None) -> tuple[int, ...]:
     name = architecture.lower()
-    if name.startswith("medium-3d"):
+    preferred: tuple[int, ...]
+    if name.endswith("-3d") and "large" in name:
+        preferred = (64, 160, 160)
+    elif name.endswith("-3d") and "big" in name:
+        preferred = (48, 144, 144)
+    elif name.endswith("-3d") and "medium" in name:
         preferred = (16, 128, 128)
-    elif name.startswith("tiny-3d"):
+    elif name.endswith("-3d"):
         preferred = (16, 96, 96)
     else:
-        preferred = (128, 128) if "medium" in name else (96, 96)
+        preferred = (192, 192) if "large" in name else (160, 160) if "big" in name else (128, 128) if "medium" in name else (96, 96)
     if image_shape is None:
         return preferred
     return tuple(min(preferred[index], int(image_shape[index])) for index in range(len(preferred)))
@@ -584,8 +676,8 @@ def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = 
 
 def default_batch_size(architecture: str, device: torch.device) -> int:
     name = architecture.lower()
-    if name.startswith(("tiny-3d", "medium-3d")):
-        if device.type == "cpu" or name.startswith("medium-3d"):
+    if name.endswith("-3d"):
+        if device.type == "cpu" or any(preset in name for preset in ("medium", "big", "large")):
             return 1
         return 2
     if "medium" in name:
@@ -614,11 +706,8 @@ def default_foreground_probability(task: str, architecture: str) -> float:
 
 
 def default_augmentation_profile(architecture: str, device: torch.device) -> str:
-    if "medium" in architecture.lower() and device.type in {"cuda", "mps"}:
-        return "balanced"
-    if "medium" in architecture.lower():
-        return "light-balanced"
-    return "fast"
+    name = architecture.lower()
+    return "strong" if any(preset in name for preset in ("big", "large")) else "balanced"
 
 
 def default_progress_update_interval(device: torch.device) -> int:

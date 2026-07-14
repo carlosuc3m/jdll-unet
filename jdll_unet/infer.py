@@ -6,7 +6,7 @@ import os
 from collections import OrderedDict
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from .errors import InferenceError, ModelLoadError
 from .io import load_image, normalize_image
 from .losses import primary_logits
 from .model import build_unet
+from .planning import read_spacing, resample_image_mask, resolve_context_stride, restore_continuous_maps
 from .postprocess import postprocess_binary, postprocess_instance, postprocess_multiclass
 from .scale import resize_2d_channels
 
@@ -48,7 +49,11 @@ def _checkpoint_from_path(model_path: Path) -> Path:
 def _config_from_checkpoint(checkpoint: Path, state: dict[str, Any]) -> dict[str, Any]:
     folder_config = checkpoint.parent / "config.json"
     if folder_config.exists():
-        return read_json(folder_config)
+        config = read_json(folder_config)
+        metadata_path = checkpoint.parent / "model_metadata.json"
+        if metadata_path.exists():
+            config["_model_metadata"] = read_json(metadata_path)
+        return config
     if "model_config" in state:
         return state["model_config"]
     raise ModelLoadError(f"Cannot find config.json or embedded model_config for {checkpoint}")
@@ -141,15 +146,15 @@ def tiled_predict(
             spatial_slices = tuple(slice(start, start + tile) for start, tile in zip(starts, tile_size, strict=True))
             patch = image[(slice(None), *spatial_slices)]
             patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
-            logits = primary_logits(model(patch_t))[0]
-            if logits.shape[1:] != tuple(tile_size):
+            patch_logits = primary_logits(model(patch_t))[0]
+            if patch_logits.shape[1:] != tuple(tile_size):
                 mode = "trilinear" if len(tile_size) == 3 else "bilinear"
-                logits = F.interpolate(logits[None], size=tile_size, mode=mode, align_corners=False)[0]
-            accum[(slice(None), *spatial_slices)] += logits
+                patch_logits = F.interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
+            accum[(slice(None), *spatial_slices)] += patch_logits
             counts[(slice(None), *spatial_slices)] += 1.0
-    logits = (accum / counts.clamp_min(1.0)).detach().cpu().numpy()
+    logits_array = (accum / counts.clamp_min(1.0)).detach().cpu().numpy()
     crop = tuple(slice(0, size) for size in original_shape)
-    return logits[(slice(None), *crop)]
+    return logits_array[(slice(None), *crop)]
 
 
 def _load_input(inputs: dict[str, Any] | np.ndarray, dimensions: str) -> np.ndarray:
@@ -198,11 +203,11 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
 
 
-def _context_stack(volume: np.ndarray, center_z: int, context_slices: int) -> np.ndarray:
+def _context_stack(volume: np.ndarray, center_z: int, context_slices: int, stride: int = 1) -> np.ndarray:
     radius = context_slices // 2
     channels: list[np.ndarray] = []
     for modality in range(volume.shape[0]):
-        for z in range(center_z - radius, center_z + radius + 1):
+        for z in range(center_z - radius * stride, center_z + radius * stride + 1, stride):
             channels.append(
                 volume[modality, z]
                 if 0 <= z < volume.shape[1]
@@ -218,9 +223,10 @@ def _predict_25d(
     tile_size: tuple[int, int],
     overlap: float,
     context_slices: int,
+    context_stride: int = 1,
 ) -> np.ndarray:
     predictions = [
-        tiled_predict(model, _context_stack(volume, z, context_slices), device, tile_size, overlap)
+        tiled_predict(model, _context_stack(volume, z, context_slices, context_stride), device, tile_size, overlap)
         for z in range(volume.shape[1])
     ]
     return np.ascontiguousarray(np.stack(predictions, axis=1))
@@ -238,6 +244,24 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     original_spatial_shape = tuple(int(item) for item in image.shape[1:])
     task_name = str(model_config["task"])
     train_cfg = model_config.get("training", {})
+    metadata = model_config.get("_model_metadata", {})
+    dataset_plan = metadata.get("dataset_plan", {})
+    spacing_cfg = train_cfg.get("spacing", {})
+    input_spacing = None
+    if isinstance(inputs, dict):
+        supplied_spacing = inputs.get("spacing", config.get("spacing"))
+        if supplied_spacing is not None:
+            input_spacing = cast(tuple[float, float, float], tuple(float(value) for value in supplied_spacing))
+        elif inputs.get("image_path") is not None and dimensions in {"2.5d", "3d"}:
+            input_spacing, _spacing_source = read_spacing(Path(inputs["image_path"]))
+    if input_spacing is None and dimensions in {"2.5d", "3d"}:
+        input_spacing = cast(
+            tuple[float, float, float], tuple(float(value) for value in spacing_cfg.get("default_spacing", (1, 1, 1)))
+        )
+    target_spacing = cast(tuple[float, float, float], tuple(dataset_plan["target_spacing"])) if dataset_plan.get("target_spacing") else None
+    if dimensions == "3d" and input_spacing is not None and target_spacing is not None:
+        dummy_mask = np.zeros(image.shape[1:], dtype=np.uint8)
+        image, _ = resample_image_mask(image, dummy_mask, input_spacing, target_spacing)
     tile_size = config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
     tile_size = _parse_tile_size(tile_size, dimensions)
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
@@ -245,8 +269,6 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
     instance_scale_enabled = task_name == "instance_friendly" and bool(scale_cfg.get("enabled", False))
     if instance_scale_enabled:
-        if dimensions not in {"2d", "2.5d"}:
-            raise InferenceError("Instance scale normalization currently supports 2D and 2.5D models only")
         object_size = config.get("object_size", config.get("object_diameter"))
         if object_size is None and isinstance(inputs, dict):
             object_size = inputs.get("object_size", inputs.get("object_diameter"))
@@ -259,7 +281,10 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         if object_size <= 0 or not np.isfinite(object_size):
             raise InferenceError("object_size must be a positive finite number in input pixels")
         training_patch = _parse_tile_size(train_cfg.get("patch_size", tile_size), dimensions)
-        target_diameter = float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch)
+        scale_metadata = metadata.get("instance_scale") or {}
+        target_diameter = float(
+            scale_metadata.get("target_object_size", float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch))
+        )
         inference_scale = float(
             np.clip(
                 target_diameter / object_size,
@@ -267,19 +292,36 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
                 float(scale_cfg.get("max_effective_scale", 4.0)),
             )
         )
-        scale_source_shape = original_spatial_shape[-2:] if dimensions == "2.5d" else original_spatial_shape
+        scale_source_shape = original_spatial_shape[-2:] if dimensions == "2.5d" else tuple(image.shape[1:])
         scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in scale_source_shape)
         if dimensions == "2.5d":
             flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
-            image = resize_2d_channels(flattened, scaled_shape).reshape(image.shape[0], image.shape[1], *scaled_shape)
+            image = resize_2d_channels(flattened, cast(tuple[int, int], scaled_shape)).reshape(
+                image.shape[0], image.shape[1], *scaled_shape
+            )
+        elif dimensions == "2d":
+            image = np.ascontiguousarray(resize_2d_channels(image, cast(tuple[int, int], scaled_shape)))
         else:
-            image = np.ascontiguousarray(resize_2d_channels(image, scaled_shape))
+            image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
+            image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
     context_slices = int((model_config.get("architecture_config") or {}).get("context_slices", 3))
+    context_cfg = train_cfg.get("context", {})
+    resolved_context = metadata.get("resolved_context", {})
+    context_policy = str(resolved_context.get("stride_policy", context_cfg.get("stride_policy", "adjacent")))
+    target_context_spacing = resolved_context.get("target_spacing")
+    context_stride = resolve_context_stride(
+        context_policy,
+        fixed_stride=int(context_cfg.get("stride", 1)),
+        target_spacing=float(target_context_spacing) if target_context_spacing is not None else None,
+        z_spacing=float(input_spacing[0]) if input_spacing is not None else 1.0,
+    )
     logits = (
-        _predict_25d(model, image, device, tile_size, overlap, context_slices)
+        _predict_25d(model, image, device, cast(tuple[int, int], tile_size), overlap, context_slices, context_stride)
         if dimensions == "2.5d"
         else tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
     )
+    if dimensions == "3d" and logits.shape[1:] != original_spatial_shape:
+        logits = restore_continuous_maps(logits, original_spatial_shape)
 
     post_cfg = dict(model_config.get("postprocessing", {}))
     post_overrides = config.get("postprocessing", {})
@@ -289,7 +331,15 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     if task_name == "binary_semantic":
         probability = _sigmoid(logits[0])
         outputs = {"foreground_probability": probability}
-        outputs.update(postprocess_binary(probability, **post_cfg))
+        outputs.update(
+            postprocess_binary(
+                probability,
+                threshold=float(post_cfg.get("threshold", 0.5)),
+                min_object_size=int(post_cfg.get("min_object_size", 0)),
+                fill_holes=bool(post_cfg.get("fill_holes", False)),
+                connected_components=bool(post_cfg.get("connected_components", True)),
+            )
+        )
     elif task_name == "multiclass_semantic":
         exp = np.exp(logits - logits.max(axis=0, keepdims=True))
         probabilities = exp / exp.sum(axis=0, keepdims=True)
@@ -300,20 +350,35 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         if instance_scale_enabled and probabilities.shape[1:] != original_spatial_shape:
             if dimensions == "2.5d":
                 channels, depth = probabilities.shape[:2]
-                restored = resize_2d_channels(probabilities.reshape(channels * depth, *probabilities.shape[2:]), original_spatial_shape[1:])
+                restored = resize_2d_channels(
+                    probabilities.reshape(channels * depth, *probabilities.shape[2:]),
+                    cast(tuple[int, int], original_spatial_shape[1:]),
+                )
                 probabilities = restored.reshape(channels, depth, *original_spatial_shape[1:])
             else:
-                probabilities = resize_2d_channels(probabilities, original_spatial_shape)
+                probabilities = resize_2d_channels(probabilities, cast(tuple[int, int], original_spatial_shape))
         outputs = {
             "foreground_probability": probabilities[0],
             "boundary_probability": probabilities[1],
+            "distance_probability": probabilities[2],
         }
         outputs.update(
             postprocess_instance(
                 probabilities[0],
                 probabilities[1],
+                probabilities[2],
                 threshold=float(post_cfg.get("threshold", 0.5)),
                 min_object_size=int(post_cfg.get("min_object_size", 0)),
+                method=str(post_cfg.get("method", "distance_boundary_watershed")),
+                seed_distance_threshold=float(post_cfg.get("seed_distance_threshold", 0.35)),
+                seed_boundary_threshold=float(post_cfg.get("seed_boundary_threshold", 0.5)),
+                seed_h=float(post_cfg.get("seed_h", 0.1)),
+                min_seed_size=int(post_cfg.get("min_seed_size", 3)),
+                boundary_weight=float(post_cfg.get("boundary_weight", 1.0)),
+                connectivity=str(post_cfg.get("connectivity", "face")),
+                spacing=tuple(input_spacing) if input_spacing is not None else None,
+                min_object_size_physical=post_cfg.get("min_object_size_physical"),
+                min_seed_size_physical=post_cfg.get("min_seed_size_physical"),
             )
         )
     else:
@@ -325,6 +390,9 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "input_shape": list(image.shape),
         "original_input_shape": [int(image.shape[0]), *original_spatial_shape],
         "instance_scale_factor": inference_scale,
+        "input_spacing": list(input_spacing) if input_spacing is not None else None,
+        "target_spacing": list(target_spacing) if target_spacing is not None else None,
+        "context_stride": context_stride if dimensions == "2.5d" else None,
         "output_keys": sorted(outputs),
     }
     CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)

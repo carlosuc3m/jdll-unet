@@ -20,12 +20,15 @@ class LearningRateScheduler:
         optimizer: torch.optim.Optimizer,
         config: LRSchedulerConfig,
         total_steps: int,
+        total_epochs: int | None = None,
     ) -> None:
         self.optimizer = optimizer
         self.config = config
         self.type = config.type
         self.total_steps = max(1, int(total_steps))
+        self.total_epochs = max(1, int(total_epochs or total_steps))
         self.step_count = 0
+        self.epoch_count = 0
         self.best_score: float | None = None
         self.bad_epochs = 0
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
@@ -44,7 +47,7 @@ class LearningRateScheduler:
     def config_dict(self) -> dict[str, Any]:
         payload = asdict(self.config)
         payload["type"] = self.type
-        payload["step_scope"] = "epoch" if self.type == "plateau" else "batch"
+        payload["step_scope"] = "epoch" if self.type in {"poly", "plateau"} else "batch"
         return payload
 
     def state_dict(self) -> dict[str, Any]:
@@ -52,6 +55,8 @@ class LearningRateScheduler:
             "type": self.type,
             "total_steps": self.total_steps,
             "step_count": self.step_count,
+            "epoch_count": self.epoch_count,
+            "total_epochs": self.total_epochs,
             "base_lrs": self.base_lrs,
             "current_lrs": self.current_lrs,
             "best_score": self.best_score,
@@ -61,12 +66,15 @@ class LearningRateScheduler:
 
     def step_batch(self) -> None:
         self.step_count += 1
-        if self.type == "poly":
-            self._set_lrs(self._scheduled_lrs(self._poly_decay()))
-        elif self.type == "cosine":
+        if self.type == "cosine":
             self._set_lrs(self._scheduled_lrs(self._cosine_decay()))
 
     def step_epoch(self, score: float) -> bool:
+        self.epoch_count += 1
+        if self.type == "poly":
+            progress = min(self.epoch_count, self.total_epochs) / self.total_epochs
+            self._set_lrs(self._scheduled_lrs((1.0 - progress) ** float(self.config.poly_power)))
+            return False
         if self.type != "plateau":
             return False
         if self.best_score is None or score > self.best_score + float(self.config.plateau_threshold):
@@ -83,10 +91,6 @@ class LearningRateScheduler:
         new_lrs = [max(self.min_lr, lr * float(self.config.plateau_factor)) for lr in old_lrs]
         self._set_lrs(new_lrs)
         return any(new_lr < old_lr for old_lr, new_lr in zip(old_lrs, new_lrs, strict=True))
-
-    def _poly_decay(self) -> float:
-        progress = min(self.step_count, self.total_steps) / self.total_steps
-        return (1.0 - progress) ** float(self.config.poly_power)
 
     def _cosine_decay(self) -> float:
         progress = min(self.step_count, self.total_steps) / self.total_steps

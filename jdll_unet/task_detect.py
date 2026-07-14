@@ -41,19 +41,19 @@ def _component_count(binary: np.ndarray) -> int:
     offsets: list[tuple[int, ...]] = []
     for axis in range(binary.ndim):
         for delta in (-1, 1):
-            offset = [0] * binary.ndim
-            offset[axis] = delta
-            offsets.append(tuple(offset))
+            offset_vector = [0] * binary.ndim
+            offset_vector[axis] = delta
+            offsets.append(tuple(offset_vector))
     for start in np.ndindex(binary.shape):
         if not binary[start] or seen[start]:
             continue
         count += 1
-        stack = [start]
+        stack: list[tuple[int, ...]] = [start]
         seen[start] = True
         while stack:
             current = stack.pop()
-            for offset in offsets:
-                neighbor = tuple(coord + step for coord, step in zip(current, offset, strict=True))
+            for neighbor_offset in offsets:
+                neighbor = tuple(coord + step for coord, step in zip(current, neighbor_offset, strict=True))
                 if all(0 <= coord < limit for coord, limit in zip(neighbor, binary.shape, strict=True)) and binary[neighbor] and not seen[neighbor]:
                     seen[neighbor] = True
                     stack.append(neighbor)

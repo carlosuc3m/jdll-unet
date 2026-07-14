@@ -76,9 +76,9 @@ def pair_images_and_masks(image_dir: Path, mask_dir: Path) -> list[ImageMaskPair
     pairs: list[ImageMaskPair] = []
     missing: list[str] = []
     for image in images:
-        keys = [image.stem, _canonical_stem(image, IMAGE_SUFFIXES)]
+        image_keys = [image.stem, _canonical_stem(image, IMAGE_SUFFIXES)]
         candidates: list[Path] = []
-        for key in keys:
+        for key in image_keys:
             candidates.extend(mask_lookup.get(key.lower(), []))
         unique = sorted(set(candidates))
         if not unique:

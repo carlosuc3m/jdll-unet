@@ -29,6 +29,7 @@ dependencies = [
   "tifffile",
   "imageio",
   "scipy",
+  "scikit-image",
 ]
 
 [project.optional-dependencies]

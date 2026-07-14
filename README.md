@@ -17,20 +17,27 @@ segmentation datasets laid out as `images/` and `masks/`, or as explicit
 
 ## Architectures
 
-Available 2D architecture names:
+Universal residual-encoder presets are available for `2d`, `2.5d`, and `3d`:
 
-- `tiny-2d`: compact baseline UNet for CPU-friendly training.
-- `medium-2d`: wider/deeper baseline UNet for GPUs or longer CPU runs.
-- `resenc-tiny-2d`: tiny UNet with residual encoder blocks.
-- `resenc-medium-2d`: medium UNet with residual encoder blocks.
-- `tiny-3d`: true 3D UNet using `Conv3d` for volumetric TIFF stacks.
-- `medium-3d`: wider true 3D UNet for GPU or longer CPU runs.
+- `resenc-tiny-*`: `[16,32,64,128]`, reference budget 4 GB.
+- `resenc-medium-*`: `[24,48,96,192,320]`, reference budget 8 GB.
+- `resenc-big-*`: `[32,64,128,256,320]`, reference budget 16 GB.
+- `resenc-large-*`: `[32,64,128,256,384,512]`, reference budget 24 GB.
+
+Replace `*` with `2d`, `2.5d`, or `3d`. Legacy `tiny-*` and `medium-*`
+architecture names remain loadable for existing configurations and checkpoints.
+The universal preset fixes model capacity and preferred patch size independently
+of installed hardware. The runtime changes only microbatch size and gradient
+accumulation, with effective batch four by default.
 
 The default architecture is `resenc-tiny-2d`. Genuine 2.5D variants are also
 available as `tiny-2.5d`, `medium-2.5d`, `resenc-tiny-2.5d`, and
 `resenc-medium-2.5d`. They use a 2D UNet with an odd number of neighboring Z
 slices flattened into input channels; configure the total with
 `"context_slices": 3`. Missing context beyond either Z boundary is zero padded.
+Context sampling supports `adjacent`, `fixed_stride`, and `nearest_physical`.
+The automatic physical target is the median resolved training Z spacing and
+always selects real slices; it never interpolates a 2.5D context channel.
 
 The `resenc-*` variants keep the UNet encoder-decoder shape but replace encoder
 conv blocks with residual blocks for better gradient flow. Deep supervision can
@@ -45,8 +52,27 @@ the default. This is separate from the image-intensity `"normalization"` setting
 
 True 3D models use image tensors shaped `C,Z,Y,X`, masks shaped `Z,Y,X`, and
 logits shaped `B,C,Z,Y,X`. Multipage TIFF/OME-TIFF image and label stacks are
-loaded as volumes for `tiny-3d` and `medium-3d`; RGB 2D images are rejected for
+loaded as volumes; RGB 2D images are rejected for
 true 3D models instead of being guessed as volumes.
+
+## Physical Planning
+
+The trainer reads explicit JSON sidecars and OME/ImageJ TIFF metadata in `Z,Y,X`
+order. If at least half the cases have spacing, missing axes use the known
+per-axis median. Otherwise missing cases use `spacing.default_spacing`, which
+defaults to `[1,1,1]`. Provenance is never discarded.
+
+True 3D data is reversibly resampled to a dataset target grid. Strongly
+anisotropic datasets use a robust coarse-axis target with a threefold automatic
+upsampling safeguard. Kernels and strides are derived per stage: coarse axes use
+`1` kernels/strides until physical resolutions become comparable, and no axis is
+downsampled below four feature-map positions. Expert kernel, stride, target
+spacing, and patch overrides remain possible through resolved configuration.
+
+Training writes reusable user configuration to `config.json`, measured dataset
+information to `dataset_fingerprint.json`, generated resolved spacing sidecars
+to `resolved_spacings/`, and resolved model/runtime decisions to
+`model_metadata.json`.
 
 ## Install
 
@@ -100,11 +126,11 @@ After the initial patch attempt, the sampler retries up to
 next training image. If it is true, the final empty patch is used. Training
 fails clearly when every training mask is empty.
 
-## 2D Instance Scale Normalization
+## Instance Scale Normalization
 
-`instance_friendly` 2D models normalize each image toward a canonical median
-instance diameter by default. Training masks are measured using the median
-equivalent diameter of up to 21 reproducibly sampled instances. Border-touching
+`instance_friendly` models normalize each image or volume toward a canonical
+median instance diameter by default. Training masks use up to 21 reproducibly
+sampled instances. Border-touching
 and tiny instances are excluded by default. Binary masks are split into
 connected components; instance-ID masks use their label IDs.
 
@@ -112,7 +138,7 @@ connected components; instance-ID masks use their label IDs.
 "instance_scale_normalization": {
     "enabled": True,
     "target_object_fraction": 0.25,
-    "object_size_measure": "equivalent_diameter",
+    "object_size_measure": "equivalent_sphere_diameter",
     "max_instances_per_image": 21,
     "exclude_border_instances": True,
     "min_instance_area": 4,
@@ -123,7 +149,8 @@ connected components; instance-ID masks use their label IDs.
 }
 ```
 
-The target diameter is `target_object_fraction * min(patch_size)`. Training
+For 2D/2.5D the target diameter is relative to patch pixels. For 3D it is
+relative to the smallest physical patch extent. Training
 draws log-uniform scale jitter and extracts the corresponding crop directly
 from the original image before resizing it to the fixed patch size. Validation
 uses its reproducibly sampled mask median without jitter. Dataset-derived
@@ -132,7 +159,8 @@ measurements are written separately to `dataset_statistics.json`.
 Inference requires the approximate median object diameter in native input
 pixels. It rescales the image to the model's canonical object size, performs
 tiled prediction, restores foreground and boundary probabilities to the
-original geometry, and then creates instance labels:
+original geometry, and then creates instance labels from foreground, boundary,
+and normalized per-instance distance predictions:
 
 ```python
 result = infer(
@@ -149,9 +177,16 @@ their largest available cross-section only when needed. One volume-level XY
 scale is shared by all center slices. Context channels receive one synchronized
 XY crop and transform, while validation uses every Z plane without jitter.
 
-2.5D inference accepts one approximate XY `object_size` for the volume and
-returns `Z,Y,X` probabilities and labels. True 3D scale normalization remains
-intentionally unsupported.
+2.5D inference accepts one approximate XY `object_size`; 3D accepts an
+approximate physical equivalent-sphere diameter. The expert `principal_axes`
+measurement is also supported. Three-dimensional EDT targets use physical
+spacing. Reconstruction blends all tiled maps, restores native geometry,
+extracts robust distance markers, and runs boundary-aware marker-controlled
+watershed once at native resolution.
+
+The mixed boundary target uses a one-voxel outside ring, both object sides of a
+touching-ID interface, and the outermost object voxel at array edges. Physical
+minimum seed/object sizes and face/full connectivity are configurable.
 
 ## Learning Rate Scheduling
 
@@ -167,7 +202,7 @@ Training uses polynomial decay by default:
 
 Supported scheduler types:
 
-- `poly`: per-step polynomial decay from `learning_rate` to `min_lr`; this is the default.
+- `poly`: nnU-Net-compatible epoch-level polynomial decay with power `0.9`; this is the default.
 - `cosine`: per-step cosine annealing from `learning_rate` to `min_lr`.
 - `plateau`: epoch-level reduction when the validation score stops improving, using `plateau_factor`, `plateau_patience`, and `plateau_threshold`.
 - `none`: constant learning rate.
@@ -182,7 +217,25 @@ The trainer chooses a composite segmentation loss from the detected task:
 
 - Binary semantic: BCE with logits plus Dice loss.
 - Multiclass semantic: cross entropy plus Dice loss.
-- Instance-friendly: foreground BCE plus foreground Dice, with an auxiliary boundary BCE term.
+- Instance-friendly: foreground BCE/Dice, boundary BCE, and foreground Smooth L1 normalized-distance loss.
+
+Patch training uses a deterministic random stream and an optimizer-step budget:
+
+```text
+steps_per_epoch = max(250, ceil(10 * training_cases / effective_batch_size))
+```
+
+Light patch validation runs every epoch. Full tiled per-case validation runs
+every five epochs by default, selects checkpoints, and drives early stopping
+after 20 unimproved full validations. Setting `validation.mode` to `light`
+disables full-case selection.
+
+Augmentation defaults are preset-aware: `tiny` and `medium` use the balanced
+profile, while `big` and `large` use the strong profile. Three-dimensional
+affine rotation stays in the high-resolution plane for anisotropic data; blur,
+low-resolution simulation, and elastic deformation account for physical axis
+spacing. Images use continuous interpolation and labels always use nearest
+neighbor interpolation.
 
 Focal loss is available as an additive term for class-imbalanced datasets. It is
 off by default; enable it directly through `loss_weights`:

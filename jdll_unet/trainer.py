@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import imageio.v3 as imageio
 import numpy as np
@@ -34,13 +35,27 @@ from .config import (
     write_json,
 )
 from .dataset import inspect_dataset, make_dataset, partition_empty_pairs, split_pairs
-from .errors import ConfigError, DatasetError, ModelLoadError
-from .io import ImageMaskPair, discover_dataset, load_mask
+from .errors import DatasetError, ModelLoadError
+from .io import ImageMaskPair, discover_dataset, load_image, load_mask, normalize_image
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
+from .planning import (
+    build_dataset_plan,
+    derive_stage_geometry,
+    fit_patch_to_reference_budget,
+    resample_image_mask,
+    resolve_context_stride,
+    restore_continuous_maps,
+)
 from .postprocess import postprocess_instance
-from .scale import aggregate_instance_statistics, estimate_instance_size, estimate_volume_instance_size
+from .scale import (
+    InstanceSizeEstimate,
+    aggregate_instance_statistics,
+    estimate_3d_instance_size,
+    estimate_instance_size,
+    estimate_volume_instance_size,
+)
 from .schedulers import LearningRateScheduler
 from .targets import boundary_target, target_output_channels
 from .task_detect import detect_task_from_pairs
@@ -67,7 +82,9 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _move_target(target: torch.Tensor | dict[str, torch.Tensor], device: torch.device):
+def _move_target(
+    target: torch.Tensor | dict[str, torch.Tensor], device: torch.device
+) -> torch.Tensor | dict[str, torch.Tensor]:
     if isinstance(target, dict):
         return {key: value.to(device, non_blocking=True) for key, value in target.items()}
     return target.to(device, non_blocking=True)
@@ -78,6 +95,70 @@ def _mean_dict(values: list[dict[str, float]]) -> dict[str, float]:
         return {}
     keys = sorted(set().union(*(item.keys() for item in values)))
     return {key: float(np.mean([item[key] for item in values if key in item])) for key in keys}
+
+
+def _full_volume_validation(
+    model: torch.nn.Module,
+    pairs: list[ImageMaskPair],
+    *,
+    task: str,
+    dimensions: str,
+    device: torch.device,
+    patch_size: tuple[int, ...],
+    normalization: object,
+    context_slices: int,
+    context_policy: str,
+    context_fixed_stride: int,
+    context_target_spacing: float | None,
+    case_spacings: dict[str, tuple[float, float, float]],
+    target_spacing: tuple[float, float, float] | None,
+    instance_sizes: dict[str, float] | None = None,
+    target_object_size: float | None = None,
+) -> dict[str, Any]:
+    from .infer import _predict_25d, tiled_predict
+
+    per_case: dict[str, float] = {}
+    for pair in pairs:
+        image = normalize_image(load_image(pair.image, dimensions=dimensions), normalization)
+        mask = load_mask(pair.mask, dimensions=dimensions if dimensions in {"2.5d", "3d"} else "2d")
+        native_shape = mask.shape
+        spacing = case_spacings.get(pair.stem, (1.0, 1.0, 1.0))
+        if dimensions == "3d" and target_spacing is not None:
+            image, _resampled_mask = resample_image_mask(image, mask, spacing, target_spacing)
+        object_size = (instance_sizes or {}).get(pair.stem)
+        if task == "instance_friendly" and object_size and target_object_size:
+            scale = target_object_size / object_size
+            if dimensions == "2.5d":
+                target_yx = cast(
+                    tuple[int, int], tuple(max(1, int(round(value * scale))) for value in image.shape[-2:])
+                )
+                flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
+                tensor = torch.from_numpy(np.ascontiguousarray(flattened[None]))
+                image = torch.nn.functional.interpolate(tensor, size=target_yx, mode="bilinear", align_corners=False)[0].numpy()
+                image = image.reshape(-1, native_shape[0], *target_yx)
+            else:
+                target_shape = tuple(max(1, int(round(value * scale))) for value in image.shape[1:])
+                tensor = torch.from_numpy(np.ascontiguousarray(image[None]))
+                mode = "trilinear" if dimensions == "3d" else "bilinear"
+                image = torch.nn.functional.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)[0].numpy()
+        if dimensions == "2.5d":
+            stride = resolve_context_stride(
+                context_policy,
+                fixed_stride=context_fixed_stride,
+                target_spacing=context_target_spacing,
+                z_spacing=spacing[0],
+            )
+            logits = _predict_25d(model, image, device, cast(tuple[int, int], patch_size), 0.5, context_slices, stride)
+        else:
+            logits = tiled_predict(model, image, device, patch_size, overlap=0.5)
+        if logits.shape[1:] != native_shape:
+            logits = restore_continuous_maps(logits, native_shape)
+        prediction = np.argmax(logits, axis=0) > 0 if task == "multiclass_semantic" else logits[0] >= 0
+        target = mask != 0
+        intersection = int(np.count_nonzero(prediction & target))
+        denominator = int(np.count_nonzero(prediction)) + int(np.count_nonzero(target))
+        per_case[pair.stem] = (2 * intersection + 1e-6) / (denominator + 1e-6)
+    return {"mean_dice": float(np.mean(list(per_case.values()))) if per_case else 0.0, "per_case_dice": per_case}
 
 
 def _sample_pairs(pairs: list[ImageMaskPair], sample_limit: int) -> list[ImageMaskPair]:
@@ -222,7 +303,7 @@ def _save_previews(
         return None
     preview_dir = output_dir / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
+    saved: list[dict[str, Any]] = []
     model.eval()
     with torch.inference_mode():
         for images, target_batch in loader:
@@ -321,7 +402,9 @@ def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarra
     if task == "instance_friendly":
         predictions = []
         for item in probabilities:
-            processed = postprocess_instance(item[0], item[1], threshold=0.5, min_object_size=0)
+            processed = postprocess_instance(
+                item[0], item[1], item[2] if item.shape[0] >= 3 else None, threshold=0.5, min_object_size=0
+            )
             predictions.append(processed["labels"])
         return np.stack(predictions, axis=0)
     return (probabilities[:, 0] >= 0.5).astype(np.uint8)
@@ -329,6 +412,9 @@ def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarra
 
 def _target_preview_rgb(task: str, target: np.ndarray | dict[str, np.ndarray], index: int, z_index: int | None = None) -> np.ndarray:
     if isinstance(target, dict):
+        instances = target.get("instances")
+        if instances is not None:
+            return _label_to_rgb(_slice_for_preview(instances[index, 0], z_index))
         foreground = target.get("foreground")
         if foreground is None:
             raise ValueError("Instance preview target is missing foreground")
@@ -384,6 +470,23 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     architecture_probe = architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     dimensions = architecture_probe.dimensions
     info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
+    spacing_cfg = train_config.spacing
+    dataset_plan = build_dataset_plan(
+        train_pairs + val_pairs,
+        dimensions,
+        default_spacing=spacing_cfg.default_spacing,
+        known_fraction_threshold=spacing_cfg.known_fraction_threshold,
+        target_spacing=spacing_cfg.target_spacing,
+        anisotropy_threshold=spacing_cfg.anisotropy_threshold,
+        max_upsampling=spacing_cfg.max_upsampling,
+    )
+    case_spacings = {case.case: case.spacing for case in dataset_plan.cases}
+    write_json(output_dir / "dataset_fingerprint.json", dataset_plan.to_dict())
+    for case in dataset_plan.cases:
+        write_json(
+            output_dir / "resolved_spacings" / f"{case.case}.json",
+            {"spacing": case.spacing, "source": case.source, "original_spacing": case.original_spacing},
+        )
     nonempty_train_pairs, empty_train_pairs = partition_empty_pairs(train_pairs, dimensions=dimensions)
     _nonempty_val_pairs, empty_val_pairs = partition_empty_pairs(val_pairs, dimensions=dimensions)
     if train_config.skip_empty_images:
@@ -406,8 +509,16 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
         output_channels = int(train_config.output_classes)
 
+    planning_shape = info.image_shape[-2:] if dimensions == "2.5d" else info.image_shape
     patch_size = (
-        default_patch_size(train_config.architecture, info.image_shape[-2:] if dimensions == "2.5d" else info.image_shape)
+        fit_patch_to_reference_budget(
+            default_patch_size(train_config.architecture, planning_shape),
+            planning_shape,
+            architecture_probe.channels,
+            architecture_probe.encoder_blocks,
+            architecture_probe.reference_memory_gb,
+            memory_fraction=train_config.memory_fraction,
+        )
         if train_config.patch_size == AUTO
         else train_config.patch_size
     )
@@ -416,25 +527,35 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     instance_scale_enabled = detected_task == "instance_friendly" and scale_cfg.enabled
     train_instance_sizes: dict[str, float] = {}
     val_instance_sizes: dict[str, float] = {}
-    training_scale_estimates = []
-    validation_scale_estimates = []
+    training_scale_estimates: list[InstanceSizeEstimate] = []
+    validation_scale_estimates: list[InstanceSizeEstimate] = []
     fallback_instance_size: float | None = None
     repaired_instance_components = 0
     if instance_scale_enabled:
-        if dimensions not in {"2d", "2.5d"}:
-            raise ConfigError("Instance scale normalization currently supports 2D and 2.5D models only")
         for split_pairs_, destination, estimates, seed_offset in (
             (train_pairs, train_instance_sizes, training_scale_estimates, 0),
             (val_pairs, val_instance_sizes, validation_scale_estimates, 100_000),
         ):
             for index, pair in enumerate(split_pairs_):
-                if dimensions == "2.5d":
+                if dimensions == "3d":
+                    estimate, repair = estimate_3d_instance_size(
+                        load_mask(pair.mask, dimensions="3d"),
+                        case_spacings[pair.stem],
+                        max_instances=scale_cfg.max_instances_per_image,
+                        exclude_border=scale_cfg.exclude_border_instances,
+                        min_instance_voxels=scale_cfg.min_instance_area,
+                        seed=train_config.seed + seed_offset + index,
+                        measure=scale_cfg.object_size_measure,
+                    )
+                    repaired_instance_components += repair.repaired_components
+                elif dimensions == "2.5d":
                     estimate, repair = estimate_volume_instance_size(
                         load_mask(pair.mask, dimensions="2.5d"),
                         max_instances=scale_cfg.max_instances_per_image,
                         exclude_xy_border=scale_cfg.exclude_border_instances,
                         min_instance_area=scale_cfg.min_instance_area,
                         seed=train_config.seed + seed_offset + index,
+                        measure=scale_cfg.object_size_measure,
                     )
                     repaired_instance_components += repair.repaired_components
                     if repair.repaired_components:
@@ -450,6 +571,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                         exclude_border=scale_cfg.exclude_border_instances,
                         min_instance_area=scale_cfg.min_instance_area,
                         seed=train_config.seed + seed_offset + index,
+                        measure=scale_cfg.object_size_measure,
                     )
                 if estimate is not None:
                     destination[pair.stem] = estimate.median_diameter_px
@@ -476,7 +598,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         fallback_instance_size = float(
             np.median([estimate.median_diameter_px for estimate in training_scale_estimates])
         )
-        target_diameter = float(scale_cfg.target_object_fraction * min(patch_size))
+        target_extent = (
+            min(size * spacing for size, spacing in zip(patch_size, dataset_plan.target_spacing, strict=True))
+            if dimensions == "3d" and dataset_plan.target_spacing is not None
+            else min(patch_size)
+        )
+        target_diameter = float(scale_cfg.target_object_fraction * target_extent)
         canonical_scales = np.asarray(
             [target_diameter / estimate.median_diameter_px for estimate in training_scale_estimates], dtype=np.float64
         )
@@ -507,6 +634,17 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             scale_cfg.max_effective_scale,
         )
     batch_size = default_batch_size(train_config.architecture, device) if train_config.batch_size == AUTO else int(train_config.batch_size)
+    microbatch_size = min(batch_size, train_config.effective_batch_size)
+    accumulation_steps = math.ceil(train_config.effective_batch_size / microbatch_size)
+    resolved_effective_batch = microbatch_size * accumulation_steps
+    steps_per_epoch = (
+        max(
+            train_config.minimum_steps_per_epoch,
+            math.ceil(train_config.expected_patches_per_case * len(train_pairs) / resolved_effective_batch),
+        )
+        if train_config.steps_per_epoch == AUTO
+        else int(train_config.steps_per_epoch)
+    )
     learning_rate = (
         default_learning_rate(train_config.optimizer)
         if train_config.learning_rate == AUTO
@@ -550,10 +688,38 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         deep_supervision=deep_supervision,
     )
     arch.context_slices = train_config.context_slices
+    if dimensions == "3d" and dataset_plan.target_spacing is not None:
+        kernels, strides = derive_stage_geometry(
+            patch_size,
+            dataset_plan.target_spacing,
+            arch.depth,
+            anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
+            minimum_feature_map=spacing_cfg.minimum_feature_map_size,
+        )
+        arch.kernels = kernels
+        arch.strides = strides
+    else:
+        kernels, strides = derive_stage_geometry(
+            patch_size,
+            (1.0, 1.0),
+            arch.depth,
+            anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
+            minimum_feature_map=spacing_cfg.minimum_feature_map_size,
+        )
+        arch.kernels = kernels
+        arch.strides = strides
     model = build_unet(arch).to(device)
     if train_config.starting_point in {"fine_tune", "finetune"} and train_config.base_model is not None:
         _load_base_model(model, train_config.base_model, device, logger)
 
+    resolved_context_policy = (
+        "adjacent"
+        if train_config.context.stride_policy == "nearest_physical" and not dataset_plan.context_spacing_reliable
+        else train_config.context.stride_policy
+    )
+    resolved_context_spacing = (
+        dataset_plan.context_spacing if train_config.context.spacing == AUTO else float(train_config.context.spacing)
+    )
     train_dataset = make_dataset(
         train_pairs,
         detected_task,
@@ -570,6 +736,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         instance_sizes=train_instance_sizes,
         fallback_instance_size=fallback_instance_size,
         context_slices=train_config.context_slices,
+        context_stride_policy=resolved_context_policy,
+        context_stride=train_config.context.stride,
+        context_target_spacing=resolved_context_spacing,
+        case_spacings=case_spacings,
+        target_spacing=dataset_plan.target_spacing,
+        sample_count=steps_per_epoch * microbatch_size * accumulation_steps,
     )
     train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
     train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
@@ -578,7 +750,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     )
     if instance_scale_enabled:
         train_dataset.augmentation.instance_scale_enabled = True
-        train_dataset.augmentation.target_object_diameter_px = float(scale_cfg.target_object_fraction * min(patch_size))
+        train_dataset.augmentation.target_object_diameter_px = target_diameter
         train_dataset.augmentation.training_scale_jitter = scale_cfg.training_scale_jitter
         train_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
         train_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
@@ -598,30 +770,37 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         instance_sizes=val_instance_sizes,
         fallback_instance_size=fallback_instance_size,
         context_slices=train_config.context_slices,
+        context_stride_policy=resolved_context_policy,
+        context_stride=train_config.context.stride,
+        context_target_spacing=resolved_context_spacing,
+        case_spacings=case_spacings,
+        target_spacing=dataset_plan.target_spacing,
     )
     if instance_scale_enabled:
         val_dataset.augmentation.instance_scale_enabled = True
-        val_dataset.augmentation.target_object_diameter_px = float(scale_cfg.target_object_fraction * min(patch_size))
+        val_dataset.augmentation.target_object_diameter_px = target_diameter
         val_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
         val_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
+        batch_size=microbatch_size,
+        shuffle=False,
         num_workers=train_config.num_workers,
         pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=microbatch_size,
         shuffle=False,
         num_workers=train_config.num_workers,
         pin_memory=device.type == "cuda",
     )
     optimizer_cls = torch.optim.AdamW if train_config.optimizer == "adamw" else torch.optim.Adam
     optimizer = optimizer_cls(model.parameters(), lr=learning_rate, weight_decay=train_config.weight_decay)
-    total_steps = len(train_loader) * train_config.epochs
-    lr_scheduler = LearningRateScheduler(optimizer, train_config.lr_scheduler, total_steps=total_steps)
+    total_steps = steps_per_epoch * train_config.epochs
+    lr_scheduler = LearningRateScheduler(
+        optimizer, train_config.lr_scheduler, total_steps=total_steps, total_epochs=train_config.epochs
+    )
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
     except AttributeError:  # pragma: no cover - older torch fallback
@@ -641,6 +820,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "resolved_device": device.type,
             "patch_size": list(patch_size),
             "batch_size": batch_size,
+            "microbatch_size": microbatch_size,
+            "accumulation_steps": accumulation_steps,
+            "effective_batch_size": resolved_effective_batch,
+            "steps_per_epoch": steps_per_epoch,
             "learning_rate": learning_rate,
             "model_normalization": train_config.model_normalization,
             "foreground_oversampling": foreground_oversampling,
@@ -660,15 +843,49 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         }
     )
     write_json(output_dir / "config.json", model_config)
+    model_metadata = {
+        "format_version": 1,
+        "architecture": arch.name,
+        "preset_reference_memory_gb": arch.reference_memory_gb,
+        "output_channels": (
+            ["foreground", "boundary", "distance"]
+            if detected_task == "instance_friendly"
+            else ["logits"]
+        ),
+        "dataset_fingerprint_path": str(output_dir / "dataset_fingerprint.json"),
+        "dataset_plan": dataset_plan.to_dict(),
+        "resolved_context": {
+            "stride_policy": resolved_context_policy,
+            "target_spacing": resolved_context_spacing,
+        },
+        "runtime_plan": {
+            "microbatch_size": microbatch_size,
+            "accumulation_steps": accumulation_steps,
+            "effective_batch_size": resolved_effective_batch,
+        },
+        "instance_scale": (
+            {
+                "target_object_size": target_diameter,
+                "size_unit": "physical" if dimensions == "3d" else "pixels",
+                "measure": scale_cfg.object_size_measure,
+            }
+            if instance_scale_enabled
+            else None
+        ),
+    }
+    write_json(output_dir / "model_metadata.json", model_metadata)
 
     history: list[dict[str, Any]] = []
     best_score = -float("inf")
+    full_validation_best = -float("inf")
+    full_validation_bad = 0
     global_step = 0
     latest_preview_path: str | None = None
     for epoch in range(1, train_config.epochs + 1):
         model.train()
         train_losses: list[dict[str, float]] = []
-        for images, target_batch in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        for microstep, (images, target_batch) in enumerate(train_loader, start=1):
             if callbacks.cancel_requested():
                 return _cancel_training(
                     callbacks,
@@ -682,10 +899,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                     arch,
                     model_config,
                 )
-            global_step += 1
             images = images.to(device, non_blocking=True)
             target_batch = _move_target(target_batch, device)
-            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", enabled=mixed_precision):
                 logits = model(images)
                 loss, components = compute_loss(
@@ -696,13 +911,17 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                     focal_gamma=train_config.focal_gamma,
                     focal_alpha=train_config.focal_alpha,
                 )
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            lr_scheduler.step_batch()
+            scaler.scale(loss / accumulation_steps).backward()
             component_floats = _tensor_losses_to_float(components)
             component_floats["total_loss"] = float(loss.detach().cpu().item())
             train_losses.append(component_floats)
+            if microstep % accumulation_steps != 0:
+                continue
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            lr_scheduler.step_batch()
             if global_step % log_update_interval == 0:
                 logger.info("step=%s/%s epoch=%s train=%s", global_step, total_steps, epoch, component_floats)
             should_emit_step = (
@@ -738,7 +957,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         val_losses: list[dict[str, float]] = []
         val_metrics: list[dict[str, float]] = []
         with torch.inference_mode():
-            for images, target_batch in val_loader:
+            for val_step, (images, target_batch) in enumerate(val_loader):
+                if val_step >= train_config.validation.light_steps:
+                    break
                 images = images.to(device, non_blocking=True)
                 target_batch = _move_target(target_batch, device)
                 logits = model(images)
@@ -755,13 +976,44 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 val_losses.append(losses)
                 val_metrics.append(compute_metrics(detected_task, logits, target_batch))
 
-        epoch_record = {
+        epoch_record: dict[str, Any] = {
             "epoch": epoch,
             "train_losses": _mean_dict(train_losses),
             "val_losses": _mean_dict(val_losses),
             "val_metrics": _mean_dict(val_metrics),
         }
-        score = primary_metric(detected_task, epoch_record["val_metrics"])
+        light_score = primary_metric(detected_task, epoch_record["val_metrics"])
+        run_full_validation = train_config.validation.mode == "full" and (
+            epoch % train_config.validation.full_every == 0 or epoch == train_config.epochs
+        )
+        if run_full_validation:
+            full_metrics = _full_volume_validation(
+                model,
+                val_pairs,
+                task=detected_task,
+                dimensions=dimensions,
+                device=device,
+                patch_size=patch_size,
+                normalization=train_config.normalization,
+                context_slices=train_config.context_slices,
+                context_policy=resolved_context_policy,
+                context_fixed_stride=train_config.context.stride,
+                context_target_spacing=resolved_context_spacing,
+                case_spacings=case_spacings,
+                target_spacing=dataset_plan.target_spacing,
+                instance_sizes=val_instance_sizes,
+                target_object_size=target_diameter if instance_scale_enabled else None,
+            )
+            epoch_record["full_validation"] = full_metrics
+            score = float(full_metrics["mean_dice"])
+            if score > full_validation_best:
+                full_validation_best = score
+                full_validation_bad = 0
+            else:
+                full_validation_bad += 1
+        else:
+            score = light_score
+        selector_update = train_config.validation.mode == "light" or run_full_validation
         lr_scheduler.step_epoch(score)
         epoch_record["learning_rate"] = lr_scheduler.current_lr
         history.append(epoch_record)
@@ -805,7 +1057,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             epoch_record,
             model_config,
         )
-        if score >= best_score:
+        if selector_update and score >= best_score:
             best_score = score
             _save_checkpoint(
                 output_dir / "weights_best.pt",
@@ -830,6 +1082,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 epoch=epoch,
                 **preview_event,
             )
+        if (
+            run_full_validation
+            and full_validation_bad >= train_config.validation.early_stopping_patience
+        ):
+            logger.info("Early stopping after %s full validations without improvement", full_validation_bad)
+            break
 
     best_path = output_dir / "weights_best.pt"
     if not best_path.exists():
@@ -849,6 +1107,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "metrics_path": str(output_dir / "metrics.json"),
         "config_path": str(output_dir / "config.json"),
         "dataset_statistics_path": str(output_dir / "dataset_statistics.json") if instance_scale_enabled else None,
+        "dataset_fingerprint_path": str(output_dir / "dataset_fingerprint.json"),
+        "model_metadata_path": str(output_dir / "model_metadata.json"),
         "latest_preview_path": latest_preview_path,
         "config": model_config,
     }
