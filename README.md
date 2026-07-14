@@ -26,24 +26,43 @@ Universal residual-encoder presets are available for `2d`, `2.5d`, and `3d`:
 
 Replace `*` with `2d`, `2.5d`, or `3d`. Legacy `tiny-*` and `medium-*`
 architecture names remain loadable for existing configurations and checkpoints.
-The universal preset fixes model capacity and preferred patch size independently
-of installed hardware. The runtime changes only microbatch size and gradient
-accumulation, with effective batch four by default.
+The universal preset fixes model capacity, context, and preferred patch size
+independently of installed hardware. Runtime planning may reduce microbatch and
+patch size, with gradient accumulation targeting effective batch four.
+
+The four presets are complete speed/quality tiers rather than capacity-only
+ablation variants. Their automatic spatial and 2.5D context defaults are:
+
+| Preset | 2D/2.5D preferred patch | 2.5D context slices | 3D preferred patch | Deep supervision |
+| --- | --- | ---: | --- | --- |
+| Small (`tiny`) | `[128,128]` | 5 | `[16,64,64]` | no |
+| Medium | `[256,256]` | 7 | `[24,96,96]` | yes |
+| Big | `[384,384]` | 9 | `[32,128,128]` | yes |
+| Large | `[512,512]` | 11 | `[48,160,160]` | yes |
+
+Context counts remain fixed across hardware and may be overridden explicitly.
+The memory planner caps microbatch by preset, reduces it before reducing the
+patch, and uses gradient accumulation to preserve effective batch four. It then
+shrinks the preferred patch only when required by the smaller of detected
+available memory and the preset's 4/8/16/24 GB reference budget. Preferred and
+resolved decisions are persisted in model metadata and emitted as a
+`training_plan` callback before the first epoch.
 
 The default architecture is `resenc-tiny-2d`. Genuine 2.5D variants are also
 available as `tiny-2.5d`, `medium-2.5d`, `resenc-tiny-2.5d`, and
 `resenc-medium-2.5d`. They use a 2D UNet with an odd number of neighboring Z
 slices flattened into input channels; configure the total with
-`"context_slices": 3`. Missing context beyond either Z boundary is zero padded.
+`"context_slices"`; when omitted it resolves to 5/7/9/11 by preset. Missing
+context beyond either Z boundary is zero padded.
 Context sampling supports `adjacent`, `fixed_stride`, and `nearest_physical`.
 The automatic physical target is the median resolved training Z spacing and
 always selects real slices; it never interpolates a 2.5D context channel.
 
 The `resenc-*` variants keep the UNet encoder-decoder shape but replace encoder
 conv blocks with residual blocks for better gradient flow. Deep supervision can
-be enabled with `"deep_supervision": true`; the trainer then applies auxiliary
-losses to intermediate decoder outputs while inference still uses the primary
-full-resolution output.
+be overridden with `"deep_supervision"`; it defaults off for Small and on for
+Medium, Big, and Large. The trainer applies auxiliary losses to intermediate
+decoder outputs while inference uses only the primary full-resolution output.
 
 Convolutional UNet blocks use group normalization by default because it is
 stable for the small batches common in biomedical segmentation. Set

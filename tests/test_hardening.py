@@ -8,7 +8,15 @@ from torch import nn
 
 from jdll_unet.appose_api import infer as appose_infer
 from jdll_unet.callbacks import CallbackDispatcher
-from jdll_unet.config import architecture_defaults, parse_training_config, write_json
+from jdll_unet.config import (
+    architecture_defaults,
+    default_batch_size,
+    default_context_slices,
+    default_deep_supervision,
+    default_patch_size,
+    parse_training_config,
+    write_json,
+)
 from jdll_unet.errors import ConfigError, InferenceError
 from jdll_unet.infer import clear_model_cache, infer
 from jdll_unet.losses import compute_loss, primary_logits
@@ -214,6 +222,57 @@ def test_resenc_architecture_and_deep_supervision_outputs():
     loss, components = compute_loss("binary_semantic", outputs, target)
     assert loss.isfinite()
     assert "deep_supervision_loss" in components
+
+
+def test_quality_preset_contract():
+    expected_patches = {
+        "2d": [(128, 128), (256, 256), (384, 384), (512, 512)],
+        "2.5d": [(128, 128), (256, 256), (384, 384), (512, 512)],
+        "3d": [(16, 64, 64), (24, 96, 96), (32, 128, 128), (48, 160, 160)],
+    }
+    presets = ("tiny", "medium", "big", "large")
+    for dimensions, patches in expected_patches.items():
+        for index, preset in enumerate(presets):
+            name = f"resenc-{preset}-{dimensions}"
+            architecture = architecture_defaults(name)
+            assert architecture.block_type == "residual"
+            assert architecture.dimensions == dimensions
+            assert default_patch_size(name) == patches[index]
+            assert default_deep_supervision(name) is (preset != "tiny")
+    assert [default_context_slices(f"resenc-{preset}-2.5d") for preset in presets] == [5, 7, 9, 11]
+    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cpu")) for preset in presets] == [4, 2, 1, 1]
+    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cuda")) for preset in presets] == [4, 4, 2, 1]
+
+
+def test_all_quality_presets_construct_and_forward_on_meta_device():
+    for dimensions in ("2d", "2.5d", "3d"):
+        for preset in ("tiny", "medium", "big", "large"):
+            name = f"resenc-{preset}-{dimensions}"
+            context = default_context_slices(name)
+            input_channels = context if dimensions == "2.5d" else 1
+            architecture = architecture_defaults(name, input_channels=input_channels, output_channels=2)
+            architecture.context_slices = context
+            minimum_side = 2 ** (architecture.depth - 1) * 2
+            spatial = (minimum_side,) * (3 if dimensions == "3d" else 2)
+            model = build_unet(architecture).to("meta")
+            output = model(torch.empty((1, input_channels, *spatial), device="meta"))
+            assert primary_logits(output).shape == (1, 2, *spatial)
+
+
+def test_quality_preset_automatic_and_explicit_overrides(tmp_path: Path):
+    automatic = parse_training_config({**_base_config(tmp_path), "architecture": "resenc-large-2.5d"})
+    assert automatic.context_slices == 11
+    assert automatic.deep_supervision == "auto"
+    explicit = parse_training_config(
+        {
+            **_base_config(tmp_path),
+            "architecture": "resenc-large-2.5d",
+            "context_slices": 7,
+            "deep_supervision": False,
+        }
+    )
+    assert explicit.context_slices == 7
+    assert explicit.deep_supervision is False
 
 
 def test_3d_architecture_defaults_and_forward_pass():

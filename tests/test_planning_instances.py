@@ -5,7 +5,12 @@ import numpy as np
 import tifffile
 
 from jdll_unet.io import ImageMaskPair
-from jdll_unet.planning import build_dataset_plan, derive_stage_geometry, resolve_context_stride
+from jdll_unet.planning import (
+    build_dataset_plan,
+    derive_stage_geometry,
+    plan_patch_and_microbatch,
+    resolve_context_stride,
+)
 from jdll_unet.postprocess import postprocess_instance
 from jdll_unet.semantic_scale import compare_semantic_region_fraction, semantic_scale_diagnostics
 from jdll_unet.targets import boundary_target, normalized_instance_distance
@@ -42,6 +47,22 @@ def test_context_policies_and_anisotropic_geometry():
     for stride in strides:
         shape //= stride
     assert np.all(shape >= 4)
+
+
+def test_memory_planner_reduces_microbatch_before_patch():
+    plan = plan_patch_and_microbatch(
+        (512, 512),
+        (512, 512),
+        (32, 64, 128, 256, 384, 512),
+        (1, 3, 4, 6, 6, 6),
+        24,
+        4,
+        available_memory_bytes=2 * 1024**3,
+        deep_supervision=True,
+    )
+    assert plan.resolved_microbatch == 1
+    assert plan.resolved_patch[0] <= 512 and plan.resolved_patch[1] <= 512
+    assert plan.reductions[0] == "microbatch_reduced_for_memory"
 
 
 def test_physical_distance_boundary_and_watershed():

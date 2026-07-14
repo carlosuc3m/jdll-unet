@@ -41,6 +41,21 @@ class DatasetPlan:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeMemoryPlan:
+    preferred_patch: tuple[int, ...]
+    resolved_patch: tuple[int, ...]
+    microbatch_cap: int
+    resolved_microbatch: int
+    reference_memory_gb: int
+    available_memory_gb: float | None
+    planning_budget_gb: float
+    reductions: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _positive_spacing(value: Any) -> tuple[float, float, float] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         return None
@@ -246,20 +261,87 @@ def estimate_training_memory_bytes(
     blocks: tuple[int, ...],
     *,
     effective_microbatch: int = 1,
+    input_channels: int = 1,
+    deep_supervision: bool = False,
 ) -> int:
     """Conservative architecture-relative memory estimate for patch planning."""
 
     shape = np.asarray(patch_size, dtype=np.int64)
     activation_elements = 0
     parameter_elements = 0
-    previous = channels[0]
+    previous = input_channels
     for level, (width, count) in enumerate(zip(channels, blocks, strict=True)):
         activation_elements += int(np.prod(shape)) * width * max(2, count)
         parameter_elements += previous * width * (3 ** len(shape)) * count
         previous = width
         if level < len(channels) - 1:
             shape = np.maximum(1, shape // 2)
-    return int(effective_microbatch * activation_elements * 16 + parameter_elements * 20)
+    supervision_factor = 1.12 if deep_supervision else 1.0
+    return int(effective_microbatch * activation_elements * 16 * supervision_factor + parameter_elements * 20)
+
+
+def plan_patch_and_microbatch(
+    preferred: tuple[int, ...],
+    image_shape: tuple[int, ...],
+    channels: tuple[int, ...],
+    blocks: tuple[int, ...],
+    reference_memory_gb: int,
+    microbatch_cap: int,
+    *,
+    effective_batch_size: int = 4,
+    available_memory_bytes: int | None = None,
+    memory_fraction: float = 0.8,
+    minimum_size: int = 8,
+    input_channels: int = 1,
+    deep_supervision: bool = False,
+) -> RuntimeMemoryPlan:
+    """Resolve microbatch first, then shrink a preferred patch to the usable budget."""
+
+    if microbatch_cap < 1 or effective_batch_size < 1:
+        raise ConfigError("microbatch_cap and effective_batch_size must be at least one")
+    patch = np.minimum(np.asarray(preferred, dtype=np.int64), np.asarray(image_shape, dtype=np.int64))
+    reference_bytes = reference_memory_gb * (1024**3)
+    usable_source = min(reference_bytes, available_memory_bytes) if available_memory_bytes else reference_bytes
+    budget = int(usable_source * memory_fraction)
+    eligible_microbatches = [
+        value
+        for value in range(1, min(microbatch_cap, effective_batch_size) + 1)
+        if effective_batch_size % value == 0
+    ]
+    microbatch = max(eligible_microbatches)
+    reductions: list[str] = []
+
+    def estimate() -> int:
+        return estimate_training_memory_bytes(
+            tuple(int(value) for value in patch),
+            channels,
+            blocks,
+            effective_microbatch=microbatch,
+            input_channels=input_channels,
+            deep_supervision=deep_supervision,
+        )
+
+    while microbatch > 1 and estimate() > budget:
+        microbatch = max(value for value in eligible_microbatches if value < microbatch)
+        reductions.append("microbatch_reduced_for_memory")
+    while estimate() > budget:
+        candidates = [axis for axis, value in enumerate(patch) if value > minimum_size]
+        if not candidates:
+            raise ConfigError("Preset cannot fit its minimum patch with microbatch one in the planning budget")
+        axis = max(candidates, key=lambda item: patch[item])
+        reduced = max(minimum_size, int(math.floor(patch[axis] * 0.9 / minimum_size) * minimum_size))
+        patch[axis] = reduced if reduced < patch[axis] else patch[axis] - 1
+        reductions.append("patch_reduced_for_memory")
+    return RuntimeMemoryPlan(
+        preferred,
+        tuple(int(value) for value in patch),
+        microbatch_cap,
+        microbatch,
+        reference_memory_gb,
+        available_memory_bytes / (1024**3) if available_memory_bytes is not None else None,
+        budget / (1024**3),
+        tuple(dict.fromkeys(reductions)),
+    )
 
 
 def fit_patch_to_reference_budget(
@@ -274,12 +356,13 @@ def fit_patch_to_reference_budget(
 ) -> tuple[int, ...]:
     """Shrink a fixed preset patch to its universal reference budget; never enlarge it."""
 
-    patch = np.minimum(np.asarray(preferred, dtype=np.int64), np.asarray(image_shape, dtype=np.int64))
-    budget = int(reference_memory_gb * (1024**3) * memory_fraction)
-    while estimate_training_memory_bytes(tuple(int(v) for v in patch), channels, blocks) > budget:
-        candidates = [axis for axis, value in enumerate(patch) if value > minimum_size]
-        if not candidates:
-            raise ConfigError(f"Preset cannot fit a minimum patch within its {reference_memory_gb} GB reference budget")
-        axis = max(candidates, key=lambda item: patch[item])
-        patch[axis] = max(minimum_size, int(math.floor(patch[axis] * 0.9)))
-    return tuple(int(value) for value in patch)
+    return plan_patch_and_microbatch(
+        preferred,
+        image_shape,
+        channels,
+        blocks,
+        reference_memory_gb,
+        1,
+        memory_fraction=memory_fraction,
+        minimum_size=minimum_size,
+    ).resolved_patch

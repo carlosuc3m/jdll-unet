@@ -23,6 +23,7 @@ from .config import (
     architecture_defaults,
     default_augmentation_profile,
     default_batch_size,
+    default_deep_supervision,
     default_foreground_probability,
     default_learning_rate,
     default_log_update_interval,
@@ -41,9 +42,10 @@ from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .planning import (
+    RuntimeMemoryPlan,
     build_dataset_plan,
     derive_stage_geometry,
-    fit_patch_to_reference_budget,
+    plan_patch_and_microbatch,
     resample_image_mask,
     resolve_context_stride,
     restore_continuous_maps,
@@ -81,6 +83,21 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _available_memory_bytes(device: torch.device) -> int | None:
+    if device.type == "cuda":
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+            return int(free_bytes)
+        except (RuntimeError, TypeError):
+            return None
+    if device.type == "cpu":
+        try:
+            return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+        except (AttributeError, OSError, ValueError):
+            return None
+    return None
 
 
 def _move_target(
@@ -515,27 +532,61 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     source_input_channels = (
         info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
     )
-    input_channels = (
-        source_input_channels * train_config.context_slices if dimensions == "2.5d" else source_input_channels
-    )
+    resolved_context_slices = int(train_config.context_slices)
+    input_channels = source_input_channels * resolved_context_slices if dimensions == "2.5d" else source_input_channels
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
     if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
         output_channels = int(train_config.output_classes)
 
+    deep_supervision = (
+        default_deep_supervision(train_config.architecture)
+        if train_config.deep_supervision == AUTO
+        else bool(train_config.deep_supervision)
+    )
     planning_shape = info.image_shape[-2:] if dimensions == "2.5d" else info.image_shape
-    patch_size = (
-        fit_patch_to_reference_budget(
-            default_patch_size(train_config.architecture, planning_shape),
+    preferred_patch = default_patch_size(train_config.architecture)
+    batch_size = (
+        default_batch_size(train_config.architecture, device)
+        if train_config.batch_size == AUTO
+        else int(train_config.batch_size)
+    )
+    available_memory = _available_memory_bytes(device)
+    if train_config.patch_size == AUTO:
+        memory_plan = plan_patch_and_microbatch(
+            preferred_patch,
             planning_shape,
             architecture_probe.channels,
             architecture_probe.encoder_blocks,
             architecture_probe.reference_memory_gb,
+            min(batch_size, train_config.effective_batch_size),
+            effective_batch_size=train_config.effective_batch_size,
+            available_memory_bytes=available_memory,
             memory_fraction=train_config.memory_fraction,
+            input_channels=input_channels,
+            deep_supervision=deep_supervision,
         )
-        if train_config.patch_size == AUTO
-        else train_config.patch_size
-    )
+        patch_size = memory_plan.resolved_patch
+        microbatch_size = memory_plan.resolved_microbatch
+    else:
+        patch_size = train_config.patch_size
+        microbatch_size = max(
+            value
+            for value in range(1, min(batch_size, train_config.effective_batch_size) + 1)
+            if train_config.effective_batch_size % value == 0
+        )
+        reference_bytes = architecture_probe.reference_memory_gb * (1024**3)
+        usable_bytes = min(reference_bytes, available_memory) if available_memory else reference_bytes
+        memory_plan = RuntimeMemoryPlan(
+            preferred_patch,
+            patch_size,
+            batch_size,
+            microbatch_size,
+            architecture_probe.reference_memory_gb,
+            available_memory / (1024**3) if available_memory is not None else None,
+            usable_bytes * train_config.memory_fraction / (1024**3),
+            ("user_patch_override",),
+        )
     assert isinstance(patch_size, tuple)
     dataset_fingerprint = dataset_plan.to_dict()
     if detected_task in {"binary_semantic", "multiclass_semantic"}:
@@ -669,12 +720,6 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             scale_cfg.min_effective_scale,
             scale_cfg.max_effective_scale,
         )
-    batch_size = (
-        default_batch_size(train_config.architecture, device)
-        if train_config.batch_size == AUTO
-        else int(train_config.batch_size)
-    )
-    microbatch_size = min(batch_size, train_config.effective_batch_size)
     accumulation_steps = math.ceil(train_config.effective_batch_size / microbatch_size)
     resolved_effective_batch = microbatch_size * accumulation_steps
     steps_per_epoch = (
@@ -714,11 +759,6 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         if train_config.log_update_interval == AUTO
         else int(train_config.log_update_interval)
     )
-    deep_supervision = (
-        train_config.architecture.lower().startswith(("resenc", "residual"))
-        if train_config.deep_supervision == AUTO
-        else bool(train_config.deep_supervision)
-    )
     effective_loss_weights, target_sparsity = _resolve_loss_weights(train_config, train_pairs, detected_task)
     logger.info("loss_weights=%s target_sparsity=%s", effective_loss_weights, target_sparsity)
 
@@ -729,7 +769,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         normalization=train_config.model_normalization,
         deep_supervision=deep_supervision,
     )
-    arch.context_slices = train_config.context_slices
+    arch.context_slices = resolved_context_slices
     if dimensions == "3d" and dataset_plan.target_spacing is not None:
         kernels, strides = derive_stage_geometry(
             patch_size,
@@ -777,7 +817,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         seed=train_config.seed,
         instance_sizes=train_instance_sizes,
         fallback_instance_size=fallback_instance_size,
-        context_slices=train_config.context_slices,
+        context_slices=resolved_context_slices,
         context_stride_policy=resolved_context_policy,
         context_stride=train_config.context.stride,
         context_target_spacing=resolved_context_spacing,
@@ -811,7 +851,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         seed=train_config.seed + 10_000,
         instance_sizes=val_instance_sizes,
         fallback_instance_size=fallback_instance_size,
-        context_slices=train_config.context_slices,
+        context_slices=resolved_context_slices,
         context_stride_policy=resolved_context_policy,
         context_stride=train_config.context.stride,
         context_target_spacing=resolved_context_spacing,
@@ -861,6 +901,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         {
             "resolved_device": device.type,
             "patch_size": list(patch_size),
+            "preferred_patch_size": list(preferred_patch),
             "batch_size": batch_size,
             "microbatch_size": microbatch_size,
             "accumulation_steps": accumulation_steps,
@@ -903,6 +944,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "microbatch_size": microbatch_size,
             "accumulation_steps": accumulation_steps,
             "effective_batch_size": resolved_effective_batch,
+            "memory": memory_plan.to_dict(),
         },
         "instance_scale": (
             {
@@ -915,6 +957,23 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         ),
     }
     write_json(output_dir / "model_metadata.json", model_metadata)
+    callbacks.emit(
+        "training_plan",
+        message="UNet training plan resolved",
+        architecture=arch.name,
+        dimensions=dimensions,
+        patch_size=list(patch_size),
+        preferred_patch_size=list(preferred_patch),
+        context_slices=resolved_context_slices if dimensions == "2.5d" else None,
+        context_stride_policy=resolved_context_policy if dimensions == "2.5d" else None,
+        deep_supervision=deep_supervision,
+        microbatch_size=microbatch_size,
+        accumulation_steps=accumulation_steps,
+        effective_batch_size=resolved_effective_batch,
+        memory_plan=memory_plan.to_dict(),
+        steps_per_epoch=steps_per_epoch,
+        augmentation_profile=augmentation_profile,
+    )
 
     history: list[dict[str, Any]] = []
     best_score = -float("inf")
@@ -1036,7 +1095,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 device=device,
                 patch_size=patch_size,
                 normalization=train_config.normalization,
-                context_slices=train_config.context_slices,
+                context_slices=resolved_context_slices,
                 context_policy=resolved_context_policy,
                 context_fixed_stride=train_config.context.stride,
                 context_target_spacing=resolved_context_spacing,

@@ -168,8 +168,8 @@ class TrainingConfig:
     augmentation_profile: str = AUTO
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
-    deep_supervision: bool | str = False
-    context_slices: int = 3
+    deep_supervision: bool | str = AUTO
+    context_slices: int | str = AUTO
     context: ContextConfig = field(default_factory=ContextConfig)
     spacing: SpacingConfig = field(default_factory=SpacingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -436,8 +436,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             augmentation_profile=str(raw.get("augmentation_profile", AUTO)),
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
-            deep_supervision=_auto_or_bool(raw.get("deep_supervision", False), "deep_supervision"),
-            context_slices=int(raw.get("context_slices", 3)),
+            deep_supervision=_auto_or_bool(raw.get("deep_supervision", AUTO), "deep_supervision"),
+            context_slices=_auto_or_int(raw.get("context_slices", AUTO), "context_slices"),
             context=_nested_dataclass(ContextConfig, raw.get("context")),
             spacing=_nested_dataclass(SpacingConfig, raw.get("spacing")),
             validation=_nested_dataclass(ValidationConfig, raw.get("validation")),
@@ -506,7 +506,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("foreground_probability must be in [0, 1]")
     if parsed.empty_patch_max_retries < 0:
         raise ConfigError("empty_patch_max_retries cannot be negative")
-    if parsed.context_slices < 1 or parsed.context_slices % 2 == 0:
+    if parsed.context_slices != AUTO and (int(parsed.context_slices) < 1 or int(parsed.context_slices) % 2 == 0):
         raise ConfigError("context_slices must be a positive odd integer")
     if parsed.context.stride_policy not in {"adjacent", "fixed_stride", "nearest_physical"}:
         raise ConfigError("context.stride_policy must be adjacent, fixed_stride, or nearest_physical")
@@ -582,7 +582,9 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
     arch = architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
-    if arch.dimensions == "2.5d" and parsed.context_slices < 3:
+    if parsed.context_slices == AUTO:
+        parsed.context_slices = default_context_slices(parsed.architecture)
+    if arch.dimensions == "2.5d" and int(parsed.context_slices) < 3:
         raise ConfigError("2.5D models require context_slices to be at least 3")
     if parsed.patch_size != AUTO:
         expected_dims = 3 if arch.dimensions == "3d" else 2
@@ -660,15 +662,23 @@ def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = 
     name = architecture.lower()
     preferred: tuple[int, ...]
     if name.endswith("-3d") and "large" in name:
-        preferred = (64, 160, 160)
+        preferred = (48, 160, 160)
     elif name.endswith("-3d") and "big" in name:
-        preferred = (48, 144, 144)
+        preferred = (32, 128, 128)
     elif name.endswith("-3d") and "medium" in name:
-        preferred = (16, 128, 128)
+        preferred = (24, 96, 96)
     elif name.endswith("-3d"):
-        preferred = (16, 96, 96)
+        preferred = (16, 64, 64)
     else:
-        preferred = (192, 192) if "large" in name else (160, 160) if "big" in name else (128, 128) if "medium" in name else (96, 96)
+        preferred = (
+            (512, 512)
+            if "large" in name
+            else (384, 384)
+            if "big" in name
+            else (256, 256)
+            if "medium" in name
+            else (128, 128)
+        )
     if image_shape is None:
         return preferred
     return tuple(min(preferred[index], int(image_shape[index])) for index in range(len(preferred)))
@@ -677,12 +687,34 @@ def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = 
 def default_batch_size(architecture: str, device: torch.device) -> int:
     name = architecture.lower()
     if name.endswith("-3d"):
-        if device.type == "cpu" or any(preset in name for preset in ("medium", "big", "large")):
-            return 1
-        return 2
+        return 2 if device.type != "cpu" and "tiny" in name else 1
+    if "large" in name:
+        return 1
+    if "big" in name:
+        return 1 if device.type == "cpu" else 2
     if "medium" in name:
         return 2 if device.type == "cpu" else 4
-    return 4 if device.type == "cpu" else 8
+    return 4
+
+
+def default_context_slices(architecture: str) -> int:
+    name = architecture.lower()
+    if not name.replace("25d", "2.5d").endswith("-2.5d"):
+        return 3
+    if "large" in name:
+        return 11
+    if "big" in name:
+        return 9
+    if "medium" in name:
+        return 7
+    return 5
+
+
+def default_deep_supervision(architecture: str) -> bool:
+    name = architecture.lower()
+    return any(preset in name for preset in ("medium", "big", "large")) and name.startswith(
+        ("resenc-", "residual-")
+    )
 
 
 def default_learning_rate(optimizer: str) -> float:
