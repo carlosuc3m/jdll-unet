@@ -81,8 +81,16 @@ fractions for 3D. Border-touching regions are tracked separately and provide a
 fallback when no complete regions exist. At inference, pass one of
 `semantic_region_fraction`, `semantic_region_area` (2D/2.5D pixels), or
 `semantic_region_volume` (3D voxels) to compare an approximate region size with
-the training distribution. A mismatch produces a warning and metadata but
-never changes inference scaling.
+the training distribution. Inference rescales XY by the square root of the
+area ratio for 2D/2.5D, or XYZ by the cube root of the volume ratio for 3D,
+then restores predictions to the input geometry. The default scale-factor
+bounds are 0.25 and 4.0; override them with `semantic_scale_min_factor` and
+`semantic_scale_max_factor`. Comparison and applied-scale details are returned
+in inference metadata.
+
+`semantic_region_size` is a dimension-aware alias for area or volume.
+`object_size` is also accepted for convenience on semantic models, where it
+means area/volume; on instance models it continues to mean object diameter.
 
 ## Install
 

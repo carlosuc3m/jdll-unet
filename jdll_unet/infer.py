@@ -270,22 +270,34 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     )
     tile_size = _parse_tile_size(tile_size, dimensions)
     semantic_scale_comparison = None
+    semantic_scale_factor = 1.0
     if task_name in {"binary_semantic", "multiclass_semantic"}:
         supplied_fraction = config.get("semantic_region_fraction")
-        supplied_measure = config.get("semantic_region_area", config.get("semantic_region_volume"))
+        semantic_values = {
+            "semantic_region_area": config.get("semantic_region_area"),
+            "semantic_region_volume": config.get("semantic_region_volume"),
+            "semantic_region_size": config.get("semantic_region_size"),
+            "object_size": config.get("object_size"),
+        }
         if isinstance(inputs, dict):
             supplied_fraction = inputs.get("semantic_region_fraction", supplied_fraction)
-            supplied_measure = inputs.get(
-                "semantic_region_area", inputs.get("semantic_region_volume", supplied_measure)
-            )
-        if supplied_fraction is not None and supplied_measure is not None:
-            raise InferenceError("Provide semantic_region_fraction or semantic_region_area/volume, not both")
+            semantic_values = {
+                key: inputs.get(key, value) for key, value in semantic_values.items()
+            }
+        provided_measures = {key: value for key, value in semantic_values.items() if value is not None}
+        if len(provided_measures) > 1 or (supplied_fraction is not None and provided_measures):
+            raise InferenceError("Provide exactly one semantic region fraction, area, volume, size, or object_size")
+        if dimensions == "3d" and semantic_values["semantic_region_area"] is not None:
+            raise InferenceError("Use semantic_region_volume rather than semantic_region_area for 3D inference")
+        if dimensions != "3d" and semantic_values["semantic_region_volume"] is not None:
+            raise InferenceError("Use semantic_region_area rather than semantic_region_volume for 2D/2.5D inference")
+        supplied_measure = next(iter(provided_measures.values()), None)
         if supplied_measure is not None:
             try:
                 diagnostic_patch = (metadata.get("semantic_scale_diagnostics") or {}).get("patch_size", tile_size)
                 supplied_fraction = float(supplied_measure) / float(np.prod(diagnostic_patch))
             except (TypeError, ValueError) as exc:
-                raise InferenceError("semantic_region_area/volume must be a positive number") from exc
+                raise InferenceError("semantic region size must be a positive number") from exc
         if supplied_fraction is not None:
             try:
                 semantic_scale_comparison = compare_semantic_region_fraction(
@@ -293,15 +305,44 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
                 )
             except (TypeError, ValueError) as exc:
                 raise InferenceError(str(exc)) from exc
+            if semantic_scale_comparison["status"] == "training_distribution_unavailable":
+                raise InferenceError(
+                    "This model does not contain semantic scale diagnostics; retrain it before using semantic size normalization"
+                )
+            scale_power = 1 / (3 if dimensions == "3d" else 2)
+            requested_scale = (1 / float(semantic_scale_comparison["ratio_to_training_median"])) ** scale_power
+            try:
+                minimum_scale = float(config.get("semantic_scale_min_factor", 0.25))
+                maximum_scale = float(config.get("semantic_scale_max_factor", 4.0))
+            except (TypeError, ValueError) as exc:
+                raise InferenceError("semantic scale factor limits must be positive numbers") from exc
+            if minimum_scale <= 0 or maximum_scale < minimum_scale:
+                raise InferenceError("semantic scale factor limits must be positive and ordered")
+            semantic_scale_factor = float(np.clip(requested_scale, minimum_scale, maximum_scale))
+            semantic_scale_comparison["requested_scale_factor"] = requested_scale
+            semantic_scale_comparison["applied_scale_factor"] = semantic_scale_factor
+            semantic_scale_comparison["scale_was_clamped"] = not np.isclose(requested_scale, semantic_scale_factor)
             if semantic_scale_comparison.get("warning"):
                 message = (
                     "Approximate semantic region fraction is "
                     f"{semantic_scale_comparison['status'].replace('_', ' ')} "
                     f"(ratio to training median: {semantic_scale_comparison['ratio_to_training_median']:.3g}). "
-                    "Check input resolution or spacing."
+                    f"Applied semantic scale factor {semantic_scale_factor:.3g}."
                 )
                 warnings.warn(message, RuntimeWarning, stacklevel=2)
                 CallbackDispatcher(task).emit("warning", message=message, **semantic_scale_comparison)
+            scale_source_shape = image.shape[-2:] if dimensions == "2.5d" else image.shape[1:]
+            scaled_shape = tuple(max(1, int(round(size * semantic_scale_factor))) for size in scale_source_shape)
+            if dimensions == "2.5d":
+                flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
+                image = resize_2d_channels(flattened, cast(tuple[int, int], scaled_shape)).reshape(
+                    image.shape[0], image.shape[1], *scaled_shape
+                )
+            elif dimensions == "2d":
+                image = np.ascontiguousarray(resize_2d_channels(image, cast(tuple[int, int], scaled_shape)))
+            else:
+                image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
+                image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
     inference_scale = 1.0
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
@@ -362,6 +403,16 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     )
     if dimensions == "3d" and logits.shape[1:] != original_spatial_shape:
         logits = restore_continuous_maps(logits, original_spatial_shape)
+    elif semantic_scale_factor != 1.0 and logits.shape[1:] != original_spatial_shape:
+        if dimensions == "2.5d":
+            channels, depth = logits.shape[:2]
+            restored = resize_2d_channels(
+                logits.reshape(channels * depth, *logits.shape[2:]),
+                cast(tuple[int, int], original_spatial_shape[-2:]),
+            )
+            logits = restored.reshape(channels, depth, *original_spatial_shape[-2:])
+        else:
+            logits = resize_2d_channels(logits, cast(tuple[int, int], original_spatial_shape))
 
     post_cfg = dict(model_config.get("postprocessing", {}))
     post_overrides = config.get("postprocessing", {})
@@ -434,6 +485,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "target_spacing": list(target_spacing) if target_spacing is not None else None,
         "context_stride": context_stride if dimensions == "2.5d" else None,
         "semantic_scale_comparison": semantic_scale_comparison,
+        "semantic_scale_factor": semantic_scale_factor,
         "output_keys": sorted(outputs),
     }
     CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)

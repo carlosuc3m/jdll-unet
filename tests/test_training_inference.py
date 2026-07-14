@@ -101,13 +101,14 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
             "model_path": str(output_dir / "model.pt"),
             "device": "cpu",
             "tile_size": [16, 16],
-            "semantic_region_fraction": semantic_diagnostics["pooled_foreground"]["median"],
+            "semantic_region_area": semantic_diagnostics["pooled_foreground"]["median"] * 32 * 32 * 4,
         },
         {"image_path": str(dataset / "images" / "sample_0.tif")},
     )
 
     assert inference["metadata"]["task"] == "binary_semantic"
-    assert inference["metadata"]["semantic_scale_comparison"]["ratio_to_training_median"] == 1
+    assert inference["metadata"]["semantic_scale_comparison"]["ratio_to_training_median"] == 4
+    assert inference["metadata"]["semantic_scale_factor"] == 0.5
     assert inference["outputs"]["foreground_probability"].shape == (32, 32)
     assert inference["outputs"]["mask"].shape == (32, 32)
 
