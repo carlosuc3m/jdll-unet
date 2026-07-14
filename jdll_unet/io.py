@@ -15,8 +15,8 @@ from .errors import DataFormatError, DatasetError
 
 IMAGE_ALIASES = ("images", "image", "imgs", "img", "data")
 MASK_ALIASES = ("masks", "mask", "labels", "label", "gt")
-IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
-MASK_EXTENSIONS = {".tif", ".tiff", ".png"}
+IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
+MASK_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp"}
 IMAGE_SUFFIXES = ("_image", "-image", "_img", "-img", "_raw", "-raw")
 MASK_SUFFIXES = ("_mask", "-mask", "_label", "-label", "_labels", "-labels", "_gt", "-gt")
 
@@ -149,6 +149,9 @@ def _looks_like_rgb_last_axis(arr: np.ndarray) -> bool:
 def load_image(path: Path | str, dimensions: str = "2d") -> np.ndarray:
     """Load an image as float32 channels-first C,Y,X or C,Z,Y,X without normalizing."""
 
+    path = Path(path)
+    if path.suffix.lower() == ".bmp" and dimensions.lower() in {"3d", "2.5d"}:
+        raise DataFormatError("BMP is supported only for 2D images; use a TIFF stack for volumetric data")
     arr = np.asarray(load_array(path))
     dimensions = dimensions.lower()
     if dimensions in {"3d", "2.5d"}:
@@ -202,6 +205,8 @@ def load_mask(path: Path | str, dimensions: str | None = None) -> np.ndarray:
     """Load a 2D or 3D integer mask while preserving label values."""
 
     path = Path(path)
+    if path.suffix.lower() == ".bmp" and dimensions in {"3d", "2.5d"}:
+        raise DataFormatError("BMP is supported only for 2D masks; use a TIFF stack for volumetric labels")
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         raise DataFormatError("JPEG masks are not supported because compression changes labels")
     arr = np.asarray(load_array(path))

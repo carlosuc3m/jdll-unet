@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import imageio.v3 as imageio
 import numpy as np
 import pytest
 import tifffile
@@ -78,3 +79,50 @@ def test_3d_tiff_stack_loading(tmp_path: Path):
     tifffile.imwrite(rgb_path, rgb)
     with pytest.raises(ValueError, match="2D RGB"):
         load_image(rgb_path, dimensions="3d")
+
+
+def test_bmp_dataset_discovery_loading_and_label_preservation(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    image_dir.mkdir()
+    mask_dir.mkdir()
+    image = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1:4, 2:6] = 7
+    mask[5:7, 5:8] = 255
+    imageio.imwrite(image_dir / "sample.bmp", image)
+    imageio.imwrite(mask_dir / "sample.bmp", mask)
+
+    pair = discover_dataset(tmp_path).train[0]
+    loaded_image = load_image(pair.image)
+    loaded_mask = load_mask(pair.mask)
+
+    assert pair.image.suffix == ".bmp" and pair.mask.suffix == ".bmp"
+    assert loaded_image.shape == (1, 8, 8)
+    assert loaded_image.dtype == np.float32
+    assert loaded_mask.dtype == np.int64
+    assert np.array_equal(loaded_mask, mask.astype(np.int64))
+
+
+def test_bmp_image_pairs_with_png_mask(tmp_path: Path):
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    image_dir.mkdir()
+    mask_dir.mkdir()
+    imageio.imwrite(image_dir / "mixed.bmp", np.zeros((8, 8), dtype=np.uint8))
+    imageio.imwrite(mask_dir / "mixed.png", np.ones((8, 8), dtype=np.uint8))
+
+    pair = discover_dataset(tmp_path).train[0]
+
+    assert pair.image.name == "mixed.bmp"
+    assert pair.mask.name == "mixed.png"
+
+
+def test_bmp_is_rejected_for_volumetric_loading(tmp_path: Path):
+    path = tmp_path / "slice.bmp"
+    imageio.imwrite(path, np.zeros((8, 8), dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="BMP is supported only for 2D images"):
+        load_image(path, dimensions="3d")
+    with pytest.raises(ValueError, match="BMP is supported only for 2D masks"):
+        load_mask(path, dimensions="2.5d")

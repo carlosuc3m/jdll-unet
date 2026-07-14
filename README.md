@@ -14,6 +14,9 @@ The implementation supports lightweight 2D, 2.5D, and true 3D UNet training and
 inference for binary semantic, multiclass semantic, and instance-friendly
 segmentation datasets laid out as `images/` and `masks/`, or as explicit
 `train/images`, `train/masks`, `val/images`, and `val/masks` folders.
+Ordinary 2D images support TIFF, PNG, BMP, and JPEG; integer masks support TIFF,
+PNG, and BMP, while lossy JPEG masks remain prohibited. BMP is intentionally
+2D-only, and volumetric images and labels require TIFF stacks.
 
 ## Architectures
 
