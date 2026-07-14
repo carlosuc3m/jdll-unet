@@ -74,6 +74,16 @@ information to `dataset_fingerprint.json`, generated resolved spacing sidecars
 to `resolved_spacings/`, and resolved model/runtime decisions to
 `model_metadata.json`.
 
+For semantic tasks, the fingerprint includes connected-region scale
+diagnostics in resampled model space. It reports pooled and per-class p10, p25,
+median, p75, and p90 area fractions for 2D and 2.5D center slices, or volume
+fractions for 3D. Border-touching regions are tracked separately and provide a
+fallback when no complete regions exist. At inference, pass one of
+`semantic_region_fraction`, `semantic_region_area` (2D/2.5D pixels), or
+`semantic_region_volume` (3D voxels) to compare an approximate region size with
+the training distribution. A mismatch produces a warning and metadata but
+never changes inference scaling.
+
 ## Install
 
 ```bash

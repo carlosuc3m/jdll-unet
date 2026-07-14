@@ -7,6 +7,7 @@ import tifffile
 from jdll_unet.io import ImageMaskPair
 from jdll_unet.planning import build_dataset_plan, derive_stage_geometry, resolve_context_stride
 from jdll_unet.postprocess import postprocess_instance
+from jdll_unet.semantic_scale import compare_semantic_region_fraction, semantic_scale_diagnostics
 from jdll_unet.targets import boundary_target, normalized_instance_distance
 
 
@@ -55,3 +56,26 @@ def test_physical_distance_boundary_and_watershed():
     foreground = (labels > 0).astype(np.float32)
     result = postprocess_instance(foreground, boundary, distance, min_object_size=1)
     assert set(np.unique(result["labels"])) == {0, 1, 2}
+
+
+def test_semantic_scale_diagnostics_2d_per_class_and_border_fallback():
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[2:4, 2:4] = 1
+    mask[0:2, 7:10] = 2
+    result = semantic_scale_diagnostics([mask], dimensions="2d", patch_size=(10, 10), label_values=[1, 2])
+    assert result["per_class"]["1"]["median"] == 0.04
+    assert result["per_class"]["2"]["median"] == 0.06
+    assert result["per_class"]["2"]["used_border_fallback"] is True
+    assert result["pooled_foreground"]["median"] == 0.04
+
+
+def test_semantic_scale_diagnostics_25d_and_3d():
+    volume = np.zeros((3, 6, 6), dtype=np.uint8)
+    volume[:, 2:4, 2:4] = 1
+    result_25d = semantic_scale_diagnostics([volume], dimensions="2.5d", patch_size=(6, 6), label_values=[1])
+    result_3d = semantic_scale_diagnostics([volume], dimensions="3d", patch_size=(3, 6, 6), label_values=[1])
+    assert np.isclose(result_25d["pooled_foreground"]["median"], 4 / 36)
+    assert np.isclose(result_3d["pooled_foreground"]["median"], 12 / 108)
+    comparison = compare_semantic_region_fraction(0.5, result_3d)
+    assert comparison["status"] == "above_training_p90"
+    assert comparison["warning"] is True

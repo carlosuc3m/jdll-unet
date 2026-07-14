@@ -57,6 +57,7 @@ from .scale import (
     estimate_volume_instance_size,
 )
 from .schedulers import LearningRateScheduler
+from .semantic_scale import semantic_scale_diagnostics
 from .targets import boundary_target, target_output_channels
 from .task_detect import detect_task_from_pairs
 
@@ -134,13 +135,17 @@ def _full_volume_validation(
                 )
                 flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
                 tensor = torch.from_numpy(np.ascontiguousarray(flattened[None]))
-                image = torch.nn.functional.interpolate(tensor, size=target_yx, mode="bilinear", align_corners=False)[0].numpy()
+                image = torch.nn.functional.interpolate(tensor, size=target_yx, mode="bilinear", align_corners=False)[
+                    0
+                ].numpy()
                 image = image.reshape(-1, native_shape[0], *target_yx)
             else:
                 target_shape = tuple(max(1, int(round(value * scale))) for value in image.shape[1:])
                 tensor = torch.from_numpy(np.ascontiguousarray(image[None]))
                 mode = "trilinear" if dimensions == "3d" else "bilinear"
-                image = torch.nn.functional.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)[0].numpy()
+                image = torch.nn.functional.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)[
+                    0
+                ].numpy()
         if dimensions == "2.5d":
             stride = resolve_context_stride(
                 context_policy,
@@ -410,7 +415,9 @@ def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarra
     return (probabilities[:, 0] >= 0.5).astype(np.uint8)
 
 
-def _target_preview_rgb(task: str, target: np.ndarray | dict[str, np.ndarray], index: int, z_index: int | None = None) -> np.ndarray:
+def _target_preview_rgb(
+    task: str, target: np.ndarray | dict[str, np.ndarray], index: int, z_index: int | None = None
+) -> np.ndarray:
     if isinstance(target, dict):
         instances = target.get("instances")
         if instances is not None:
@@ -457,7 +464,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         logger.warning(warning)
         callbacks.emit("warning", message=warning)
 
-    detection = detect_task_from_pairs(train_pairs + val_pairs, train_config.dataset_path, requested_task=train_config.task)
+    detection = detect_task_from_pairs(
+        train_pairs + val_pairs, train_config.dataset_path, requested_task=train_config.task
+    )
     if detection.get("ambiguous"):
         raise ValueError(
             "Dataset task is ambiguous. Ask whether labels represent classes or objects and pass "
@@ -467,7 +476,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     if detected_task == "unsupported":
         raise ValueError(str(detection.get("reason", "Unsupported annotation type")))
 
-    architecture_probe = architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
+    architecture_probe = architecture_defaults(
+        train_config.architecture, normalization=train_config.model_normalization
+    )
     dimensions = architecture_probe.dimensions
     info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
     spacing_cfg = train_config.spacing
@@ -481,7 +492,6 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         max_upsampling=spacing_cfg.max_upsampling,
     )
     case_spacings = {case.case: case.spacing for case in dataset_plan.cases}
-    write_json(output_dir / "dataset_fingerprint.json", dataset_plan.to_dict())
     for case in dataset_plan.cases:
         write_json(
             output_dir / "resolved_spacings" / f"{case.case}.json",
@@ -502,8 +512,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         message = f"Empty validation masks: {len(empty_val_pairs)} image(s) retained."
         logger.warning(message)
         callbacks.emit("warning", message=message)
-    source_input_channels = info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
-    input_channels = source_input_channels * train_config.context_slices if dimensions == "2.5d" else source_input_channels
+    source_input_channels = (
+        info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
+    )
+    input_channels = (
+        source_input_channels * train_config.context_slices if dimensions == "2.5d" else source_input_channels
+    )
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
     output_channels = target_output_channels(detected_task, label_values)
     if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
@@ -523,6 +537,24 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         else train_config.patch_size
     )
     assert isinstance(patch_size, tuple)
+    dataset_fingerprint = dataset_plan.to_dict()
+    if detected_task in {"binary_semantic", "multiclass_semantic"}:
+        diagnostic_masks: list[np.ndarray] = []
+        for pair in train_pairs:
+            mask = load_mask(pair.mask, dimensions=dimensions)
+            if dimensions == "3d" and dataset_plan.target_spacing is not None:
+                dummy_image = np.zeros((1, *mask.shape), dtype=np.float32)
+                _image, mask = resample_image_mask(
+                    dummy_image, mask, case_spacings[pair.stem], dataset_plan.target_spacing
+                )
+            diagnostic_masks.append(mask)
+        dataset_fingerprint["semantic_scale_diagnostics"] = semantic_scale_diagnostics(
+            diagnostic_masks,
+            dimensions=dimensions,
+            patch_size=patch_size,
+            label_values=label_values,
+        )
+    write_json(output_dir / "dataset_fingerprint.json", dataset_fingerprint)
     scale_cfg = train_config.instance_scale_normalization
     instance_scale_enabled = detected_task == "instance_friendly" and scale_cfg.enabled
     train_instance_sizes: dict[str, float] = {}
@@ -618,8 +650,12 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                     "median": float(np.median(canonical_scales)),
                     "minimum": float(canonical_scales.min()),
                     "maximum": float(canonical_scales.max()),
-                    "images_below_minimum_clamp": int(np.count_nonzero(canonical_scales < scale_cfg.min_effective_scale)),
-                    "images_above_maximum_clamp": int(np.count_nonzero(canonical_scales > scale_cfg.max_effective_scale)),
+                    "images_below_minimum_clamp": int(
+                        np.count_nonzero(canonical_scales < scale_cfg.min_effective_scale)
+                    ),
+                    "images_above_maximum_clamp": int(
+                        np.count_nonzero(canonical_scales > scale_cfg.max_effective_scale)
+                    ),
                 },
             }
         }
@@ -633,7 +669,11 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             scale_cfg.min_effective_scale,
             scale_cfg.max_effective_scale,
         )
-    batch_size = default_batch_size(train_config.architecture, device) if train_config.batch_size == AUTO else int(train_config.batch_size)
+    batch_size = (
+        default_batch_size(train_config.architecture, device)
+        if train_config.batch_size == AUTO
+        else int(train_config.batch_size)
+    )
     microbatch_size = min(batch_size, train_config.effective_batch_size)
     accumulation_steps = math.ceil(train_config.effective_batch_size / microbatch_size)
     resolved_effective_batch = microbatch_size * accumulation_steps
@@ -670,7 +710,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         else int(train_config.progress_update_interval)
     )
     log_update_interval = (
-        default_log_update_interval(device) if train_config.log_update_interval == AUTO else int(train_config.log_update_interval)
+        default_log_update_interval(device)
+        if train_config.log_update_interval == AUTO
+        else int(train_config.log_update_interval)
     )
     deep_supervision = (
         train_config.architecture.lower().startswith(("resenc", "residual"))
@@ -848,12 +890,11 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "architecture": arch.name,
         "preset_reference_memory_gb": arch.reference_memory_gb,
         "output_channels": (
-            ["foreground", "boundary", "distance"]
-            if detected_task == "instance_friendly"
-            else ["logits"]
+            ["foreground", "boundary", "distance"] if detected_task == "instance_friendly" else ["logits"]
         ),
         "dataset_fingerprint_path": str(output_dir / "dataset_fingerprint.json"),
         "dataset_plan": dataset_plan.to_dict(),
+        "semantic_scale_diagnostics": dataset_fingerprint.get("semantic_scale_diagnostics"),
         "resolved_context": {
             "stride_policy": resolved_context_policy,
             "target_spacing": resolved_context_spacing,
@@ -1017,7 +1058,13 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         lr_scheduler.step_epoch(score)
         epoch_record["learning_rate"] = lr_scheduler.current_lr
         history.append(epoch_record)
-        logger.info("epoch=%s train=%s val=%s metrics=%s", epoch, epoch_record["train_losses"], epoch_record["val_losses"], epoch_record["val_metrics"])
+        logger.info(
+            "epoch=%s train=%s val=%s metrics=%s",
+            epoch,
+            epoch_record["train_losses"],
+            epoch_record["val_losses"],
+            epoch_record["val_metrics"],
+        )
         if not callbacks.emit(
             "progress",
             message=f"UNet validation epoch {epoch}",
@@ -1031,7 +1078,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             losses={f"val/{key}": value for key, value in epoch_record["val_losses"].items()},
             metrics={f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
             last_checkpoint_path=str(output_dir / "weights_last.pt"),
-            best_checkpoint_path=str(output_dir / "weights_best.pt") if score >= best_score or (output_dir / "weights_best.pt").exists() else None,
+            best_checkpoint_path=str(output_dir / "weights_best.pt")
+            if score >= best_score or (output_dir / "weights_best.pt").exists()
+            else None,
         ):
             return _cancel_training(
                 callbacks,
@@ -1071,7 +1120,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 model_config,
             )
         write_json(output_dir / "metrics.json", {"history": history, "best_score": best_score})
-        preview_event = _save_previews(output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count)
+        preview_event = _save_previews(
+            output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count
+        )
         if preview_event is not None:
             latest_preview_path = preview_event["latest_preview_path"]
             callbacks.emit(
@@ -1082,10 +1133,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 epoch=epoch,
                 **preview_event,
             )
-        if (
-            run_full_validation
-            and full_validation_bad >= train_config.validation.early_stopping_patience
-        ):
+        if run_full_validation and full_validation_bad >= train_config.validation.early_stopping_patience:
             logger.info("Early stopping after %s full validations without improvement", full_validation_bad)
             break
 
@@ -1160,7 +1208,9 @@ def _cancel_training(
         "step": step,
         "model_dir": str(output_dir),
         "last_checkpoint_path": str(output_dir / "weights_last.pt"),
-        "best_checkpoint_path": str(output_dir / "weights_best.pt") if (output_dir / "weights_best.pt").exists() else None,
+        "best_checkpoint_path": str(output_dir / "weights_best.pt")
+        if (output_dir / "weights_best.pt").exists()
+        else None,
     }
     callbacks.emit("cancelled", message="UNet training cancelled", current=step, maximum=step, **payload)
     return payload

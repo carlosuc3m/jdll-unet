@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections import OrderedDict
 from itertools import product
 from pathlib import Path
@@ -21,6 +22,7 @@ from .model import build_unet
 from .planning import read_spacing, resample_image_mask, resolve_context_stride, restore_continuous_maps
 from .postprocess import postprocess_binary, postprocess_instance, postprocess_multiclass
 from .scale import resize_2d_channels
+from .semantic_scale import compare_semantic_region_fraction
 
 
 def _model_cache_size() -> int:
@@ -135,8 +137,7 @@ def tiled_predict(
     spatial_shape = tuple(int(item) for item in image.shape[1:])
     strides = tuple(max(1, int(tile * (1.0 - overlap))) for tile in tile_size)
     starts_by_axis = [
-        _starts(length, tile, stride)
-        for length, tile, stride in zip(spatial_shape, tile_size, strides, strict=True)
+        _starts(length, tile, stride) for length, tile, stride in zip(spatial_shape, tile_size, strides, strict=True)
     ]
     output_channels = int(model.config.output_channels)
     accum = torch.zeros((output_channels, *spatial_shape), dtype=torch.float32, device=device)
@@ -209,9 +210,7 @@ def _context_stack(volume: np.ndarray, center_z: int, context_slices: int, strid
     for modality in range(volume.shape[0]):
         for z in range(center_z - radius * stride, center_z + radius * stride + 1, stride):
             channels.append(
-                volume[modality, z]
-                if 0 <= z < volume.shape[1]
-                else np.zeros(volume.shape[2:], dtype=volume.dtype)
+                volume[modality, z] if 0 <= z < volume.shape[1] else np.zeros(volume.shape[2:], dtype=volume.dtype)
             )
     return np.ascontiguousarray(np.stack(channels))
 
@@ -258,12 +257,51 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         input_spacing = cast(
             tuple[float, float, float], tuple(float(value) for value in spacing_cfg.get("default_spacing", (1, 1, 1)))
         )
-    target_spacing = cast(tuple[float, float, float], tuple(dataset_plan["target_spacing"])) if dataset_plan.get("target_spacing") else None
+    target_spacing = (
+        cast(tuple[float, float, float], tuple(dataset_plan["target_spacing"]))
+        if dataset_plan.get("target_spacing")
+        else None
+    )
     if dimensions == "3d" and input_spacing is not None and target_spacing is not None:
         dummy_mask = np.zeros(image.shape[1:], dtype=np.uint8)
         image, _ = resample_image_mask(image, dummy_mask, input_spacing, target_spacing)
-    tile_size = config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
+    tile_size = (
+        config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
+    )
     tile_size = _parse_tile_size(tile_size, dimensions)
+    semantic_scale_comparison = None
+    if task_name in {"binary_semantic", "multiclass_semantic"}:
+        supplied_fraction = config.get("semantic_region_fraction")
+        supplied_measure = config.get("semantic_region_area", config.get("semantic_region_volume"))
+        if isinstance(inputs, dict):
+            supplied_fraction = inputs.get("semantic_region_fraction", supplied_fraction)
+            supplied_measure = inputs.get(
+                "semantic_region_area", inputs.get("semantic_region_volume", supplied_measure)
+            )
+        if supplied_fraction is not None and supplied_measure is not None:
+            raise InferenceError("Provide semantic_region_fraction or semantic_region_area/volume, not both")
+        if supplied_measure is not None:
+            try:
+                diagnostic_patch = (metadata.get("semantic_scale_diagnostics") or {}).get("patch_size", tile_size)
+                supplied_fraction = float(supplied_measure) / float(np.prod(diagnostic_patch))
+            except (TypeError, ValueError) as exc:
+                raise InferenceError("semantic_region_area/volume must be a positive number") from exc
+        if supplied_fraction is not None:
+            try:
+                semantic_scale_comparison = compare_semantic_region_fraction(
+                    float(supplied_fraction), metadata.get("semantic_scale_diagnostics") or {}
+                )
+            except (TypeError, ValueError) as exc:
+                raise InferenceError(str(exc)) from exc
+            if semantic_scale_comparison.get("warning"):
+                message = (
+                    "Approximate semantic region fraction is "
+                    f"{semantic_scale_comparison['status'].replace('_', ' ')} "
+                    f"(ratio to training median: {semantic_scale_comparison['ratio_to_training_median']:.3g}). "
+                    "Check input resolution or spacing."
+                )
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+                CallbackDispatcher(task).emit("warning", message=message, **semantic_scale_comparison)
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
     inference_scale = 1.0
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
@@ -283,7 +321,9 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         training_patch = _parse_tile_size(train_cfg.get("patch_size", tile_size), dimensions)
         scale_metadata = metadata.get("instance_scale") or {}
         target_diameter = float(
-            scale_metadata.get("target_object_size", float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch))
+            scale_metadata.get(
+                "target_object_size", float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch)
+            )
         )
         inference_scale = float(
             np.clip(
@@ -393,6 +433,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "input_spacing": list(input_spacing) if input_spacing is not None else None,
         "target_spacing": list(target_spacing) if target_spacing is not None else None,
         "context_stride": context_stride if dimensions == "2.5d" else None,
+        "semantic_scale_comparison": semantic_scale_comparison,
         "output_keys": sorted(outputs),
     }
     CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)

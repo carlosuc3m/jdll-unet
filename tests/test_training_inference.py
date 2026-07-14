@@ -91,13 +91,23 @@ def test_tiny_training_and_inference_smoke(tmp_path: Path):
     assert config["training"]["target_sparsity"]["foreground_focal_enabled"] is True
     checkpoint = torch.load(output_dir / "weights_last.pt", map_location="cpu", weights_only=False)
     assert checkpoint["scheduler_state_dict"]["type"] == "poly"
+    fingerprint = json.loads((output_dir / "dataset_fingerprint.json").read_text())
+    semantic_diagnostics = fingerprint["semantic_scale_diagnostics"]
+    assert semantic_diagnostics["reference"] == "patch_xy_area"
+    assert semantic_diagnostics["pooled_foreground"]["median"] > 0
 
     inference = infer(
-        {"model_path": str(output_dir / "model.pt"), "device": "cpu", "tile_size": [32, 32]},
+        {
+            "model_path": str(output_dir / "model.pt"),
+            "device": "cpu",
+            "tile_size": [16, 16],
+            "semantic_region_fraction": semantic_diagnostics["pooled_foreground"]["median"],
+        },
         {"image_path": str(dataset / "images" / "sample_0.tif")},
     )
 
     assert inference["metadata"]["task"] == "binary_semantic"
+    assert inference["metadata"]["semantic_scale_comparison"]["ratio_to_training_median"] == 1
     assert inference["outputs"]["foreground_probability"].shape == (32, 32)
     assert inference["outputs"]["mask"].shape == (32, 32)
 
