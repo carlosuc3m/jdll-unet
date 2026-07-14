@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,16 +190,45 @@ def load_image(path: Path | str, dimensions: str = "2d") -> np.ndarray:
     return np.ascontiguousarray(out.astype(np.float32, copy=False))
 
 
-def _collapse_mask_channels(arr: np.ndarray, path: Path) -> np.ndarray:
-    if arr.ndim != 3 or arr.shape[-1] not in {3, 4}:
+def _warn_discarded_mask_channels(path: Path, count: int) -> None:
+    if count > 1:
+        warnings.warn(
+            f"Mask {path} has {count} channels; only the first channel will be used",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _collapse_mask_channels(arr: np.ndarray, path: Path, dimensions: str | None) -> np.ndarray:
+    if dimensions == "2d":
+        if arr.ndim == 3 and arr.shape[-1] > 1:
+            _warn_discarded_mask_channels(path, int(arr.shape[-1]))
+            return arr[..., 0]
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            return arr[..., 0]
         return arr
-    channels = arr[..., :3]
-    if np.all(channels == channels[..., :1]):
-        return channels[..., 0]
-    raise DataFormatError(
-        f"Mask {path} has RGB channels that are not a duplicated label plane; "
-        "store masks as single-channel integer label images."
-    )
+    if dimensions in {"3d", "2.5d"}:
+        if arr.ndim != 4:
+            return arr
+        first_is_channel = arr.shape[0] <= 4 and arr.shape[-1] > 4
+        last_is_channel = arr.shape[-1] <= 4 and arr.shape[0] > 4
+        if first_is_channel:
+            _warn_discarded_mask_channels(path, int(arr.shape[0]))
+            return arr[0]
+        if last_is_channel:
+            _warn_discarded_mask_channels(path, int(arr.shape[-1]))
+            return arr[..., 0]
+        raise DataFormatError(
+            f"Ambiguous 3D multichannel mask shape {arr.shape} for {path}; expected C,Z,Y,X or Z,Y,X,C"
+        )
+    if arr.ndim == 3 and arr.shape[-1] in {1, 3, 4}:
+        if path.suffix.lower() in {".png", ".bmp"} or np.all(arr == arr[..., :1]):
+            _warn_discarded_mask_channels(path, int(arr.shape[-1]))
+            return arr[..., 0]
+        raise DataFormatError(
+            f"Ambiguous mask shape {arr.shape} for {path}; pass dimensions='2d' for Y,X,C or '3d' for Z,Y,X"
+        )
+    return arr
 
 
 def load_mask(path: Path | str, dimensions: str | None = None) -> np.ndarray:
@@ -210,14 +240,12 @@ def load_mask(path: Path | str, dimensions: str | None = None) -> np.ndarray:
     if path.suffix.lower() in {".jpg", ".jpeg"}:
         raise DataFormatError("JPEG masks are not supported because compression changes labels")
     arr = np.asarray(load_array(path))
-    arr = _collapse_mask_channels(arr, path)
+    arr = _collapse_mask_channels(arr, path, dimensions)
     if dimensions == "2d" and arr.ndim != 2:
         raise DataFormatError(f"2D masks must have shape Y,X, got shape {arr.shape}")
     if dimensions in {"3d", "2.5d"}:
         if arr.ndim != 3:
             raise DataFormatError(f"3D masks must have shape Z,Y,X, got shape {arr.shape}")
-        if arr.shape[-1] in {3, 4} and arr.shape[0] not in {1, 3, 4}:
-            raise DataFormatError(f"Mask {path} looks like a 2D RGB image, not a 3D label volume")
     elif arr.ndim not in {2, 3}:
         raise DataFormatError(f"Masks must be 2D or 3D integer label arrays, got shape {arr.shape}")
     if np.issubdtype(arr.dtype, np.floating):

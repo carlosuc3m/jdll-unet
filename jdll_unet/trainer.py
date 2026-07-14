@@ -196,13 +196,14 @@ def _estimate_target_sparsity(
     pairs: list[ImageMaskPair],
     task: str,
     sample_limit: int,
+    dimensions: str,
 ) -> dict[str, float | int | None]:
     sampled = _sample_pairs(pairs, sample_limit)
     foreground_pixels = 0
     boundary_pixels = 0
     total_pixels = 0
     for pair in sampled:
-        mask = load_mask(pair.mask)
+        mask = load_mask(pair.mask, dimensions=dimensions)
         foreground_pixels += int(np.count_nonzero(mask))
         total_pixels += int(mask.size)
         if task == "instance_friendly":
@@ -221,6 +222,7 @@ def _resolve_loss_weights(
     train_config: Any,
     train_pairs: list[ImageMaskPair],
     task: str,
+    dimensions: str,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     weights = dict(train_config.loss_weights)
     if not train_config.auto_focal:
@@ -233,7 +235,7 @@ def _resolve_loss_weights(
             "boundary_focal_enabled": weights.get("boundary_focal", 0.0) > 0,
         }
 
-    stats = _estimate_target_sparsity(train_pairs, task, train_config.auto_focal_sample_limit)
+    stats = _estimate_target_sparsity(train_pairs, task, train_config.auto_focal_sample_limit, dimensions)
     if train_config.auto_focal and stats["foreground_ratio"] <= train_config.auto_focal_foreground_threshold:
         weights["focal"] = max(weights.get("focal", 0.0), train_config.auto_focal_weight)
     if (
@@ -481,8 +483,15 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         logger.warning(warning)
         callbacks.emit("warning", message=warning)
 
+    architecture_probe = architecture_defaults(
+        train_config.architecture, normalization=train_config.model_normalization
+    )
+    dimensions = architecture_probe.dimensions
     detection = detect_task_from_pairs(
-        train_pairs + val_pairs, train_config.dataset_path, requested_task=train_config.task
+        train_pairs + val_pairs,
+        train_config.dataset_path,
+        requested_task=train_config.task,
+        dimensions=dimensions,
     )
     if detection.get("ambiguous"):
         raise ValueError(
@@ -493,10 +502,6 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     if detected_task == "unsupported":
         raise ValueError(str(detection.get("reason", "Unsupported annotation type")))
 
-    architecture_probe = architecture_defaults(
-        train_config.architecture, normalization=train_config.model_normalization
-    )
-    dimensions = architecture_probe.dimensions
     info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
     spacing_cfg = train_config.spacing
     dataset_plan = build_dataset_plan(
@@ -649,7 +654,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                         )
                 else:
                     estimate = estimate_instance_size(
-                        load_mask(pair.mask),
+                        load_mask(pair.mask, dimensions="2d"),
                         max_instances=scale_cfg.max_instances_per_image,
                         exclude_border=scale_cfg.exclude_border_instances,
                         min_instance_area=scale_cfg.min_instance_area,
@@ -759,7 +764,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         if train_config.log_update_interval == AUTO
         else int(train_config.log_update_interval)
     )
-    effective_loss_weights, target_sparsity = _resolve_loss_weights(train_config, train_pairs, detected_task)
+    effective_loss_weights, target_sparsity = _resolve_loss_weights(
+        train_config, train_pairs, detected_task, dimensions
+    )
     logger.info("loss_weights=%s target_sparsity=%s", effective_loss_weights, target_sparsity)
 
     arch = architecture_defaults(

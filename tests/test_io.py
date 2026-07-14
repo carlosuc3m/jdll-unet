@@ -40,21 +40,51 @@ def test_explicit_train_val_layout(tmp_path: Path):
     assert splits.explicit_val
 
 
-def test_rgb_mask_collapses_only_duplicate_channels(tmp_path: Path):
+def test_multichannel_2d_masks_use_only_first_channel(tmp_path: Path):
     duplicate = np.zeros((8, 8, 3), dtype=np.uint8)
     duplicate[..., :] = 4
     duplicate_path = tmp_path / "duplicate.tif"
     tifffile.imwrite(duplicate_path, duplicate)
 
-    assert np.array_equal(load_mask(duplicate_path), np.full((8, 8), 4, dtype=np.int64))
+    with pytest.warns(RuntimeWarning, match="only the first channel"):
+        loaded_duplicate = load_mask(duplicate_path, dimensions="2d")
+    assert np.array_equal(loaded_duplicate, np.full((8, 8), 4, dtype=np.int64))
 
-    bad = duplicate.copy()
-    bad[..., 1] = 3
-    bad_path = tmp_path / "bad.tif"
-    tifffile.imwrite(bad_path, bad)
+    different = duplicate.copy()
+    different[..., 1] = 3
+    different_path = tmp_path / "different.tif"
+    tifffile.imwrite(different_path, different)
 
-    with pytest.raises(ValueError, match="RGB channels"):
-        load_mask(bad_path)
+    with pytest.warns(RuntimeWarning, match="only the first channel"):
+        loaded_different = load_mask(different_path, dimensions="2d")
+    assert np.array_equal(loaded_different, np.full((8, 8), 4, dtype=np.int64))
+
+    single_channel = np.full((8, 8, 1), 9, dtype=np.uint8)
+    single_path = tmp_path / "single.tif"
+    tifffile.imwrite(single_path, single_channel)
+    assert np.array_equal(load_mask(single_path, dimensions="2d"), np.full((8, 8), 9, dtype=np.int64))
+
+
+def test_3d_mask_channel_handling_preserves_spatial_axes_and_rejects_ambiguity(tmp_path: Path):
+    volume = np.arange(5 * 7 * 3, dtype=np.uint16).reshape(5, 7, 3)
+    volume_path = tmp_path / "volume-short-x.tif"
+    tifffile.imwrite(volume_path, volume)
+    assert np.array_equal(load_mask(volume_path, dimensions="3d"), volume.astype(np.int64))
+
+    multichannel = np.zeros((5, 7, 8, 2), dtype=np.uint8)
+    multichannel[..., 0] = 6
+    multichannel[..., 1] = 2
+    multichannel_path = tmp_path / "volume-channels.tif"
+    tifffile.imwrite(multichannel_path, multichannel)
+    with pytest.warns(RuntimeWarning, match="only the first channel"):
+        loaded = load_mask(multichannel_path, dimensions="3d")
+    assert loaded.shape == (5, 7, 8)
+    assert np.all(loaded == 6)
+
+    ambiguous = tmp_path / "ambiguous.tif"
+    tifffile.imwrite(ambiguous, np.zeros((2, 5, 7, 3), dtype=np.uint8))
+    with pytest.raises(ValueError, match="Ambiguous 3D multichannel mask shape"):
+        load_mask(ambiguous, dimensions="3d")
 
 
 def test_3d_tiff_stack_loading(tmp_path: Path):

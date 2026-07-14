@@ -17,6 +17,9 @@ segmentation datasets laid out as `images/` and `masks/`, or as explicit
 Ordinary 2D images support TIFF, PNG, BMP, and JPEG; integer masks support TIFF,
 PNG, and BMP, while lossy JPEG masks remain prohibited. BMP is intentionally
 2D-only, and volumetric images and labels require TIFF stacks.
+For JDLL compatibility, channel-last 2D label masks use channel zero and emit a
+warning when additional channels are discarded. Dimension-aware loading keeps
+`Z,Y,X` masks volumetric and rejects ambiguous 3D channel layouts.
 
 ## Architectures
 

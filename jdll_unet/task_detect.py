@@ -9,6 +9,7 @@ from statistics import median
 
 import numpy as np
 
+from .config import architecture_defaults
 from .errors import TaskDetectionError
 from .io import ImageMaskPair, discover_dataset, load_mask, read_class_names
 
@@ -96,6 +97,7 @@ def detect_task_from_pairs(
     pairs: list[ImageMaskPair],
     dataset_path: Path | str | None = None,
     requested_task: str = "auto",
+    dimensions: str | None = None,
 ) -> dict[str, object]:
     """Infer the task from mask statistics and lightweight metadata."""
 
@@ -130,7 +132,7 @@ def detect_task_from_pairs(
             "reason": "Point annotations require a detection workflow rather than this UNet backend.",
         }
 
-    stats = [mask_statistics(load_mask(pair.mask), str(pair.mask)) for pair in pairs]
+    stats = [mask_statistics(load_mask(pair.mask, dimensions=dimensions), str(pair.mask)) for pair in pairs]
     label_sets = _all_label_sets(stats)
     all_labels = sorted(set().union(*label_sets)) if label_sets else []
     non_empty_label_sets = [labels for labels in label_sets if labels]
@@ -224,4 +226,14 @@ def detect_task(config: dict | str | Path) -> dict[str, object]:
         elif requested == "objects":
             requested = "instance_friendly"
     splits = discover_dataset(dataset_path)
-    return detect_task_from_pairs(splits.train + splits.val, dataset_path, requested_task=requested)
+    dimensions = (
+        architecture_defaults(str(config["architecture"])).dimensions
+        if isinstance(config, dict) and config.get("architecture") is not None
+        else None
+    )
+    return detect_task_from_pairs(
+        splits.train + splits.val,
+        dataset_path,
+        requested_task=requested,
+        dimensions=dimensions,
+    )

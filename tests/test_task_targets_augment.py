@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 
 from jdll_unet.augment import EmptyPatchError, apply_augmentation, make_augmentation_config, sample_patch
@@ -56,6 +57,26 @@ def test_task_detection_binary_multiclass_and_instance(tmp_path: Path):
         instance_masks.append(mask)
     _write_dataset(instance_root, instance_masks)
     assert detect_task({"dataset_path": instance_root})["task"] == "instance_friendly"
+
+
+def test_task_detection_uses_only_first_2d_mask_channel(tmp_path: Path):
+    root = tmp_path / "multichannel"
+    images = root / "images"
+    masks = root / "masks"
+    images.mkdir(parents=True)
+    masks.mkdir()
+    image = np.zeros((16, 16), dtype=np.uint8)
+    mask = np.zeros((16, 16, 3), dtype=np.uint8)
+    mask[3:10, 3:10, 0] = 1
+    mask[..., 1] = np.arange(16, dtype=np.uint8)[None, :]
+    tifffile.imwrite(images / "sample.tif", image)
+    tifffile.imwrite(masks / "sample.tif", mask)
+
+    with pytest.warns(RuntimeWarning, match="only the first channel"):
+        result = detect_task({"dataset_path": root, "architecture": "resenc-tiny-2d"})
+
+    assert result["task"] == "binary_semantic"
+    assert result["unique_label_values"] == [1]
 
 
 def test_task_detection_3d_binary_multiclass_and_instance(tmp_path: Path):
