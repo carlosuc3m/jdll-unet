@@ -22,12 +22,8 @@ def train(config: dict, task: Any = None) -> dict:
         raise
 
 
-def infer(config: dict, inputs: dict, task: Any = None) -> dict:
-    try:
-        return _infer(config, inputs=inputs, task=task)
-    except Exception as exc:
-        _emit_error(task, exc)
-        raise
+def infer(config: dict, inputs: dict, task: Any = None, *, callback: Any = None) -> dict:
+    return _infer(config, inputs=inputs, task=task, callback=callback)
 
 
 def detect_task(config: dict) -> dict:

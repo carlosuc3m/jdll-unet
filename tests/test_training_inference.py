@@ -338,12 +338,22 @@ def test_tiny_3d_training_and_inference_smoke(tmp_path: Path):
     checkpoint = torch.load(output_dir / "weights_last.pt", map_location="cpu", weights_only=False)
     assert checkpoint["architecture_config"]["dimensions"] == "3d"
 
+    inference_events = []
     inference = infer(
         {"model_path": str(output_dir / "model.pt"), "device": "cpu", "tile_size": [8, 16, 16]},
         {"image_path": str(dataset / "images" / "volume_0.tif")},
+        callback=inference_events.append,
     )
 
     assert inference["metadata"]["input_shape"] == [1, 8, 16, 16]
+    assert inference["metadata"]["total_patches"] == 1
+    assert [event["phase"] for event in inference_events if event["type"] == "inference_progress"] == [
+        "inference_start",
+        "patch_start",
+        "patch_end",
+        "merge_start",
+        "inference_end",
+    ]
     assert inference["outputs"]["foreground_probability"].shape == (8, 16, 16)
     assert inference["outputs"]["mask"].shape == (8, 16, 16)
 
@@ -391,10 +401,17 @@ def test_25d_instance_training_and_full_volume_inference(tmp_path: Path):
     assert result["config"]["architecture_config"]["dimensions"] == "2.5d"
     assert result["config"]["architecture_config"]["input_channels"] == 3
     assert result["config"]["architecture_config"]["context_slices"] == 3
+    inference_events = []
     inference = infer(
         {"model_path": result["model_path"], "device": "cpu", "object_size": 7.0, "tile_size": [24, 24]},
         {"image_path": images / "volume_0.tif"},
+        callback=inference_events.append,
     )
+    patch_starts = [
+        event for event in inference_events if event["type"] == "inference_progress" and event["phase"] == "patch_start"
+    ]
+    assert [event["patch_index"] for event in patch_starts] == list(range(1, len(patch_starts) + 1))
+    assert inference["metadata"]["total_patches"] == len(patch_starts)
     assert inference["outputs"]["foreground_probability"].shape == (5, 32, 32)
     assert inference["outputs"]["boundary_probability"].shape == (5, 32, 32)
     assert inference["outputs"]["labels"].shape == (5, 32, 32)

@@ -2,7 +2,15 @@
 
 from .appose_api import detect_task, infer, train
 from .callbacks import CallbackDispatcher, CallbackEvent
-from .errors import ConfigError, DataFormatError, DatasetError, InferenceError, JdllUnetError, ModelLoadError
+from .errors import (
+    ConfigError,
+    DataFormatError,
+    DatasetError,
+    InferenceCancelled,
+    InferenceError,
+    JdllUnetError,
+    ModelLoadError,
+)
 
 __all__ = [
     "CallbackDispatcher",
@@ -10,6 +18,7 @@ __all__ = [
     "ConfigError",
     "DataFormatError",
     "DatasetError",
+    "InferenceCancelled",
     "InferenceError",
     "JdllUnetError",
     "ModelLoadError",

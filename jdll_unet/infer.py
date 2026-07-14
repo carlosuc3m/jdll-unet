@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import warnings
 from collections import OrderedDict
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Any, cast
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 
 from .callbacks import CallbackDispatcher
 from .config import ArchitectureConfig, read_json, resolve_device
-from .errors import InferenceError, ModelLoadError
+from .errors import InferenceCancelled, InferenceError, ModelLoadError
 from .io import load_image, normalize_image
 from .losses import primary_logits
 from .model import build_unet
@@ -34,6 +35,59 @@ def _model_cache_size() -> int:
 
 _MAX_MODEL_CACHE_SIZE = _model_cache_size()
 _MODEL_CACHE: OrderedDict[tuple[str, str], tuple[torch.nn.Module, dict[str, Any]]] = OrderedDict()
+
+
+@dataclass(frozen=True, slots=True)
+class _TileLayout:
+    padded_shape: tuple[int, ...]
+    starts_by_axis: tuple[tuple[int, ...], ...]
+
+    @property
+    def count(self) -> int:
+        return int(np.prod([len(starts) for starts in self.starts_by_axis]))
+
+
+@dataclass(slots=True)
+class _InferenceProgress:
+    callbacks: CallbackDispatcher
+    total_patches: int = 0
+    completed_patches: int = 0
+    stage: str = "input"
+
+    def check(self, stage: str) -> None:
+        self.stage = stage
+        if self.callbacks.cancel_requested():
+            raise InferenceCancelled("UNet inference cancelled")
+
+    def patch_start(self, starts: tuple[int, ...]) -> None:
+        self.check("prediction")
+        patch_index = self.completed_patches + 1
+        if not self.callbacks.emit(
+            "inference_progress",
+            message=f"UNet inference patch {patch_index}/{self.total_patches}",
+            current=self.completed_patches,
+            maximum=self.total_patches,
+            phase="patch_start",
+            patch_index=patch_index,
+            total_patches=self.total_patches,
+            spatial_starts=list(starts),
+        ):
+            raise InferenceCancelled("UNet inference cancelled")
+
+    def patch_end(self) -> None:
+        self.completed_patches += 1
+        patch_index = self.completed_patches
+        if not self.callbacks.emit(
+            "inference_progress",
+            message=f"Finished UNet inference patch {patch_index}/{self.total_patches}",
+            current=patch_index,
+            maximum=self.total_patches,
+            phase="patch_end",
+            patch_index=patch_index,
+            total_patches=self.total_patches,
+        ):
+            raise InferenceCancelled("UNet inference cancelled")
+        self.check("prediction")
 
 
 def clear_model_cache() -> None:
@@ -126,24 +180,39 @@ def _starts(length: int, tile: int, stride: int) -> list[int]:
     return starts
 
 
+def _tile_layout(spatial_shape: tuple[int, ...], tile_size: tuple[int, ...], overlap: float) -> _TileLayout:
+    padded_shape = tuple(max(length, tile) for length, tile in zip(spatial_shape, tile_size, strict=True))
+    strides = tuple(max(1, int(tile * (1.0 - overlap))) for tile in tile_size)
+    starts_by_axis = tuple(
+        tuple(_starts(length, tile, stride))
+        for length, tile, stride in zip(padded_shape, tile_size, strides, strict=True)
+    )
+    return _TileLayout(padded_shape, starts_by_axis)
+
+
 def tiled_predict(
     model: torch.nn.Module,
     image: np.ndarray,
     device: torch.device,
     tile_size: tuple[int, ...],
     overlap: float = 0.25,
+    *,
+    layout: _TileLayout | None = None,
+    progress: _InferenceProgress | None = None,
 ) -> np.ndarray:
     image, original_shape = _pad_image(image, tile_size)
     spatial_shape = tuple(int(item) for item in image.shape[1:])
-    strides = tuple(max(1, int(tile * (1.0 - overlap))) for tile in tile_size)
-    starts_by_axis = [
-        _starts(length, tile, stride) for length, tile, stride in zip(spatial_shape, tile_size, strides, strict=True)
-    ]
+    layout = layout or _tile_layout(original_shape, tile_size, overlap)
+    if layout.padded_shape != spatial_shape:
+        raise InferenceError("Tile layout does not match the prepared image shape")
     output_channels = int(model.config.output_channels)
     accum = torch.zeros((output_channels, *spatial_shape), dtype=torch.float32, device=device)
     counts = torch.zeros((1, *spatial_shape), dtype=torch.float32, device=device)
     with torch.inference_mode():
-        for starts in product(*starts_by_axis):
+        for starts in product(*layout.starts_by_axis):
+            starts = tuple(int(value) for value in starts)
+            if progress is not None:
+                progress.patch_start(starts)
             spatial_slices = tuple(slice(start, start + tile) for start, tile in zip(starts, tile_size, strict=True))
             patch = image[(slice(None), *spatial_slices)]
             patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
@@ -153,6 +222,8 @@ def tiled_predict(
                 patch_logits = F.interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
             accum[(slice(None), *spatial_slices)] += patch_logits
             counts[(slice(None), *spatial_slices)] += 1.0
+            if progress is not None:
+                progress.patch_end()
     logits_array = (accum / counts.clamp_min(1.0)).detach().cpu().numpy()
     crop = tuple(slice(0, size) for size in original_shape)
     return logits_array[(slice(None), *crop)]
@@ -223,23 +294,42 @@ def _predict_25d(
     overlap: float,
     context_slices: int,
     context_stride: int = 1,
+    *,
+    layout: _TileLayout | None = None,
+    progress: _InferenceProgress | None = None,
 ) -> np.ndarray:
     predictions = [
-        tiled_predict(model, _context_stack(volume, z, context_slices, context_stride), device, tile_size, overlap)
+        tiled_predict(
+            model,
+            _context_stack(volume, z, context_slices, context_stride),
+            device,
+            tile_size,
+            overlap,
+            layout=layout,
+            progress=progress,
+        )
         for z in range(volume.shape[1])
     ]
     return np.ascontiguousarray(np.stack(predictions, axis=1))
 
 
-def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any = None) -> dict[str, Any]:
+def _infer_impl(
+    config: dict[str, Any],
+    inputs: dict[str, Any] | np.ndarray,
+    callbacks: CallbackDispatcher,
+    progress: _InferenceProgress,
+) -> dict[str, Any]:
+    progress.check("input")
     model_path = config.get("model_path") or config.get("model_folder") or config.get("checkpoint")
     if model_path is None:
         raise InferenceError("Inference config requires model_path, model_folder, or checkpoint")
     device = resolve_device(str(config.get("device", "cpu")))
     model, model_config = load_model(model_path, device)
     dimensions = str((model_config.get("architecture_config") or {}).get("dimensions", "2d"))
+    progress.stage = "preprocessing"
     image = normalize_image(_load_input(inputs, dimensions), model_config.get("normalization"))
     _validate_input_channels(image, model_config)
+    progress.check("preprocessing")
     original_spatial_shape = tuple(int(item) for item in image.shape[1:])
     task_name = str(model_config["task"])
     train_cfg = model_config.get("training", {})
@@ -265,10 +355,12 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
     if dimensions == "3d" and input_spacing is not None and target_spacing is not None:
         dummy_mask = np.zeros(image.shape[1:], dtype=np.uint8)
         image, _ = resample_image_mask(image, dummy_mask, input_spacing, target_spacing)
+    progress.stage = "planning"
     tile_size = (
         config.get("tile_size") or train_cfg.get("patch_size") or ([16, 96, 96] if dimensions == "3d" else [128, 128])
     )
     tile_size = _parse_tile_size(tile_size, dimensions)
+    progress.stage = "preprocessing"
     semantic_scale_comparison = None
     semantic_scale_factor = 1.0
     if task_name in {"binary_semantic", "multiclass_semantic"}:
@@ -330,7 +422,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
                     f"Applied semantic scale factor {semantic_scale_factor:.3g}."
                 )
                 warnings.warn(message, RuntimeWarning, stacklevel=2)
-                CallbackDispatcher(task).emit("warning", message=message, **semantic_scale_comparison)
+                callbacks.emit("warning", message=message, **semantic_scale_comparison)
             scale_source_shape = image.shape[-2:] if dimensions == "2.5d" else image.shape[1:]
             scaled_shape = tuple(max(1, int(round(size * semantic_scale_factor))) for size in scale_source_shape)
             if dimensions == "2.5d":
@@ -343,7 +435,9 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
             else:
                 image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
                 image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
+    progress.stage = "planning"
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
+    progress.stage = "preprocessing"
     inference_scale = 1.0
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
     instance_scale_enabled = task_name == "instance_friendly" and bool(scale_cfg.get("enabled", False))
@@ -385,6 +479,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         else:
             image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
             image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
+    progress.stage = "planning"
     context_slices = int((model_config.get("architecture_config") or {}).get("context_slices", 3))
     context_cfg = train_cfg.get("context", {})
     resolved_context = metadata.get("resolved_context", {})
@@ -396,11 +491,63 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         target_spacing=float(target_context_spacing) if target_context_spacing is not None else None,
         z_spacing=float(input_spacing[0]) if input_spacing is not None else 1.0,
     )
+    progress.check("planning")
+    prepared_spatial_shape = tuple(int(value) for value in image.shape[1:])
+    layout_shape = prepared_spatial_shape[-2:] if dimensions == "2.5d" else prepared_spatial_shape
+    layout = _tile_layout(layout_shape, tile_size, overlap)
+    total_patches = layout.count * (prepared_spatial_shape[0] if dimensions == "2.5d" else 1)
+    progress.total_patches = total_patches
+    if not callbacks.emit(
+        "inference_progress",
+        message=f"Starting UNet inference on {total_patches} patch(es)",
+        current=0,
+        maximum=total_patches,
+        phase="inference_start",
+        patch_index=0,
+        total_patches=total_patches,
+        dimensions=dimensions,
+        original_shape=list(original_spatial_shape),
+        prepared_shape=list(prepared_spatial_shape),
+        tile_size=list(tile_size),
+        tile_overlap=overlap,
+    ):
+        raise InferenceCancelled("UNet inference cancelled")
+    progress.check("prediction")
     logits = (
-        _predict_25d(model, image, device, cast(tuple[int, int], tile_size), overlap, context_slices, context_stride)
+        _predict_25d(
+            model,
+            image,
+            device,
+            cast(tuple[int, int], tile_size),
+            overlap,
+            context_slices,
+            context_stride,
+            layout=layout,
+            progress=progress,
+        )
         if dimensions == "2.5d"
-        else tiled_predict(model, image, device, tile_size=tile_size, overlap=overlap)
+        else tiled_predict(
+            model,
+            image,
+            device,
+            tile_size=tile_size,
+            overlap=overlap,
+            layout=layout,
+            progress=progress,
+        )
     )
+    progress.check("reconstruction")
+    if not callbacks.emit(
+        "inference_progress",
+        message="Reconstructing and postprocessing UNet prediction",
+        current=total_patches,
+        maximum=total_patches,
+        phase="merge_start",
+        patch_index=total_patches,
+        total_patches=total_patches,
+    ):
+        raise InferenceCancelled("UNet inference cancelled")
+    progress.check("reconstruction")
     if dimensions == "3d" and logits.shape[1:] != original_spatial_shape:
         logits = restore_continuous_maps(logits, original_spatial_shape)
     elif semantic_scale_factor != 1.0 and logits.shape[1:] != original_spatial_shape:
@@ -414,6 +561,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         else:
             logits = resize_2d_channels(logits, cast(tuple[int, int], original_spatial_shape))
 
+    progress.check("postprocessing")
     post_cfg = dict(model_config.get("postprocessing", {}))
     post_overrides = config.get("postprocessing", {})
     if not isinstance(post_overrides, dict):
@@ -479,6 +627,7 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "task": task_name,
         "model_path": str(model_path),
         "input_shape": list(image.shape),
+        "prepared_input_shape": [int(image.shape[0]), *prepared_spatial_shape],
         "original_input_shape": [int(image.shape[0]), *original_spatial_shape],
         "instance_scale_factor": inference_scale,
         "input_spacing": list(input_spacing) if input_spacing is not None else None,
@@ -486,7 +635,78 @@ def infer(config: dict[str, Any], inputs: dict[str, Any] | np.ndarray, task: Any
         "context_stride": context_stride if dimensions == "2.5d" else None,
         "semantic_scale_comparison": semantic_scale_comparison,
         "semantic_scale_factor": semantic_scale_factor,
+        "total_patches": total_patches,
+        "tile_size": list(tile_size),
+        "tile_overlap": overlap,
         "output_keys": sorted(outputs),
     }
-    CallbackDispatcher(task).emit("complete", message="UNet inference complete", **metadata)
+    progress.check("postprocessing")
+    if not callbacks.emit(
+        "inference_progress",
+        message="UNet inference finished",
+        current=total_patches,
+        maximum=total_patches,
+        phase="inference_end",
+        patch_index=total_patches,
+        total_patches=total_patches,
+    ):
+        raise InferenceCancelled("UNet inference cancelled")
+    progress.check("postprocessing")
+    callbacks.emit("complete", message="UNet inference complete", **metadata)
     return {"metadata": metadata, "outputs": outputs}
+
+
+def _cleanup_inference(device: torch.device) -> None:
+    import gc
+
+    gc.collect()
+    try:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+        elif device.type == "mps" and getattr(torch.backends, "mps", None) is not None:
+            empty_cache = getattr(torch.mps, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+    except Exception:
+        pass
+
+
+def infer(
+    config: dict[str, Any],
+    inputs: dict[str, Any] | np.ndarray,
+    task: Any = None,
+    *,
+    callback: Any = None,
+) -> dict[str, Any]:
+    """Run whole-image inference with optional generic progress callbacks."""
+
+    callback_targets = [target for target in (task, callback) if target is not None]
+    callbacks = CallbackDispatcher(callback_targets)
+    progress = _InferenceProgress(callbacks)
+    device = resolve_device(str(config.get("device", "cpu")))
+    try:
+        return _infer_impl(config, inputs, callbacks, progress)
+    except InferenceCancelled:
+        callbacks.emit(
+            "cancelled",
+            message="UNet inference cancelled",
+            current=progress.completed_patches,
+            maximum=progress.total_patches,
+            stage=progress.stage,
+            completed_patches=progress.completed_patches,
+            total_patches=progress.total_patches,
+        )
+        raise
+    except Exception as exc:
+        callbacks.emit(
+            "error",
+            message=str(exc),
+            error_class=exc.__class__.__name__,
+            stage=progress.stage,
+        )
+        raise
+    finally:
+        _cleanup_inference(device)

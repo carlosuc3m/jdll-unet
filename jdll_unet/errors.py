@@ -27,3 +27,7 @@ class ModelLoadError(ValueError, JdllUnetError):
 
 class InferenceError(ValueError, JdllUnetError):
     """Raised when inference inputs or options are invalid."""
+
+
+class InferenceCancelled(JdllUnetError):
+    """Raised after a caller cooperatively cancels an inference call."""

@@ -1,3 +1,4 @@
+import json
 from dataclasses import asdict
 from pathlib import Path
 
@@ -17,8 +18,8 @@ from jdll_unet.config import (
     parse_training_config,
     write_json,
 )
-from jdll_unet.errors import ConfigError, InferenceError
-from jdll_unet.infer import clear_model_cache, infer
+from jdll_unet.errors import ConfigError, InferenceCancelled, InferenceError
+from jdll_unet.infer import clear_model_cache, infer, load_model
 from jdll_unet.losses import compute_loss, primary_logits
 from jdll_unet.model import build_unet
 from jdll_unet.postprocess import postprocess_binary
@@ -169,6 +170,56 @@ def test_appose_api_emits_error_update_on_failure():
 
     assert updates[-1]["type"] == "error"
     assert updates[-1]["error_class"] == "InferenceError"
+    assert updates[-1]["stage"] == "input"
+
+
+def test_inference_callback_phases_count_actual_tiles_and_complete(tmp_path: Path):
+    model_path = _write_minimal_model(tmp_path / "progress-model", input_channels=1)
+    events = []
+    result = infer(
+        {"model_path": str(model_path), "tile_size": [16, 16], "tile_overlap": 0},
+        {"image": np.zeros((32, 32), dtype=np.float32)},
+        callback=events.append,
+    )
+
+    progress = [event for event in events if event["type"] == "inference_progress"]
+    phases = [event["phase"] for event in progress]
+    assert phases == ["inference_start", *(phase for _ in range(4) for phase in ("patch_start", "patch_end")), "merge_start", "inference_end"]
+    assert [event["patch_index"] for event in progress if event["phase"] == "patch_start"] == [1, 2, 3, 4]
+    assert result["metadata"]["total_patches"] == 4
+    assert result["metadata"]["tile_size"] == [16, 16]
+    assert result["metadata"]["tile_overlap"] == 0
+    assert events[-1]["type"] == "complete"
+    json.dumps(events)
+
+
+def test_inference_callback_cancels_without_clearing_cache_and_can_resume(tmp_path: Path):
+    clear_model_cache()
+    model_path = _write_minimal_model(tmp_path / "cancel-model", input_channels=1)
+    cached_model, _config = load_model(model_path)
+    events = []
+
+    def cancel_after_first_patch(event):
+        events.append(event)
+        return False if event.get("phase") == "patch_end" else None
+
+    with pytest.raises(InferenceCancelled):
+        infer(
+            {"model_path": str(model_path), "tile_size": [16, 16], "tile_overlap": 0},
+            {"image": np.zeros((32, 32), dtype=np.float32)},
+            callback=cancel_after_first_patch,
+        )
+
+    assert [event["type"] for event in events].count("cancelled") == 1
+    assert not any(event["type"] in {"error", "complete"} for event in events)
+    assert not any(event.get("phase") == "inference_end" for event in events)
+    assert next(event for event in events if event["type"] == "cancelled")["completed_patches"] == 1
+    assert load_model(model_path)[0] is cached_model
+    resumed = infer(
+        {"model_path": str(model_path), "tile_size": [16, 16]},
+        {"image": np.zeros((16, 16), dtype=np.float32)},
+    )
+    assert resumed["outputs"]["mask"].shape == (16, 16)
 
 
 class _ApposeLikeTask:

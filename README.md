@@ -306,8 +306,9 @@ the boundary/separator channel.
 
 ## Callbacks
 
-Training and inference accept the optional `task` argument as a generic
-callback target. Supported forms:
+Training accepts the optional `task` argument as a generic callback target.
+Inference accepts both the backward-compatible `task` argument and the
+framework-neutral `callback` keyword. Supported forms:
 
 - Appose-style object exposing `update(message=..., current=..., maximum=..., info=...)`.
 - Callable accepting one flat event payload dictionary.
@@ -315,8 +316,11 @@ callback target. Supported forms:
 - A list or tuple containing any mix of the above.
 
 Every event payload contains a string `type`, such as `progress`, `preview`,
-`warning`, `complete`, `cancelled`, or `error`. A callable can return `False`
-to request cooperative cancellation during training.
+`inference_progress`, `warning`, `complete`, `cancelled`, or `error`. Inference
+progress phases are `inference_start`, repeated `patch_start`/`patch_end`,
+`merge_start`, and `inference_end`. A callable can return `False` to request
+cooperative cancellation. Cancelled inference raises `InferenceCancelled`
+without clearing the loaded-model cache.
 
 ## Minimal Inference Example
 
@@ -326,6 +330,7 @@ from jdll_unet.appose_api import infer
 result = infer(
     {"model_path": "models/unet/cells/model.pt", "device": "cpu"},
     {"image_path": "datasets/cells/images/example.tif"},
+    callback=lambda event: print(event["type"], event.get("phase")),
 )
 mask = result["outputs"]["mask"]
 ```
