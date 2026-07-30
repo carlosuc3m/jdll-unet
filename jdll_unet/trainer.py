@@ -20,6 +20,7 @@ from .callbacks import CallbackDispatcher
 from .config import (
     AUTO,
     ArchitectureConfig,
+    TrainingConfig,
     architecture_defaults,
     default_augmentation_profile,
     default_batch_size,
@@ -37,6 +38,14 @@ from .config import (
 )
 from .dataset import inspect_dataset, make_dataset, partition_empty_pairs, split_pairs
 from .errors import DatasetError, ModelLoadError
+from .finetune import (
+    FineTuneReport,
+    SourceModel,
+    initialize_finetune_model,
+    resolve_finetune_learning_rates,
+    resolve_source_model,
+    target_architecture,
+)
 from .io import ImageMaskPair, discover_dataset, load_image, load_mask, normalize_image
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
@@ -302,18 +311,6 @@ def _save_checkpoint(
     )
 
 
-def _load_base_model(model: torch.nn.Module, base_model: Path, device: torch.device, logger: logging.Logger) -> None:
-    checkpoint = base_model / "model.pt" if base_model.is_dir() else base_model
-    if not checkpoint.exists():
-        raise ModelLoadError(f"Base model checkpoint does not exist: {checkpoint}")
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
-    if not isinstance(state, dict):
-        raise ModelLoadError(f"Base model checkpoint {checkpoint} is not a valid JDLL UNet checkpoint")
-    state_dict = state.get("state_dict", state)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    logger.info("Loaded base model %s (missing=%s unexpected=%s)", checkpoint, missing, unexpected)
-
-
 def _save_previews(
     output_dir: Path,
     epoch: int,
@@ -465,7 +462,28 @@ def _overlay_prediction(image_rgb: np.ndarray, prediction_rgb: np.ndarray) -> np
 
 
 def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
-    train_config = parse_training_config(config)
+    source_model: SourceModel | None = None
+    resolved_request: dict[str, Any] | TrainingConfig = config
+    if isinstance(config, dict) and str(config.get("starting_point", "scratch")) in {"fine_tune", "finetune"}:
+        if config.get("base_model") is None:
+            raise ModelLoadError("base_model is required when starting_point is fine_tune")
+        source_model = resolve_source_model(Path(config["base_model"]))
+        requested_architecture = config.get("architecture")
+        if requested_architecture is not None and str(requested_architecture) != source_model.architecture.name:
+            raise ModelLoadError(
+                f"Fine-tuning architecture {requested_architecture!r} disagrees with source architecture "
+                f"{source_model.architecture.name!r}"
+            )
+        resolved = dict(config)
+        resolved["architecture"] = source_model.architecture.name
+        resolved.setdefault("context_slices", source_model.architecture.context_slices)
+        resolved["deep_supervision"] = source_model.architecture.deep_supervision
+        resolved["model_normalization"] = source_model.architecture.normalization
+        resolved_request = resolved
+    train_config = parse_training_config(resolved_request)
+    if source_model is None and train_config.starting_point in {"fine_tune", "finetune"}:
+        assert train_config.base_model is not None
+        source_model = resolve_source_model(train_config.base_model)
     output_dir = train_config.output_dir
     callbacks = CallbackDispatcher(task)
     logger = _setup_logging(output_dir)
@@ -483,8 +501,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         logger.warning(warning)
         callbacks.emit("warning", message=warning)
 
-    architecture_probe = architecture_defaults(
-        train_config.architecture, normalization=train_config.model_normalization
+    architecture_probe = (
+        source_model.architecture
+        if source_model is not None
+        else architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     )
     dimensions = architecture_probe.dimensions
     detection = detect_task_from_pairs(
@@ -735,11 +755,19 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         if train_config.steps_per_epoch == AUTO
         else int(train_config.steps_per_epoch)
     )
-    learning_rate = (
-        default_learning_rate(train_config.optimizer)
-        if train_config.learning_rate == AUTO
-        else float(train_config.learning_rate)
-    )
+    if source_model is not None:
+        backbone_learning_rate, adapted_learning_rate = resolve_finetune_learning_rates(
+            source_model.learning_rate
+        )
+        learning_rate = backbone_learning_rate
+    else:
+        learning_rate = (
+            default_learning_rate(train_config.optimizer)
+            if train_config.learning_rate == AUTO
+            else float(train_config.learning_rate)
+        )
+        backbone_learning_rate = learning_rate
+        adapted_learning_rate = None
     foreground_oversampling = (
         True if train_config.foreground_oversampling == AUTO else bool(train_config.foreground_oversampling)
     )
@@ -769,15 +797,29 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     )
     logger.info("loss_weights=%s target_sparsity=%s", effective_loss_weights, target_sparsity)
 
-    arch = architecture_defaults(
-        train_config.architecture,
-        input_channels=input_channels,
-        output_channels=output_channels,
-        normalization=train_config.model_normalization,
-        deep_supervision=deep_supervision,
+    arch = (
+        target_architecture(
+            source_model,
+            input_channels=input_channels,
+            output_channels=output_channels,
+            context_slices=resolved_context_slices,
+        )
+        if source_model is not None
+        else architecture_defaults(
+            train_config.architecture,
+            input_channels=input_channels,
+            output_channels=output_channels,
+            normalization=train_config.model_normalization,
+            deep_supervision=deep_supervision,
+        )
     )
     arch.context_slices = resolved_context_slices
-    if dimensions == "3d" and dataset_plan.target_spacing is not None:
+    if source_model is not None:
+        if arch.dimensions != dimensions:
+            raise ModelLoadError(
+                f"Source model dimensions {arch.dimensions} are incompatible with target dataset dimensions {dimensions}"
+            )
+    elif dimensions == "3d" and dataset_plan.target_spacing is not None:
         kernels, strides = derive_stage_geometry(
             patch_size,
             dataset_plan.target_spacing,
@@ -798,8 +840,25 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         arch.kernels = kernels
         arch.strides = strides
     model = build_unet(arch).to(device)
-    if train_config.starting_point in {"fine_tune", "finetune"} and train_config.base_model is not None:
-        _load_base_model(model, train_config.base_model, device, logger)
+    finetune_report: FineTuneReport | None = None
+    adapted_parameter_names: set[str] = set()
+    if source_model is not None:
+        finetune_report, adapted_parameter_names = initialize_finetune_model(
+            model,
+            source_model,
+            target_task=detected_task,
+            target_label_values=label_values,
+            backbone_learning_rate=backbone_learning_rate,
+            adapted_learning_rate=cast(float, adapted_learning_rate),
+        )
+        logger.info(
+            "Initialized fine-tuning from %s: input=%s output=%s adapted=%s reinitialized=%s",
+            source_model.checkpoint_path,
+            finetune_report.input_adaptation,
+            finetune_report.output_adaptation,
+            finetune_report.adapted_tensors,
+            finetune_report.reinitialized_tensors,
+        )
 
     resolved_context_policy = (
         "adjacent"
@@ -885,7 +944,29 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         pin_memory=device.type == "cuda",
     )
     optimizer_cls = torch.optim.AdamW if train_config.optimizer == "adamw" else torch.optim.Adam
-    optimizer = optimizer_cls(model.parameters(), lr=learning_rate, weight_decay=train_config.weight_decay)
+    if adapted_parameter_names:
+        adapted_parameters = [
+            parameter for name, parameter in model.named_parameters() if name in adapted_parameter_names
+        ]
+        backbone_parameters = [
+            parameter for name, parameter in model.named_parameters() if name not in adapted_parameter_names
+        ]
+        optimizer = optimizer_cls(
+            [
+                {"params": backbone_parameters, "lr": backbone_learning_rate, "group": "backbone"},
+                {
+                    "params": adapted_parameters,
+                    "lr": cast(float, adapted_learning_rate),
+                    "group": "adapted_layers",
+                },
+            ],
+            weight_decay=train_config.weight_decay,
+        )
+    else:
+        optimizer = optimizer_cls(
+            [{"params": list(model.parameters()), "lr": backbone_learning_rate, "group": "backbone"}],
+            weight_decay=train_config.weight_decay,
+        )
     total_steps = steps_per_epoch * train_config.epochs
     lr_scheduler = LearningRateScheduler(
         optimizer, train_config.lr_scheduler, total_steps=total_steps, total_epochs=train_config.epochs
@@ -915,6 +996,15 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "effective_batch_size": resolved_effective_batch,
             "steps_per_epoch": steps_per_epoch,
             "learning_rate": learning_rate,
+            "starting_point": "fine_tune" if source_model is not None else "scratch",
+            "source_model": str(source_model.requested_path) if source_model is not None else None,
+            "source_checkpoint": str(source_model.checkpoint_path) if source_model is not None else None,
+            "source_learning_rate": source_model.learning_rate if source_model is not None else None,
+            "backbone_learning_rate": backbone_learning_rate,
+            "adapted_layers_learning_rate": (
+                finetune_report.adapted_layers_learning_rate if finetune_report is not None else None
+            ),
+            "fine_tuning_initialization": finetune_report.to_dict() if finetune_report is not None else None,
             "model_normalization": train_config.model_normalization,
             "foreground_oversampling": foreground_oversampling,
             "foreground_probability": foreground_probability,
@@ -953,6 +1043,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "effective_batch_size": resolved_effective_batch,
             "memory": memory_plan.to_dict(),
         },
+        "fine_tuning_initialization": finetune_report.to_dict() if finetune_report is not None else None,
         "instance_scale": (
             {
                 "target_object_size": target_diameter,
@@ -967,7 +1058,21 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     callbacks.emit(
         "training_plan",
         message="UNet training plan resolved",
+        starting_point="fine_tune" if source_model is not None else "scratch",
+        source_model=str(source_model.requested_path) if source_model is not None else None,
+        source_architecture=source_model.architecture.name if source_model is not None else None,
         architecture=arch.name,
+        source_input_channels=source_model.architecture.input_channels if source_model is not None else None,
+        target_input_channels=arch.input_channels,
+        source_output_channels=source_model.architecture.output_channels if source_model is not None else None,
+        target_output_channels=arch.output_channels,
+        input_adaptation=finetune_report.input_adaptation if finetune_report is not None else None,
+        output_adaptation=finetune_report.output_adaptation if finetune_report is not None else None,
+        source_learning_rate=source_model.learning_rate if source_model is not None else None,
+        backbone_learning_rate=backbone_learning_rate,
+        adapted_layers_learning_rate=(
+            finetune_report.adapted_layers_learning_rate if finetune_report is not None else None
+        ),
         dimensions=dimensions,
         patch_size=list(patch_size),
         preferred_patch_size=list(preferred_patch),

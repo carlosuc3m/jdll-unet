@@ -215,6 +215,14 @@ def test_training_emits_callback_events_and_png_previews(tmp_path: Path):
     assert "progress" in event_types
     assert "preview" in event_types
     assert event_types[-1] == "complete"
+    training_plan = next(event for event in events if event["type"] == "training_plan")
+    assert training_plan["starting_point"] == "scratch"
+    assert training_plan["source_model"] is None
+    assert training_plan["source_architecture"] is None
+    assert training_plan["backbone_learning_rate"] == 0.001
+    assert training_plan["adapted_layers_learning_rate"] is None
+    assert training_plan["input_adaptation"] is None
+    assert training_plan["output_adaptation"] is None
     preview_event = next(event for event in events if event["type"] == "preview")
     assert Path(preview_event["preview_path"]).is_absolute()
     assert Path(preview_event["latest_preview_path"]).exists()

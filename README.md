@@ -212,6 +212,33 @@ result = infer(
 )
 ```
 
+## Fine-Tuning
+
+Fine-tuning recovers the complete architecture from the source model; callers
+should omit `architecture` and use an automatic learning rate:
+
+```python
+result = train(
+    {
+        "model_name": "adapted-cells",
+        "output_dir": "models/adapted-cells",
+        "dataset_path": "datasets/new-cells",
+        "starting_point": "fine_tune",
+        "base_model": "models/source-cells",
+        "learning_rate": "auto",
+    }
+)
+```
+
+The source backbone, dimensionality, kernels, strides, normalization, context,
+and deep-supervision topology are reconstructed strictly. Only input
+convolutions and output heads may be adapted. Fine-tuning uses one tenth of the
+source learning rate for preserved backbone parameters and the source rate for
+adapted layers; missing source rates fall back to `1e-4` and `1e-3`. A fresh
+optimizer and scheduler preserve this group ratio. `config.json`,
+`model_metadata.json`, checkpoints, and the `training_plan` callback record the
+source paths, resolved rates, adaptation summaries, and complete tensor audit.
+
 For 2.5D instance models, object identities are canonicalized per volume with
 efficient 3D connected components. Disconnected regions sharing an annotation
 ID receive fresh in-memory IDs. Up to 21 objects are measured per volume,

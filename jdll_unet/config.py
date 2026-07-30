@@ -472,6 +472,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("starting_point must be 'scratch' or 'fine_tune'")
     if parsed.starting_point in {"fine_tune", "finetune"} and parsed.base_model is None:
         raise ConfigError("base_model is required when starting_point is fine_tune")
+    if parsed.starting_point in {"fine_tune", "finetune"} and parsed.learning_rate != AUTO:
+        raise ConfigError("Numeric learning_rate is supported only for scratch training; use 'auto' for fine-tuning")
     if parsed.task not in SUPPORTED_TASKS:
         raise ConfigError(f"Unsupported task: {parsed.task}")
     if parsed.augmentation_profile not in SUPPORTED_AUGMENTATION_PROFILES:

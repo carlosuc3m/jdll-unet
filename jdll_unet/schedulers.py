@@ -33,7 +33,14 @@ class LearningRateScheduler:
         self.bad_epochs = 0
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
         self.min_lr = float(config.min_lr)
-        if self.type != "none" and any(self.min_lr > base_lr for base_lr in self.base_lrs):
+        maximum_base_lr = max(self.base_lrs)
+        self.min_lrs = [
+            self.min_lr * base_lr / maximum_base_lr if maximum_base_lr > 0 else self.min_lr
+            for base_lr in self.base_lrs
+        ]
+        if self.type != "none" and any(
+            minimum > base_lr for minimum, base_lr in zip(self.min_lrs, self.base_lrs, strict=True)
+        ):
             raise ConfigError("lr_scheduler.min_lr cannot exceed the optimizer learning rate")
 
     @property
@@ -58,6 +65,7 @@ class LearningRateScheduler:
             "epoch_count": self.epoch_count,
             "total_epochs": self.total_epochs,
             "base_lrs": self.base_lrs,
+            "min_lrs": self.min_lrs,
             "current_lrs": self.current_lrs,
             "best_score": self.best_score,
             "bad_epochs": self.bad_epochs,
@@ -88,7 +96,10 @@ class LearningRateScheduler:
 
         self.bad_epochs = 0
         old_lrs = self.current_lrs
-        new_lrs = [max(self.min_lr, lr * float(self.config.plateau_factor)) for lr in old_lrs]
+        new_lrs = [
+            max(minimum, lr * float(self.config.plateau_factor))
+            for minimum, lr in zip(self.min_lrs, old_lrs, strict=True)
+        ]
         self._set_lrs(new_lrs)
         return any(new_lr < old_lr for old_lr, new_lr in zip(old_lrs, new_lrs, strict=True))
 
@@ -97,7 +108,10 @@ class LearningRateScheduler:
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     def _scheduled_lrs(self, decay: float) -> list[float]:
-        return [self.min_lr + (base_lr - self.min_lr) * decay for base_lr in self.base_lrs]
+        return [
+            minimum + (base_lr - minimum) * decay
+            for minimum, base_lr in zip(self.min_lrs, self.base_lrs, strict=True)
+        ]
 
     def _set_lrs(self, learning_rates: list[float]) -> None:
         for group, lr in zip(self.optimizer.param_groups, learning_rates, strict=True):
