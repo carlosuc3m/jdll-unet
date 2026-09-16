@@ -2,20 +2,44 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
+from .errors import DatasetError
+
 Logits = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 Target = torch.Tensor | dict[str, torch.Tensor]
+
+
+def valid_support(target: Target, logits: torch.Tensor) -> torch.Tensor | None:
+    valid = target.get("valid") if isinstance(target, dict) else None
+    if valid is not None:
+        if valid.shape != logits[:, :1].shape or not torch.all(valid.flatten(1).any(1)):
+            raise DatasetError(
+                "Every target requires nonempty real support with matching shape, including auxiliary heads"
+            )
+        valid = valid.bool()
+    return valid
+
+
+def masked_mean(value: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
+    return value.mean() if valid is None else value.masked_select(valid.expand_as(value)).mean()
 
 
 def primary_logits(logits: Logits) -> torch.Tensor:
     return logits[0] if isinstance(logits, (list, tuple)) else logits
 
 
-def binary_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def binary_dice_loss(
+    logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6, valid: torch.Tensor | None = None
+) -> torch.Tensor:
     probs = torch.sigmoid(logits)
     target = target.float()
+    if valid is not None:
+        probs = probs * valid
+        target = target * valid
     dims = tuple(range(1, probs.ndim))
     intersection = (probs * target).sum(dim=dims)
     denom = probs.sum(dim=dims) + target.sum(dim=dims)
@@ -23,10 +47,15 @@ def binary_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e
     return 1.0 - dice.mean()
 
 
-def multiclass_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def multiclass_dice_loss(
+    logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6, valid: torch.Tensor | None = None
+) -> torch.Tensor:
     probs = torch.softmax(logits, dim=1)
     classes = logits.shape[1]
     one_hot = F.one_hot(target.long().clamp_min(0), num_classes=classes).movedim(-1, 1).float()
+    if valid is not None:
+        probs = probs * valid
+        one_hot = one_hot * valid
     dims = (0, *range(2, probs.ndim))
     intersection = (probs * one_hot).sum(dim=dims)
     denom = probs.sum(dim=dims) + one_hot.sum(dim=dims)
@@ -41,6 +70,7 @@ def focal_binary_loss(
     target: torch.Tensor,
     gamma: float = 2.0,
     alpha: float | None = None,
+    valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     target = target.float()
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
@@ -50,7 +80,7 @@ def focal_binary_loss(
     if alpha is not None:
         alpha_t = alpha * target + (1 - alpha) * (1 - target)
         focal = alpha_t * focal
-    return focal.mean()
+    return masked_mean(focal, valid)
 
 
 def multiclass_focal_loss(
@@ -58,6 +88,7 @@ def multiclass_focal_loss(
     target: torch.Tensor,
     gamma: float = 2.0,
     alpha: float | None = None,
+    valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     target = target.long()
     ce = F.cross_entropy(logits, target, reduction="none")
@@ -66,7 +97,7 @@ def multiclass_focal_loss(
     if alpha is not None:
         alpha_t = torch.where(target > 0, torch.full_like(focal, alpha), torch.full_like(focal, 1 - alpha))
         focal = alpha_t * focal
-    return focal.mean()
+    return masked_mean(focal, valid[:, 0] if valid is not None else None)
 
 
 def compute_loss(
@@ -98,6 +129,25 @@ def compute_loss(
 
 def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) -> Target:
     size = logits.shape[2:]
+    if isinstance(target, dict) and "valid" in target:
+        result = {}
+        for key, value in target.items():
+            if key == "valid":
+                pool: Any = F.adaptive_avg_pool3d if value.ndim == 5 else F.adaptive_avg_pool2d
+                result[key] = pool(value.float(), size) >= 1 - 1e-6
+            elif key == "semantic":
+                semantic = resize_target_for_logits(task, value, logits)
+                assert isinstance(semantic, torch.Tensor)
+                result[key] = semantic
+            elif key == "distance":
+                valid = target["valid"].float()
+                mode = "trilinear" if value.ndim == 5 else "bilinear"
+                numerator = F.interpolate(value.float() * valid, size=size, mode=mode, align_corners=False)
+                denominator = F.interpolate(valid, size=size, mode=mode, align_corners=False)
+                result[key] = numerator / denominator.clamp_min(1e-6)
+            else:
+                result[key] = F.interpolate(value.float(), size=size, mode="nearest").to(value.dtype)
+        return result
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
         return F.interpolate(target[:, None].float(), size=size, mode="nearest")[:, 0].long()
@@ -122,25 +172,30 @@ def _compute_single_loss(
     focal_alpha: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or {}
+    valid = valid_support(target, logits)
+    if task != "instance_friendly" and isinstance(target, dict):
+        target = target["semantic"]
     if task == "binary_semantic":
         assert isinstance(target, torch.Tensor)
-        bce = F.binary_cross_entropy_with_logits(logits, target.float())
-        dice = binary_dice_loss(logits, target)
+        bce = masked_mean(F.binary_cross_entropy_with_logits(logits, target.float(), reduction="none"), valid)
+        dice = binary_dice_loss(logits, target, valid=valid)
         total = weights.get("bce", 1.0) * bce + weights.get("dice", 1.0) * dice
         components = {"bce_loss": bce.detach(), "dice_loss": dice.detach()}
         if weights.get("focal", 0.0) > 0:
-            focal = focal_binary_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha)
+            focal = focal_binary_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha, valid=valid)
             total = total + weights.get("focal", 0.0) * focal
             components["focal_loss"] = focal.detach()
         return total, components
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
-        ce = F.cross_entropy(logits, target.long())
-        dice = multiclass_dice_loss(logits, target)
+        ce = masked_mean(
+            F.cross_entropy(logits, target.long(), reduction="none"), valid[:, 0] if valid is not None else None
+        )
+        dice = multiclass_dice_loss(logits, target, valid=valid)
         total = weights.get("cross_entropy", 1.0) * ce + weights.get("dice", 1.0) * dice
         components = {"cross_entropy_loss": ce.detach(), "dice_loss": dice.detach()}
         if weights.get("focal", 0.0) > 0:
-            focal = multiclass_focal_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha)
+            focal = multiclass_focal_loss(logits, target, gamma=focal_gamma, alpha=focal_alpha, valid=valid)
             total = total + weights.get("focal", 0.0) * focal
             components["focal_loss"] = focal.detach()
         return total, components
@@ -151,19 +206,23 @@ def _compute_single_loss(
         fg_logits = logits[:, 0:1]
         boundary_logits = logits[:, 1:2]
         distance_logits = logits[:, 2:3] if logits.shape[1] >= 3 else None
-        fg_bce = F.binary_cross_entropy_with_logits(fg_logits, foreground)
-        fg_dice = binary_dice_loss(fg_logits, foreground)
-        boundary_loss = F.binary_cross_entropy_with_logits(boundary_logits, boundary)
+        fg_bce = masked_mean(F.binary_cross_entropy_with_logits(fg_logits, foreground, reduction="none"), valid)
+        fg_dice = binary_dice_loss(fg_logits, foreground, valid=valid)
+        boundary_loss = masked_mean(
+            F.binary_cross_entropy_with_logits(boundary_logits, boundary, reduction="none"), valid
+        )
         if distance_logits is not None and "distance" in target:
             distance_target = target["distance"].float()
             foreground_pixels = foreground > 0.5
+            if valid is not None:
+                foreground_pixels &= valid
             predicted_distance = torch.sigmoid(distance_logits)
             distance_loss = (
                 F.smooth_l1_loss(predicted_distance[foreground_pixels], distance_target[foreground_pixels], beta=0.1)
                 if torch.any(foreground_pixels)
                 else predicted_distance.sum() * 0.0
             )
-            background_pixels = ~foreground_pixels
+            background_pixels = (foreground <= 0.5) & (valid if valid is not None else True)
             distance_background = (
                 F.smooth_l1_loss(predicted_distance[background_pixels], torch.zeros_like(predicted_distance[background_pixels]), beta=0.1)
                 if torch.any(background_pixels)
@@ -187,11 +246,13 @@ def _compute_single_loss(
             "distance_background_loss": distance_background.detach(),
         }
         if weights.get("focal", 0.0) > 0:
-            fg_focal = focal_binary_loss(fg_logits, foreground, gamma=focal_gamma, alpha=focal_alpha)
+            fg_focal = focal_binary_loss(fg_logits, foreground, gamma=focal_gamma, alpha=focal_alpha, valid=valid)
             total = total + weights.get("focal", 0.0) * fg_focal
             components["foreground_focal_loss"] = fg_focal.detach()
         if weights.get("boundary_focal", 0.0) > 0:
-            boundary_focal = focal_binary_loss(boundary_logits, boundary, gamma=focal_gamma, alpha=focal_alpha)
+            boundary_focal = focal_binary_loss(
+                boundary_logits, boundary, gamma=focal_gamma, alpha=focal_alpha, valid=valid
+            )
             total = total + weights.get("boundary_focal", 0.0) * boundary_focal
             components["boundary_focal_loss"] = boundary_focal.detach()
         return total, components

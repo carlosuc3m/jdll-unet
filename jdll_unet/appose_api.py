@@ -15,11 +15,7 @@ def _emit_error(task: Any, exc: Exception) -> None:
 
 
 def train(config: dict, task: Any = None) -> dict:
-    try:
-        return _train(config, task=task)
-    except Exception as exc:
-        _emit_error(task, exc)
-        raise
+    return _train(config, task=task)
 
 
 def infer(config: dict, inputs: dict, task: Any = None, *, callback: Any = None) -> dict:

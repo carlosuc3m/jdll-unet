@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
@@ -31,6 +32,9 @@ class SourceModel:
     task: str
     label_values: tuple[int, ...] | None
     learning_rate: float | None
+    base_learning_rate: float = 1e-3
+    learning_rate_provenance: str = "fallback_default"
+    recovery_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,18 @@ def _architecture_from_payload(payload: Any, source: str) -> ArchitectureConfig:
         raise ModelLoadError(f"Missing or invalid architecture_config in {source}")
     try:
         values = dict(payload)
+        required = {
+            "name",
+            "dimensions",
+            "input_channels",
+            "output_channels",
+            "depth",
+            "normalization",
+            "block_type",
+            "deep_supervision",
+        }
+        if not required.issubset(values) or any(value == "auto" for value in values.values() if isinstance(value, str)):
+            raise ValueError("Architecture-defining values are missing or unresolved")
         for key in ("channels", "encoder_blocks"):
             if key in values:
                 values[key] = tuple(int(value) for value in values[key])
@@ -89,17 +105,102 @@ def _source_learning_rate(config: dict[str, Any]) -> float | None:
     training = config.get("training")
     if not isinstance(training, dict):
         return None
-    for key in ("adapted_layers_learning_rate", "learning_rate", "backbone_learning_rate"):
+    for key in ("learning_rate", "backbone_learning_rate"):
         value = training.get(key)
-        if value is None:
+        if value is None or value == "auto":
             continue
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise ModelLoadError(f"Corrupt {key} in source training metadata") from exc
         if math.isfinite(parsed) and parsed > 0:
             return parsed
+        raise ModelLoadError(f"Corrupt {key} in source training metadata: expected a finite positive LR")
     return None
+
+
+def _recover_saved_values(
+    saved: dict[str, Any], trusted: dict[str, Any], sources: list[str], prefix: str = "model_config"
+) -> dict[str, Any]:
+    recovered = dict(saved)
+    for key, value in trusted.items():
+        current = recovered.get(key)
+        path = f"{prefix}.{key}"
+        if key not in recovered or (
+            isinstance(current, str)
+            and current == "auto"
+            and key not in {"model_name", "dataset_path", "output_dir", "base_model"}
+        ):
+            recovered[key] = value
+            sources.append(f"checkpoint.{path}")
+        elif isinstance(current, dict) and isinstance(value, dict):
+            recovered[key] = _recover_saved_values(current, value, sources, path)
+    return recovered
+
+
+def recover_base_learning_rate(config: dict[str, Any], _visited: tuple[str, ...] = ()) -> tuple[float, str]:
+    training = config.get("training", {})
+    if not isinstance(training, dict):
+        training = {}
+    for key in (
+        "base_learning_rate",
+        "learning_rate",
+        "backbone_learning_rate",
+        "adapted_layers_learning_rate",
+        "source_learning_rate",
+    ):
+        value = training.get(key)
+        if value is not None and value != "auto":
+            try:
+                rate = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ModelLoadError(f"Corrupt source LR metadata: {key}") from exc
+            if isinstance(value, bool) or not math.isfinite(rate) or rate <= 0:
+                raise ModelLoadError(f"Corrupt source LR metadata: {key} must be finite and positive")
+    base = training.get("base_learning_rate")
+    if base is not None and base != "auto":
+        return float(base), "saved_base_learning_rate"
+    initial = _source_learning_rate(config)
+    if training.get("starting_point") == "scratch" and initial is not None:
+        return initial, "legacy_scratch_initial_learning_rate"
+    report = training.get("fine_tuning_initialization")
+    if isinstance(report, dict):
+        # The previous JDLL rule used 0.1 * source-initial-LR. Only a source
+        # explicitly identified as scratch establishes lineage unambiguously.
+        source_config = report.get("source_config")
+        if isinstance(source_config, dict) and source_config.get("training", {}).get("starting_point") == "scratch":
+            return recover_base_learning_rate(source_config)[0], "legacy_saved_scratch_provenance"
+        path = report.get("source_model")
+        recorded_source = report.get("source_learning_rate")
+        recorded_backbone = report.get("backbone_learning_rate")
+        if path and recorded_source is not None and recorded_backbone is not None:
+            try:
+                known_rule = (
+                    math.isfinite(float(recorded_source))
+                    and float(recorded_source) > 0
+                    and math.isclose(float(recorded_backbone), 0.1 * float(recorded_source))
+                )
+            except (TypeError, ValueError):
+                known_rule = False
+            parent = Path(path)
+            parent_config_path = parent / "config.json" if parent.is_dir() else parent.parent / "config.json"
+            identity = str(parent_config_path.resolve())
+            if known_rule and identity not in _visited and len(_visited) < 64 and parent_config_path.is_file():
+                parent_config = _read_json(parent_config_path)
+                parent_training = parent_config.get("training", {})
+                matching = any(
+                    value is not None and value != "auto" and float(value) == float(recorded_source)
+                    for key in ("learning_rate", "adapted_layers_learning_rate", "backbone_learning_rate")
+                    for value in [parent_training.get(key)]
+                )
+                if matching:
+                    base, provenance = recover_base_learning_rate(parent_config, (*_visited, identity))
+                    if provenance != "fallback_default":
+                        return base, f"legacy_source_lineage:{identity}"
+    warnings.warn(
+        "Cannot recover original scratch LR; using fallback base_learning_rate=0.001", RuntimeWarning, stacklevel=2
+    )
+    return 1e-3, "fallback_default"
 
 
 def resolve_source_model(base_model: Path | str, device: torch.device | str = "cpu") -> SourceModel:
@@ -126,19 +227,44 @@ def resolve_source_model(base_model: Path | str, device: torch.device | str = "c
             f"Source model {checkpoint} has no recoverable config.json or embedded model_config"
         )
     model_config = folder_config or cast(dict[str, Any], checkpoint_config)
+    recovery_sources: list[str] = []
+    if isinstance(checkpoint_config, dict):
+        model_config = _recover_saved_values(model_config, checkpoint_config, recovery_sources)
     if model_config.get("format") not in {None, "jdll-unet"} or int(model_config.get("format_version", 1)) != 1:
         raise ModelLoadError(f"Unsupported source model schema in {checkpoint}")
 
     checkpoint_arch_payload = state.get("architecture_config")
     config_arch_payload = model_config.get("architecture_config")
+    embedded_arch = checkpoint_config.get("architecture_config") if isinstance(checkpoint_config, dict) else None
+    trusted_arch = checkpoint_arch_payload or embedded_arch
+    if isinstance(config_arch_payload, dict) and isinstance(trusted_arch, dict):
+        merged = dict(config_arch_payload)
+        for key, value in trusted_arch.items():
+            if key not in merged or merged[key] == "auto":
+                merged[key] = value
+                recovery_sources.append(f"checkpoint.architecture_config.{key}")
+        config_arch_payload = merged
     architecture = _architecture_from_payload(
-        config_arch_payload if config_arch_payload is not None else checkpoint_arch_payload,
+        config_arch_payload if config_arch_payload is not None else trusted_arch,
         str(checkpoint),
     )
     if checkpoint_arch_payload is not None:
         checkpoint_arch = _architecture_from_payload(checkpoint_arch_payload, str(checkpoint))
         if asdict(checkpoint_arch) != asdict(architecture):
             raise ModelLoadError("Source config.json and checkpoint architecture_config disagree")
+    if embedded_arch is not None and asdict(_architecture_from_payload(embedded_arch, str(checkpoint))) != asdict(
+        architecture
+    ):
+        raise ModelLoadError("Source config.json and embedded checkpoint architecture_config disagree")
+    if isinstance(checkpoint_config, dict):
+        for key in ("task", "label_values", "normalization"):
+            if key in model_config and key in checkpoint_config and model_config[key] != checkpoint_config[key]:
+                raise ModelLoadError(f"Source config.json and checkpoint {key} disagree")
+        for key in ("base_learning_rate", "learning_rate", "backbone_learning_rate", "adapted_layers_learning_rate"):
+            saved = model_config.get("training", {}).get(key)
+            embedded = checkpoint_config.get("training", {}).get(key)
+            if saved not in (None, "auto") and embedded not in (None, "auto") and saved != embedded:
+                raise ModelLoadError(f"Source config.json and checkpoint {key} disagree")
 
     source_model = build_unet(architecture)
     try:
@@ -165,6 +291,7 @@ def resolve_source_model(base_model: Path | str, device: torch.device | str = "c
             f"Source task metadata expects {expected_outputs} output channels but architecture records "
             f"{architecture.output_channels}"
         )
+    base_lr, provenance = recover_base_learning_rate(model_config)
     return SourceModel(
         requested.resolve(),
         checkpoint.resolve(),
@@ -174,6 +301,9 @@ def resolve_source_model(base_model: Path | str, device: torch.device | str = "c
         task,
         labels,
         _source_learning_rate(model_config),
+        base_lr,
+        provenance,
+        tuple(recovery_sources),
     )
 
 
@@ -308,7 +438,9 @@ def initialize_finetune_model(
                 resolved[name] = target_tensor
                 reinitialized.append(name)
                 missing.append(name)
-            elif source_tensor.shape == target_tensor.shape:
+            elif source_tensor.shape == target_tensor.shape and (
+                dimensions != "2.5d" or source_context == target_context
+            ):
                 resolved[name] = source_tensor
                 copied.append(name)
             elif (

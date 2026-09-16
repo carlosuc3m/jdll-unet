@@ -1,5 +1,10 @@
 # Fine-Tuning Compatibility and Learning-Rate Requirements
 
+For the final resolved-configuration, learning-rate lineage, mixed-dimensional
+dataset, padding, and validation rules, also follow
+[Resolved Training and Dataset Geometry Requirements](README_TRAINING_GEOMETRY_REQUIREMENTS.md).
+That specification takes precedence where an older interpretation differs.
+
 ## Context
 
 JDLL provides a simplified UNet training interface. Training from scratch may
@@ -96,15 +101,20 @@ Fine-tuning must reject, with a clear message:
 
 ### Fine-Tuning Learning Rates
 
-Read the source model's recorded initial/resolved training learning rate.
+Read the model lineage's original scratch `base_learning_rate`, not the source
+run's already reduced fine-tuning rate. Carry this base forward unchanged.
 
 With `learning_rate="auto"`:
 
-- preserved backbone parameters use `source_learning_rate * 0.1`;
+- preserved backbone parameters use `base_learning_rate * 0.1`;
 - adapted or reinitialized input/output parameters use
-  `source_learning_rate`;
-- if the source learning rate is unavailable, use `1e-4` for the backbone and
-  `1e-3` for adapted parameters.
+  `base_learning_rate`;
+- if the base learning rate cannot be recovered, use base `1e-3`, producing
+  `1e-4` for the backbone and `1e-3` for adapted parameters, and log the fallback.
+
+Fine-tuning an already fine-tuned model must not reduce the rate again. Keep the
+source run's effective initial LR separately as provenance. See the linked
+specification for legacy recovery and resolved configuration requirements.
 
 If no input or output adaptation is needed, use only the reduced backbone rate
 for the complete model.
@@ -124,6 +134,7 @@ The new model's `config.json` and checkpoint metadata must contain:
 - the complete resolved target `architecture_config`;
 - source model and checkpoint paths;
 - source learning rate, when available;
+- original scratch `base_learning_rate`, preserved across generations;
 - resolved backbone learning rate;
 - resolved adapted-layer learning rate, or `null` when no adaptation occurred;
 - input-channel adaptation summary;
@@ -153,6 +164,7 @@ callbacks.emit(
     input_adaptation="Adapted input convolution from 1 to 3 channels",
     output_adaptation="Reinitialized primary and deep-supervision heads",
     source_learning_rate=0.001,
+    base_learning_rate=0.001,
     backbone_learning_rate=0.0001,
     adapted_layers_learning_rate=0.001,
 )
@@ -183,8 +195,7 @@ Add tests covering:
 - primary and deep-supervision head adaptation;
 - complete head reinitialization when task semantics change;
 - strict rejection of an unrelated backbone mismatch;
-- source LR reduction and fallback rates;
+- base LR reduction, fallback rates, and unchanged base across repeated fine-tuning;
 - optimizer parameter groups and scheduler ratio preservation;
 - saved configuration and `training_plan` callback fields;
 - missing, malformed, and checkpoint-inconsistent source metadata.
-

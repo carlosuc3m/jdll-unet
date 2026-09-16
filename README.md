@@ -17,6 +17,12 @@ segmentation datasets laid out as `images/` and `masks/`, or as explicit
 Ordinary 2D images support TIFF, PNG, BMP, and JPEG; integer masks support TIFF,
 PNG, and BMP, while lossy JPEG masks remain prohibited. BMP is intentionally
 2D-only, and volumetric images and labels require TIFF stacks.
+For accepted extensions, confirmed header mismatches select the actual format's
+reader. TIFF volumes, axes, spacing, and precision survive misleading raster
+extensions; palette masks retain their integer indices. Successful corrections
+are remembered per run, folder, extension, and image/mask role and reported
+through callbacks. Corrupt data, JPEG mask contents, independent TIFF series,
+and animated rasters fail clearly instead of falling back to a partial image.
 For JDLL compatibility, channel-last 2D label masks use channel zero and emit a
 warning when additional channels are discarded. Dimension-aware loading keeps
 `Z,Y,X` masks volumetric and rejects ambiguous 3D channel layouts.
@@ -150,6 +156,40 @@ Training writes `config.json`, `weights_best.pt`, `weights_last.pt`,
 `model.pt`, `training.log`, `metrics.json`, and optional previews into the
 model folder.
 
+Training also saves `dataset_plan.json`, which records source geometry, accepted
+and skipped cases, split regions, spacing, padding, eligible planes, and sampling
+quotas. The effective configuration and checkpoints contain resolved values;
+per-case decisions stay in the dataset plan.
+
+## Training Geometry and Validation
+
+2D training accepts standalone images and individual planes from volumes when
+the supplied dataset contains at least one valid standalone 2D image/mask pair
+(a singleton Z=1 stack also qualifies). This condition applies to scratch
+training and fine-tuning across the dataset, not separately within each split.
+Volume-only datasets require a 2.5D or 3D model.
+2.5D and 3D training use eligible volumes and report skipped standalone images.
+Explicit TIFF axes and image/mask spatial geometry determine the interpretation;
+ambiguous pairs require an export with explicit axes.
+
+Splits keep each original source together, including sources reached through
+links. One sufficiently large 2D image, or one volume for a 2.5D/3D model, uses
+disjoint spatial regions for training and validation. All preprocessing, context, and augmentation stay within
+the assigned region. Infeasible holdouts fail clearly; training content is never
+reused as validation. This is within-source validation, not an independent specimen.
+
+Each run uses one patch shape validated against the actual network. The default
+padding limit is one real domain length per side on each spatial axis. A real
+depth of 8 can support a depth-16 patch; depth 4 cannot. Added spatial padding
+does not contribute to targets, losses, or metrics. This validity information
+does not identify unannotated real content.
+
+2.5D keeps the resolved context count and stride. For depth 4, context 11, and
+stride 1, centers 1 and 2 are eligible; all four real planes remain available
+as context. Missing context is zero-filled and does not invalidate a real center.
+See [the integration handoff](README_TRAINING_GEOMETRY_HANDOFF.md) for callbacks,
+artifacts, and Java integration details.
+
 ## Empty Training Samples
 
 Training excludes images with empty masks and rejects empty sampled patches by
@@ -163,11 +203,20 @@ ones, and their counts are logged. Configure the training policy with:
 "include_empty_patches_after_max_retries": False,
 ```
 
-After the initial patch attempt, the sampler retries up to
-`empty_patch_max_retries` times. If those attempts are empty and
-`include_empty_patches_after_max_retries` is false, sampling continues from the
-next training image. If it is true, the final empty patch is used. Training
-fails clearly when every training mask is empty.
+`skip_empty_patches=True` is the stricter policy and always excludes empty output
+patches, including after augmentation. Sampling retries eligible targets within
+the source and has a foreground-centered fallback with spatial deformation
+disabled. Training fails clearly if no feasible foreground target remains.
+The legacy `include_empty_patches_after_max_retries` flag cannot override this
+stricter policy.
+
+When negative patches are permitted, `max_empty_plane_fraction=0.20` caps empty
+training planes per volume and epoch. Twenty positive planes permit up to five
+empty planes; three positive planes permit none. Empty subsets rotate
+reproducibly across epochs, and repeated draws also respect the cap. Wholly
+empty volumes contribute no plane samples under this quota. Validation keeps
+eligible real empty content. Advanced callers can set `max_empty_plane_fraction`
+in `[0,1)` and the finite nonnegative per-side `max_padding_ratio` (default `1.0`).
 
 ## Instance Scale Normalization
 
@@ -232,9 +281,12 @@ result = train(
 
 The source backbone, dimensionality, kernels, strides, normalization, context,
 and deep-supervision topology are reconstructed strictly. Only input
-convolutions and output heads may be adapted. Fine-tuning uses one tenth of the
-source learning rate for preserved backbone parameters and the source rate for
-adapted layers; missing source rates fall back to `1e-4` and `1e-3`. A fresh
+convolutions and output heads may be adapted. Omitted settings and explicit
+`auto` inherit the source values, including its context count. Fine-tuning uses
+one tenth of the original scratch `base_learning_rate` for backbone parameters
+and that base rate for adapted layers. Successive fine-tunes keep the same base
+rate. Unrecoverable legacy provenance falls back to base `1e-3`, with a warning,
+giving backbone/adapted rates `1e-4` and `1e-3`. A fresh
 optimizer and scheduler preserve this group ratio. `config.json`,
 `model_metadata.json`, checkpoints, and the `training_plan` callback record the
 source paths, resolved rates, adaptation summaries, and complete tensor audit.

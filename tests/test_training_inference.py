@@ -164,6 +164,7 @@ def test_instance_scale_normalization_supports_3d(tmp_path: Path):
     result = train(
         {
             "model_name": "instance-scale-3d",
+            "instance_scale_normalization": {"target_object_fraction": 0.5},
             "output_dir": tmp_path / "instance_model",
             "dataset_path": dataset,
             "task": "instance_friendly",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .losses import Logits, primary_logits
+from .losses import Logits, masked_mean, primary_logits, valid_support
 from .postprocess import postprocess_instance
 
 try:  # pragma: no cover
@@ -20,10 +20,15 @@ def _safe_float(value: torch.Tensor | float) -> float:
     return float(value)
 
 
-def binary_metrics(logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> dict[str, float]:
+def binary_metrics(
+    logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, valid: torch.Tensor | None = None
+) -> dict[str, float]:
     probs = torch.sigmoid(logits)
     pred = probs >= threshold
     target_bool = target.bool()
+    if valid is not None:
+        pred = pred & valid
+        target_bool = target_bool & valid
     intersection = (pred & target_bool).sum().float()
     union = (pred | target_bool).sum().float()
     denom = pred.sum().float() + target_bool.sum().float()
@@ -32,7 +37,9 @@ def binary_metrics(logits: torch.Tensor, target: torch.Tensor, threshold: float 
     return {"dice": _safe_float(dice), "iou": _safe_float(iou)}
 
 
-def multiclass_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+def multiclass_metrics(
+    logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None
+) -> dict[str, float]:
     pred = torch.argmax(logits, dim=1)
     classes = int(logits.shape[1])
     result: dict[str, float] = {}
@@ -40,6 +47,9 @@ def multiclass_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, 
     for cls in range(1, classes):
         pred_cls = pred == cls
         target_cls = target == cls
+        if valid is not None:
+            pred_cls &= valid[:, 0]
+            target_cls &= valid[:, 0]
         intersection = (pred_cls & target_cls).sum().float()
         denom = pred_cls.sum().float() + target_cls.sum().float()
         dice = _safe_float((2 * intersection + 1e-6) / (denom + 1e-6))
@@ -50,21 +60,28 @@ def multiclass_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, 
 
 
 def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> dict[str, float]:
-    metrics = binary_metrics(logits[:, 0:1], target["foreground"])
+    valid = valid_support(target, logits)
+    metrics = binary_metrics(logits[:, 0:1], target["foreground"], valid=valid)
     metrics = {f"foreground_{key}": value for key, value in metrics.items()}
     boundary_loss_proxy = torch.nn.functional.binary_cross_entropy_with_logits(
         logits[:, 1:2],
         target["boundary"].float(),
+        reduction="none",
     )
-    metrics["boundary_loss"] = _safe_float(boundary_loss_proxy)
+    metrics["boundary_loss"] = _safe_float(masked_mean(boundary_loss_proxy, valid))
     boundary_pred = torch.sigmoid(logits[:, 1:2]) >= 0.5
     boundary_true = target["boundary"].bool()
+    if valid is not None:
+        boundary_pred &= valid
+        boundary_true &= valid
     boundary_intersection = (boundary_pred & boundary_true).sum().float()
     metrics["boundary_f1"] = _safe_float(
         (2 * boundary_intersection + 1e-6) / (boundary_pred.sum() + boundary_true.sum() + 1e-6)
     )
     if "distance" in target and logits.shape[1] >= 3:
         foreground = target["foreground"] > 0.5
+        if valid is not None:
+            foreground &= valid
         distance = torch.sigmoid(logits[:, 2:3])
         metrics["distance_mae"] = _safe_float(
             torch.abs(distance[foreground] - target["distance"][foreground]).mean()
@@ -73,6 +90,8 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> d
         )
     if ndi is not None:
         pred = (torch.sigmoid(logits[:, 0:1]) >= 0.5).detach().cpu().numpy()
+        if valid is not None:
+            pred &= valid.detach().cpu().numpy()
         counts = []
         for item in pred[:, 0]:
             _, count = ndi.label(item)
@@ -81,6 +100,10 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> d
     if "instances" in target and logits.shape[1] >= 3:
         p = torch.sigmoid(logits).detach().cpu().numpy()
         truths = target["instances"][:, 0].detach().cpu().numpy()
+        if valid is not None:
+            support = valid.detach().cpu().numpy()
+            p = np.where(support, p, 0)
+            truths = np.where(support[:, 0], truths, 0)
         instance_values: list[dict[str, float]] = []
         for index in range(len(truths)):
             predicted = postprocess_instance(p[index, 0], p[index, 1], p[index, 2], min_object_size=0)["labels"]
@@ -142,12 +165,15 @@ def compute_metrics(
     target: torch.Tensor | dict[str, torch.Tensor],
 ) -> dict[str, float]:
     logits = primary_logits(logits)
+    valid = valid_support(target, logits)
+    if task != "instance_friendly" and isinstance(target, dict):
+        target = target["semantic"]
     if task == "binary_semantic":
         assert isinstance(target, torch.Tensor)
-        return binary_metrics(logits, target)
+        return binary_metrics(logits, target, valid=valid)
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
-        return multiclass_metrics(logits, target)
+        return multiclass_metrics(logits, target, valid=valid)
     if task == "instance_friendly":
         assert isinstance(target, dict)
         return instance_metrics(logits, target)

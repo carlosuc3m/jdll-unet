@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from .callbacks import CallbackDispatcher
 from .config import ArchitectureConfig, read_json, resolve_device
 from .errors import InferenceCancelled, InferenceError, ModelLoadError
+from .image_reading import image_reading_session
 from .io import load_image, normalize_image
 from .losses import primary_logits
 from .model import build_unet
@@ -205,7 +206,7 @@ def tiled_predict(
     layout = layout or _tile_layout(original_shape, tile_size, overlap)
     if layout.padded_shape != spatial_shape:
         raise InferenceError("Tile layout does not match the prepared image shape")
-    output_channels = int(model.config.output_channels)
+    output_channels = int(cast(ArchitectureConfig, model.config).output_channels)
     accum = torch.zeros((output_channels, *spatial_shape), dtype=torch.float32, device=device)
     counts = torch.zeros((1, *spatial_shape), dtype=torch.float32, device=device)
     with torch.inference_mode():
@@ -688,7 +689,8 @@ def infer(
     progress = _InferenceProgress(callbacks)
     device = resolve_device(str(config.get("device", "cpu")))
     try:
-        return _infer_impl(config, inputs, callbacks, progress)
+        with image_reading_session(callbacks.emit):
+            return _infer_impl(config, inputs, callbacks, progress)
     except InferenceCancelled:
         callbacks.emit(
             "cancelled",

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
+from numbers import Real
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+import numpy as np
 import torch
 
 from .errors import ConfigError
@@ -133,14 +136,14 @@ class ArchitectureConfig:
     reference_memory_gb: int = 4
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class TrainingConfig:
     model_name: str
     output_dir: Path
     dataset_path: Path
     starting_point: str = "scratch"
     base_model: Path | None = None
-    architecture: str = "resenc-tiny-2d"
+    architecture: str = AUTO
     device: str = "cpu"
     epochs: int = 100
     seed: int = 42
@@ -165,6 +168,8 @@ class TrainingConfig:
     skip_empty_patches: bool = True
     empty_patch_max_retries: int = 8
     include_empty_patches_after_max_retries: bool = False
+    max_padding_ratio: float = 1.0
+    max_empty_plane_fraction: float = 0.20
     augmentation_profile: str = AUTO
     num_workers: int = 0
     mixed_precision: bool | str = AUTO
@@ -194,6 +199,51 @@ class TrainingConfig:
     postprocessing: PostprocessingConfig = field(default_factory=PostprocessingConfig)
     loss_weights: dict[str, float] = field(default_factory=_default_loss_weights)
     augmentation: dict[str, Any] = field(default_factory=dict)
+    _provided_fields: frozenset[str] = field(default_factory=frozenset, init=False, repr=False, compare=False)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        options = [option for option in fields(type(self)) if option.init]
+        if len(args) > len(options):
+            raise TypeError("Too many positional TrainingConfig arguments")
+        supplied = dict(kwargs)
+        for option, value in zip(options, args, strict=False):
+            if option.name in supplied:
+                raise TypeError(f"Multiple values for {option.name}")
+            supplied[option.name] = value
+        unknown = set(supplied) - {option.name for option in options}
+        if unknown:
+            raise TypeError(f"Unknown TrainingConfig fields: {sorted(unknown)}")
+        self._provided_fields = frozenset(supplied)
+        for option in options:
+            if option.name in supplied:
+                value = supplied[option.name]
+            elif option.default is not MISSING:
+                value = option.default
+            elif option.default_factory is not MISSING:
+                value = option.default_factory()
+            else:
+                raise TypeError(f"Missing required TrainingConfig field: {option.name}")
+            setattr(self, option.name, value)
+
+    def request_dict(self) -> dict[str, Any]:
+        values = asdict(self)
+        values.pop("_provided_fields")
+        inheritable = {
+            "architecture",
+            "model_normalization",
+            "normalization",
+            "deep_supervision",
+            "context_slices",
+            "context",
+            "spacing",
+            "instance_scale_normalization",
+        }
+        for option in fields(type(self)):
+            if option.name in inheritable and option.name not in self._provided_fields:
+                default = option.default_factory() if option.default_factory is not MISSING else option.default
+                if getattr(self, option.name) == default:
+                    values.pop(option.name, None)
+        return values
 
 
 def _path_or_none(value: Any) -> Path | None:
@@ -268,19 +318,20 @@ def _as_spatial_tuple(value: Any) -> tuple[int, ...] | str:
 def _nested_dataclass(cls: type[T], value: Any) -> T:
     if isinstance(value, cls):
         return value
-    if value is None:
+    if value is None or value == AUTO:
         return cls()
     if isinstance(value, Mapping):
         valid = {item.name for item in fields(cast(Any, cls))}
         unknown = sorted(set(value) - valid)
         if unknown:
             raise ConfigError(f"Unknown {cls.__name__} field(s): {', '.join(unknown)}")
-        return cls(**{k: v for k, v in value.items() if k in valid})
+        defaults = cls()
+        return cls(**{k: getattr(defaults, k) if v == AUTO else v for k, v in value.items() if k in valid})
     raise ConfigError(f"Expected mapping for {cls.__name__}")
 
 
 def _lr_scheduler_config(value: Any) -> LRSchedulerConfig:
-    if value is None:
+    if value is None or value == AUTO:
         return LRSchedulerConfig()
     if isinstance(value, LRSchedulerConfig):
         return value
@@ -323,6 +374,8 @@ def _validate_normalization(config: NormalizationConfig) -> None:
 
 def _model_normalization(value: Any) -> str:
     normalization = str(value).lower()
+    if normalization == AUTO:
+        normalization = "group"
     if normalization not in SUPPORTED_MODEL_NORMALIZATIONS:
         raise ConfigError(f"Unsupported model_normalization: {normalization}")
     return "none" if normalization == "identity" else normalization
@@ -384,11 +437,21 @@ def _validate_auto_positive_float(value: float | str, name: str) -> None:
         raise ConfigError(f"{name} must be positive")
 
 
-def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> TrainingConfig:
+def _max_empty_plane_fraction(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ConfigError("max_empty_plane_fraction must be a finite number in [0, 1), not a boolean")
+    if not 0 <= value < 1 or not math.isfinite(value):
+        raise ConfigError("max_empty_plane_fraction must be finite and in [0, 1)")
+    return float(value)
+
+
+def parse_training_config(
+    config: Mapping[str, Any] | TrainingConfig, *, source_architecture: ArchitectureConfig | None = None
+) -> TrainingConfig:
     """Parse and validate a training config supplied by Java, JSON, or tests."""
 
     if isinstance(config, TrainingConfig):
-        parsed = config
+        return parse_training_config(config.request_dict(), source_architecture=source_architecture)
     else:
         missing = [key for key in ("model_name", "output_dir", "dataset_path") if key not in config]
         if missing:
@@ -401,7 +464,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             dataset_path=Path(raw["dataset_path"]),
             starting_point=str(raw.get("starting_point", "scratch")),
             base_model=_path_or_none(raw.get("base_model")),
-            architecture=str(raw.get("architecture", "resenc-tiny-2d")),
+            architecture=str(raw.get("architecture", AUTO)),
             device=str(raw.get("device", "cpu")),
             epochs=int(raw.get("epochs", 100)),
             seed=int(raw.get("seed", 42)),
@@ -410,7 +473,10 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             input_channels=_auto_or_int(raw.get("input_channels", AUTO), "input_channels"),
             output_classes=_auto_or_int(raw.get("output_classes", AUTO), "output_classes"),
             model_normalization=_model_normalization(
-                raw.get("model_normalization", raw.get("network_normalization", raw.get("architecture_normalization", "group")))
+                raw.get(
+                    "model_normalization",
+                    raw.get("network_normalization", raw.get("architecture_normalization", "group")),
+                )
             ),
             patch_size=_as_spatial_tuple(raw.get("patch_size", AUTO)),
             batch_size=_auto_or_int(raw.get("batch_size", AUTO), "batch_size"),
@@ -434,6 +500,8 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
                 "include_empty_patches_after_max_retries",
             ),
             augmentation_profile=str(raw.get("augmentation_profile", AUTO)),
+            max_padding_ratio=float(raw.get("max_padding_ratio", 1.0)),
+            max_empty_plane_fraction=_max_empty_plane_fraction(raw.get("max_empty_plane_fraction", 0.20)),
             num_workers=int(raw.get("num_workers", 0)),
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", AUTO), "deep_supervision"),
@@ -454,7 +522,9 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             auto_focal_weight=float(raw.get("auto_focal_weight", 0.5)),
             auto_boundary_focal_weight=float(raw.get("auto_boundary_focal_weight", 0.25)),
             auto_focal_sample_limit=int(raw.get("auto_focal_sample_limit", 64)),
-            progress_update_interval=_auto_or_int(raw.get("progress_update_interval", AUTO), "progress_update_interval"),
+            progress_update_interval=_auto_or_int(
+                raw.get("progress_update_interval", AUTO), "progress_update_interval"
+            ),
             log_update_interval=_auto_or_int(raw.get("log_update_interval", AUTO), "log_update_interval"),
             save_every_epoch=_coerce_bool(raw.get("save_every_epoch", True), "save_every_epoch"),
             preview_count=int(raw.get("preview_count", 20)),
@@ -463,9 +533,12 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
             loss_weights=_loss_weights(raw.get("loss_weights")),
             augmentation=dict(raw.get("augmentation", {})),
         )
+        parsed._provided_fields = frozenset(raw)
 
     if not parsed.model_name.strip():
         raise ConfigError("model_name cannot be empty")
+    if not math.isfinite(parsed.max_padding_ratio) or parsed.max_padding_ratio < 0:
+        raise ConfigError("max_padding_ratio must be finite and nonnegative")
     if "/" in parsed.model_name or "\\" in parsed.model_name:
         raise ConfigError("model_name must be a name, not a path")
     if parsed.starting_point not in {"scratch", "fine_tune", "finetune"}:
@@ -514,7 +587,7 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("context.stride_policy must be adjacent, fixed_stride, or nearest_physical")
     if int(parsed.context.stride) < 1:
         raise ConfigError("context.stride must be at least 1")
-    if parsed.context.spacing != AUTO and float(parsed.context.spacing) <= 0:
+    if parsed.context.spacing not in (AUTO, None) and float(parsed.context.spacing) <= 0:
         raise ConfigError("context.spacing must be 'auto' or positive")
     if parsed.effective_batch_size < 1 or parsed.minimum_steps_per_epoch < 1 or parsed.expected_patches_per_case < 1:
         raise ConfigError("effective batch and training-step settings must be positive")
@@ -583,10 +656,16 @@ def parse_training_config(config: Mapping[str, Any] | TrainingConfig) -> Trainin
         raise ConfigError("instance_scale_normalization effective scale bounds must be positive and ordered")
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
-    arch = architecture_defaults(str(parsed.architecture), normalization=parsed.model_normalization)
-    if parsed.context_slices == AUTO:
+    if parsed.architecture == AUTO and parsed.starting_point not in {"fine_tune", "finetune"}:
+        parsed.architecture = "resenc-tiny-2d"
+    if parsed.architecture == AUTO:
+        return parsed
+    arch = source_architecture or architecture_defaults(
+        str(parsed.architecture), normalization=parsed.model_normalization
+    )
+    if parsed.context_slices == AUTO and parsed.starting_point not in {"fine_tune", "finetune"}:
         parsed.context_slices = default_context_slices(parsed.architecture)
-    if arch.dimensions == "2.5d" and int(parsed.context_slices) < 3:
+    if arch.dimensions == "2.5d" and parsed.context_slices != AUTO and int(parsed.context_slices) < 3:
         raise ConfigError("2.5D models require context_slices to be at least 3")
     if parsed.patch_size != AUTO:
         expected_dims = 3 if arch.dimensions == "3d" else 2
@@ -774,15 +853,17 @@ def model_folder_config(
         "label_values": label_values,
         "normalization": asdict(train_config.normalization),
         "postprocessing": asdict(train_config.postprocessing),
-        "training": to_jsonable(asdict(train_config)),
+        "training": to_jsonable({key: value for key, value in asdict(train_config).items() if not key.startswith("_")}),
     }
 
 
 def to_jsonable(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple):
-        return list(value)
+        return [to_jsonable(item) for item in value]
     if isinstance(value, dict):
         return {k: to_jsonable(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -793,7 +874,7 @@ def to_jsonable(value: Any) -> Any:
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(json.dumps(to_jsonable(dict(payload)), indent=2, sort_keys=True) + "\n")
+    tmp_path.write_text(json.dumps(to_jsonable(dict(payload)), indent=2, sort_keys=True, allow_nan=False) + "\n")
     os.replace(tmp_path, path)
 
 

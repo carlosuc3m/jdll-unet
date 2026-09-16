@@ -23,20 +23,17 @@ from .config import (
     TrainingConfig,
     architecture_defaults,
     default_augmentation_profile,
-    default_batch_size,
-    default_deep_supervision,
     default_foreground_probability,
     default_learning_rate,
     default_log_update_interval,
     default_mixed_precision,
-    default_patch_size,
     default_progress_update_interval,
     model_folder_config,
     parse_training_config,
     resolve_device,
     write_json,
 )
-from .dataset import inspect_dataset, make_dataset, partition_empty_pairs, split_pairs
+from .dataset import JdllSegmentationDataset, make_dataset, partition_empty_pairs
 from .errors import DatasetError, ModelLoadError
 from .finetune import (
     FineTuneReport,
@@ -44,18 +41,16 @@ from .finetune import (
     initialize_finetune_model,
     resolve_finetune_learning_rates,
     resolve_source_model,
-    target_architecture,
 )
-from .io import ImageMaskPair, discover_dataset, load_image, load_mask, normalize_image
+from .geometry import load_domain_image, load_domain_mask
+from .image_reading import current_read_session, image_reading_session
+from .io import ImageMaskPair, normalize_image
 from .losses import compute_loss, primary_logits
 from .metrics import compute_metrics, primary_metric
 from .model import build_unet
 from .planning import (
-    RuntimeMemoryPlan,
-    build_dataset_plan,
-    derive_stage_geometry,
-    plan_patch_and_microbatch,
     resample_image_mask,
+    resample_mask,
     resolve_context_stride,
     restore_continuous_maps,
 )
@@ -63,14 +58,21 @@ from .postprocess import postprocess_instance
 from .scale import (
     InstanceSizeEstimate,
     aggregate_instance_statistics,
-    estimate_3d_instance_size,
-    estimate_instance_size,
-    estimate_volume_instance_size,
 )
 from .schedulers import LearningRateScheduler
 from .semantic_scale import semantic_scale_diagnostics
-from .targets import boundary_target, target_output_channels
-from .task_detect import detect_task_from_pairs
+from .targets import boundary_target
+from .training_geometry import resolve_training_geometry
+
+
+class PlanningCancelled(Exception):
+    """Internal cooperative stop before any model/optimizer state exists."""
+
+
+class TrainingStopped(Exception):
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("Training cancelled")
+        self.result = result
 
 
 def _setup_logging(output_dir: Path) -> logging.Logger:
@@ -97,10 +99,12 @@ def _set_seed(seed: int) -> None:
 def _available_memory_bytes(device: torch.device) -> int | None:
     if device.type == "cuda":
         try:
-            free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+            device_index = (device.index if device.index is not None else torch.cuda.current_device())
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device_index)
             return int(free_bytes)
-        except (RuntimeError, TypeError):
+        except (RuntimeError, TypeError, ValueError):
             return None
+
     if device.type == "cpu":
         try:
             return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
@@ -141,55 +145,92 @@ def _full_volume_validation(
     target_spacing: tuple[float, float, float] | None,
     instance_sizes: dict[str, float] | None = None,
     target_object_size: float | None = None,
+    label_values: list[int] | None = None,
+    min_scale: float = 0.25,
+    max_scale: float = 4.0,
+    check_cancel: Any = None,
 ) -> dict[str, Any]:
-    from .infer import _predict_25d, tiled_predict
+    from .infer import _context_stack, tiled_predict
+    from .targets import prepare_target
 
     per_case: dict[str, float] = {}
+    per_case_metrics: dict[str, dict[str, float]] = {}
+    evaluated_centers: dict[str, list[int] | None] = {}
     for pair in pairs:
-        image = normalize_image(load_image(pair.image, dimensions=dimensions), normalization)
-        mask = load_mask(pair.mask, dimensions=dimensions if dimensions in {"2.5d", "3d"} else "2d")
-        native_shape = mask.shape
+        if check_cancel is not None:
+            check_cancel()
+        image = load_domain_image(pair, dimensions)
+        mask = load_domain_mask(pair, dimensions)
         spacing = case_spacings.get(pair.stem, (1.0, 1.0, 1.0))
-        if dimensions == "3d" and target_spacing is not None:
-            image, _resampled_mask = resample_image_mask(image, mask, spacing, target_spacing)
         object_size = (instance_sizes or {}).get(pair.stem)
-        if task == "instance_friendly" and object_size and target_object_size:
-            scale = target_object_size / object_size
+        scale = (
+            float(np.clip(target_object_size / object_size, min_scale, max_scale))
+            if object_size and target_object_size
+            else 1.0
+        )
+        image = normalize_image(image, normalization) if dimensions != "2d" or image.ndim == 3 else image
+        if dimensions == "3d" and target_spacing is not None:
+            image, _ = resample_image_mask(image, mask, spacing, target_spacing)
+        is_plane_volume = mask.ndim == 3 and dimensions in {"2d", "2.5d"}
+        centers = (
+            pair.eligible_centers
+            if pair.eligible_centers is not None
+            else tuple(range(mask.shape[0]))
+            if is_plane_volume
+            else None
+        )
+        evaluated_centers[pair.stem] = (
+            [z + (pair.region[0][0] if pair.region else 0) for z in centers] if centers is not None else None
+        )
+        metrics = []
+        for z in centers if centers is not None else (None,):
+            if check_cancel is not None:
+                check_cancel()
             if dimensions == "2.5d":
-                target_yx = cast(
-                    tuple[int, int], tuple(max(1, int(round(value * scale))) for value in image.shape[-2:])
+                assert z is not None
+                stride = resolve_context_stride(
+                    context_policy,
+                    fixed_stride=context_fixed_stride,
+                    target_spacing=context_target_spacing,
+                    z_spacing=spacing[0],
                 )
-                flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
-                tensor = torch.from_numpy(np.ascontiguousarray(flattened[None]))
-                image = torch.nn.functional.interpolate(tensor, size=target_yx, mode="bilinear", align_corners=False)[
-                    0
-                ].numpy()
-                image = image.reshape(-1, native_shape[0], *target_yx)
+                current_image = _context_stack(image, z, context_slices, stride)
+            elif z is not None:
+                current_image = normalize_image(image[:, z], normalization)
             else:
-                target_shape = tuple(max(1, int(round(value * scale))) for value in image.shape[1:])
-                tensor = torch.from_numpy(np.ascontiguousarray(image[None]))
-                mode = "trilinear" if dimensions == "3d" else "bilinear"
-                image = torch.nn.functional.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)[
-                    0
-                ].numpy()
-        if dimensions == "2.5d":
-            stride = resolve_context_stride(
-                context_policy,
-                fixed_stride=context_fixed_stride,
-                target_spacing=context_target_spacing,
-                z_spacing=spacing[0],
+                current_image = image
+            current_mask = mask[z] if z is not None else mask
+            if scale != 1.0:
+                size = tuple(max(1, round(length * scale)) for length in current_image.shape[1:])
+                current_image = torch.nn.functional.interpolate(
+                    torch.from_numpy(np.ascontiguousarray(current_image[None])),
+                    size=size,
+                    mode="trilinear" if dimensions == "3d" else "bilinear",
+                    align_corners=False,
+                )[0].numpy()
+            logits = tiled_predict(model, current_image, device, patch_size, overlap=0.5)
+            if logits.shape[1:] != current_mask.shape:
+                logits = restore_continuous_maps(logits, current_mask.shape)
+            target = prepare_target(
+                task,
+                current_mask,
+                label_values=label_values,
+                spacing=spacing if dimensions == "3d" else None,
+                validity=np.ones(current_mask.shape, dtype=bool),
             )
-            logits = _predict_25d(model, image, device, cast(tuple[int, int], patch_size), 0.5, context_slices, stride)
-        else:
-            logits = tiled_predict(model, image, device, patch_size, overlap=0.5)
-        if logits.shape[1:] != native_shape:
-            logits = restore_continuous_maps(logits, native_shape)
-        prediction = np.argmax(logits, axis=0) > 0 if task == "multiclass_semantic" else logits[0] >= 0
-        target = mask != 0
-        intersection = int(np.count_nonzero(prediction & target))
-        denominator = int(np.count_nonzero(prediction)) + int(np.count_nonzero(target))
-        per_case[pair.stem] = (2 * intersection + 1e-6) / (denominator + 1e-6)
-    return {"mean_dice": float(np.mean(list(per_case.values()))) if per_case else 0.0, "per_case_dice": per_case}
+            assert isinstance(target, dict)
+            tensors = {key: torch.from_numpy(value[None]) for key, value in target.items()}
+            metrics.append(compute_metrics(task, torch.from_numpy(logits[None]), tensors))
+        per_case_metrics[pair.stem] = _mean_dict(metrics)
+        per_case[pair.stem] = primary_metric(task, per_case_metrics[pair.stem])
+    if not per_case:
+        raise DatasetError("Full validation has no eligible real targets")
+    return {
+        "mean_dice": float(np.mean(list(per_case.values()))),
+        "per_case_dice": per_case,
+        "per_case_metrics": per_case_metrics,
+        "evaluated_centers": evaluated_centers,
+    }
 
 
 def _sample_pairs(pairs: list[ImageMaskPair], sample_limit: int) -> list[ImageMaskPair]:
@@ -212,11 +253,12 @@ def _estimate_target_sparsity(
     boundary_pixels = 0
     total_pixels = 0
     for pair in sampled:
-        mask = load_mask(pair.mask, dimensions=dimensions)
+        mask = load_domain_mask(pair, dimensions=dimensions)
         foreground_pixels += int(np.count_nonzero(mask))
         total_pixels += int(mask.size)
         if task == "instance_friendly":
-            boundary_pixels += int(np.count_nonzero(boundary_target(mask)))
+            planes = mask if dimensions in {"2d", "2.5d"} and mask.ndim == 3 else (mask,)
+            boundary_pixels += sum(int(np.count_nonzero(boundary_target(plane))) for plane in planes)
 
     foreground_ratio = float(foreground_pixels / total_pixels) if total_pixels else 0.0
     boundary_ratio = float(boundary_pixels / total_pixels) if total_pixels and task == "instance_friendly" else None
@@ -332,7 +374,8 @@ def _save_previews(
             logits = primary_logits(model(images)).detach().cpu()
             images_cpu = images.detach().cpu().numpy()
             target_cpu = _target_to_numpy(target_batch)
-            predictions = _predictions_to_visual_targets(task, logits)
+            support = target_batch.get("valid") if isinstance(target_batch, dict) else None
+            predictions = _predictions_to_visual_targets(task, logits, support)
             for idx in range(images_cpu.shape[0]):
                 if len(saved) >= preview_count:
                     break
@@ -342,9 +385,20 @@ def _save_previews(
                 pred_path = (preview_dir / f"{base}_prediction.png").resolve()
                 overlay_path = (preview_dir / f"{base}_overlay.png").resolve()
                 z_index = _preview_z_index(images_cpu[idx])
-                image_rgb = _image_preview_rgb(images_cpu[idx], z_index)
+                preview_image = images_cpu[idx]
+                if getattr(loader.dataset, "dimensions", None) == "2.5d":
+                    context = cast(JdllSegmentationDataset, loader.dataset).context_slices
+                    preview_image = preview_image[context // 2 :: context]
+                image_rgb = _image_preview_rgb(preview_image, z_index)
                 target_rgb = _target_preview_rgb(task, target_cpu, idx, z_index)
                 pred_rgb = _prediction_preview_rgb(task, predictions[idx], z_index)
+                if isinstance(target_cpu, dict) and "valid" in target_cpu:
+                    valid = _slice_for_preview(target_cpu["valid"][idx, 0], z_index)
+                    image_rgb[~valid] = 0
+                    target_rgb[~valid] = 0
+                    pred_rgb[~valid] = 0
+                    validity_path = (preview_dir / f"{base}_validity.png").resolve()
+                    _atomic_image_write(validity_path, valid.astype(np.uint8) * 255)
                 overlay_rgb = _overlay_prediction(image_rgb, pred_rgb)
                 _atomic_image_write(image_path, image_rgb)
                 _atomic_image_write(target_path, target_rgb)
@@ -358,6 +412,10 @@ def _save_previews(
                         "prediction_path": str(pred_path),
                         "overlay_path": str(overlay_path),
                         "z_index": z_index,
+                        "validity_path": str(validity_path)
+                        if isinstance(target_cpu, dict) and "valid" in target_cpu
+                        else None,
+                        **(loader.dataset.provenance(len(saved)) if hasattr(loader.dataset, "provenance") else {}),
                     }
                 )
             if len(saved) >= preview_count:
@@ -416,10 +474,12 @@ def _label_to_rgb(labels: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarray:
+def _predictions_to_visual_targets(task: str, logits: torch.Tensor, validity: torch.Tensor | None = None) -> np.ndarray:
     if task == "multiclass_semantic":
         return torch.argmax(logits, dim=1).numpy()
     probabilities = torch.sigmoid(logits).numpy()
+    if validity is not None:
+        probabilities = np.where(validity.detach().cpu().numpy(), probabilities, 0)
     if task == "instance_friendly":
         predictions = []
         for item in probabilities:
@@ -434,6 +494,8 @@ def _predictions_to_visual_targets(task: str, logits: torch.Tensor) -> np.ndarra
 def _target_preview_rgb(
     task: str, target: np.ndarray | dict[str, np.ndarray], index: int, z_index: int | None = None
 ) -> np.ndarray:
+    if isinstance(target, dict) and "semantic" in target:
+        target = target["semantic"]
     if isinstance(target, dict):
         instances = target.get("instances")
         if instances is not None:
@@ -461,26 +523,72 @@ def _overlay_prediction(image_rgb: np.ndarray, prediction_rgb: np.ndarray) -> np
     return overlay
 
 
-def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
+def train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[str, Any]:
+    try:
+        if CallbackDispatcher(task).cancel_requested():
+            raise PlanningCancelled()
+        with image_reading_session(CallbackDispatcher(task).emit):
+            return _train(config, task)
+    except TrainingStopped as exc:
+        return exc.result
+    except PlanningCancelled:
+        payload: dict[str, Any] = {"cancelled": True, "phase": "planning"}
+        CallbackDispatcher(task).emit("cancelled", message="Training cancelled during dataset planning", **payload)
+        return payload
+    except Exception as exc:
+        CallbackDispatcher(task).emit("error", message=str(exc), error_class=type(exc).__name__)
+        raise
+    finally:
+        output = config.output_dir if isinstance(config, TrainingConfig) else config.get("output_dir")
+        logger = logging.Logger.manager.loggerDict.get(f"jdll_unet.training.{output}")
+        if isinstance(logger, logging.Logger):
+            for handler in logger.handlers[:]:
+                handler.close()
+                logger.removeHandler(handler)
+
+
+def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[str, Any]:
     source_model: SourceModel | None = None
+    if isinstance(config, TrainingConfig):
+        config = config.request_dict()
     resolved_request: dict[str, Any] | TrainingConfig = config
     if isinstance(config, dict) and str(config.get("starting_point", "scratch")) in {"fine_tune", "finetune"}:
         if config.get("base_model") is None:
             raise ModelLoadError("base_model is required when starting_point is fine_tune")
         source_model = resolve_source_model(Path(config["base_model"]))
         requested_architecture = config.get("architecture")
-        if requested_architecture is not None and str(requested_architecture) != source_model.architecture.name:
+        if requested_architecture not in (None, AUTO) and str(requested_architecture) != source_model.architecture.name:
             raise ModelLoadError(
                 f"Fine-tuning architecture {requested_architecture!r} disagrees with source architecture "
                 f"{source_model.architecture.name!r}"
             )
         resolved = dict(config)
         resolved["architecture"] = source_model.architecture.name
-        resolved.setdefault("context_slices", source_model.architecture.context_slices)
-        resolved["deep_supervision"] = source_model.architecture.deep_supervision
-        resolved["model_normalization"] = source_model.architecture.normalization
+        if resolved.get("context_slices", AUTO) == AUTO:
+            resolved["context_slices"] = source_model.architecture.context_slices
+        for key, inherited_value in (
+            ("deep_supervision", source_model.architecture.deep_supervision),
+            ("model_normalization", source_model.architecture.normalization),
+        ):
+            if key in resolved and resolved[key] not in (None, AUTO, inherited_value):
+                raise ModelLoadError(f"Fine-tuning must preserve source {key}={inherited_value!r}")
+            resolved[key] = inherited_value
+        if resolved.get("normalization", AUTO) == AUTO:
+            resolved["normalization"] = source_model.model_config.get("normalization")
+        for key in ("context", "spacing", "instance_scale_normalization"):
+            if source_model.architecture.dimensions == "2d" and key in {"context", "spacing"}:
+                continue
+            saved = source_model.model_config.get("training", {}).get(key)
+            if isinstance(saved, dict):
+                requested = resolved.get(key)
+                if requested is None or requested == AUTO:
+                    resolved[key] = saved
+                elif isinstance(requested, dict):
+                    resolved[key] = {**saved, **{k: v for k, v in requested.items() if v != AUTO}}
         resolved_request = resolved
-    train_config = parse_training_config(resolved_request)
+    train_config = parse_training_config(
+        resolved_request, source_architecture=source_model.architecture if source_model else None
+    )
     if source_model is None and train_config.starting_point in {"fine_tune", "finetune"}:
         assert train_config.base_model is not None
         source_model = resolve_source_model(train_config.base_model)
@@ -490,142 +598,98 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     _set_seed(train_config.seed)
     device = resolve_device(train_config.device)
     logger.info("Starting training on device=%s", device)
-
-    splits = discover_dataset(train_config.dataset_path)
-    if splits.explicit_val:
-        train_pairs, val_pairs = splits.train, splits.val
-    else:
-        train_pairs, val_pairs = split_pairs(splits.train, train_config.validation_fraction, train_config.seed)
-    if len(train_pairs) < 3:
-        warning = f"Very small training set: {len(train_pairs)} image(s). Results may be unstable."
-        logger.warning(warning)
-        callbacks.emit("warning", message=warning)
+    if source_model is not None:
+        message = f"Fine-tuning from base LR {source_model.base_learning_rate:g}: backbone LR {source_model.base_learning_rate * 0.1:g}; adapted layers use {source_model.base_learning_rate:g} when present."
+        if source_model.learning_rate_provenance == "fallback_default":
+            message = "Original scratch LR could not be recovered; using fallback base LR 0.001. " + message
+        logger.info(message)
+        callbacks.emit(
+            "warning" if source_model.learning_rate_provenance == "fallback_default" else "source_model_resolved",
+            message=message,
+            base_learning_rate=source_model.base_learning_rate,
+            learning_rate_provenance=source_model.learning_rate_provenance,
+            recovery_sources=source_model.recovery_sources,
+        )
 
     architecture_probe = (
         source_model.architecture
         if source_model is not None
         else architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     )
-    dimensions = architecture_probe.dimensions
-    detection = detect_task_from_pairs(
-        train_pairs + val_pairs,
-        train_config.dataset_path,
-        requested_task=train_config.task,
-        dimensions=dimensions,
-    )
-    if detection.get("ambiguous"):
-        raise ValueError(
-            "Dataset task is ambiguous. Ask whether labels represent classes or objects and pass "
-            "task='multiclass_semantic' or task='instance_friendly'."
-        )
-    detected_task = str(detection["task"])
-    if detected_task == "unsupported":
-        raise ValueError(str(detection.get("reason", "Unsupported annotation type")))
 
-    info = inspect_dataset(train_pairs + val_pairs, dimensions=dimensions)
-    spacing_cfg = train_config.spacing
-    dataset_plan = build_dataset_plan(
-        train_pairs + val_pairs,
-        dimensions,
-        default_spacing=spacing_cfg.default_spacing,
-        known_fraction_threshold=spacing_cfg.known_fraction_threshold,
-        target_spacing=spacing_cfg.target_spacing,
-        anisotropy_threshold=spacing_cfg.anisotropy_threshold,
-        max_upsampling=spacing_cfg.max_upsampling,
+    def emit_plan(event_type: str, **payload: Any) -> bool:
+        logger.info("%s: %s", event_type, payload.get("message", ""))
+        return callbacks.emit(event_type, **payload)
+
+    current_read_session().emit = emit_plan
+
+    active_training: dict[str, Any] = {}
+
+    def check_cancel() -> None:
+        if callbacks.cancel_requested():
+            if active_training:
+                raise TrainingStopped(
+                    _cancel_training(
+                        callbacks,
+                        output_dir,
+                        model,
+                        optimizer,
+                        lr_scheduler,
+                        active_training["epoch"],
+                        active_training["step"],
+                        detected_task,
+                        arch,
+                        model_config,
+                    )
+                )
+            raise PlanningCancelled()
+
+    geometry = resolve_training_geometry(
+        train_config,
+        architecture_probe,
+        inherited=source_model is not None,
+        device=device,
+        available_memory=_available_memory_bytes(device),
+        emit=emit_plan,
+        check_cancel=check_cancel,
     )
+    train_pairs, val_pairs = geometry.train, geometry.val
+    dimensions = geometry.architecture.dimensions
+    detected_task = geometry.task
+    info = geometry.info
+    dataset_plan = geometry.spacing
     case_spacings = {case.case: case.spacing for case in dataset_plan.cases}
     for case in dataset_plan.cases:
         write_json(
             output_dir / "resolved_spacings" / f"{case.case}.json",
             {"spacing": case.spacing, "source": case.source, "original_spacing": case.original_spacing},
         )
-    nonempty_train_pairs, empty_train_pairs = partition_empty_pairs(train_pairs, dimensions=dimensions)
-    _nonempty_val_pairs, empty_val_pairs = partition_empty_pairs(val_pairs, dimensions=dimensions)
-    if train_config.skip_empty_images:
-        train_pairs = nonempty_train_pairs
-    if not train_pairs or not nonempty_train_pairs:
-        raise DatasetError("All training masks are empty; at least one foreground annotation is required")
-    if empty_train_pairs:
-        action = "skipped" if train_config.skip_empty_images else "retained"
-        message = f"Empty training masks: {len(empty_train_pairs)} image(s) {action}."
-        logger.warning(message)
-        callbacks.emit("warning", message=message)
-    if empty_val_pairs:
-        message = f"Empty validation masks: {len(empty_val_pairs)} image(s) retained."
-        logger.warning(message)
-        callbacks.emit("warning", message=message)
-    source_input_channels = (
-        info.input_channels if train_config.input_channels == AUTO else int(train_config.input_channels)
-    )
-    resolved_context_slices = int(train_config.context_slices)
-    input_channels = source_input_channels * resolved_context_slices if dimensions == "2.5d" else source_input_channels
+    _nonempty_train_pairs, empty_train_pairs = partition_empty_pairs(train_pairs, dimensions)
+    _nonempty_val_pairs, empty_val_pairs = partition_empty_pairs(val_pairs, dimensions)
+    source_input_channels = info.input_channels
+    resolved_context_slices = geometry.architecture.context_slices
+    output_channels = geometry.architecture.output_channels
     label_values = [1] if detected_task == "binary_semantic" else info.label_values
-    output_channels = target_output_channels(detected_task, label_values)
-    if train_config.output_classes != AUTO and detected_task == "multiclass_semantic":
-        output_channels = int(train_config.output_classes)
-
-    deep_supervision = (
-        default_deep_supervision(train_config.architecture)
-        if train_config.deep_supervision == AUTO
-        else bool(train_config.deep_supervision)
-    )
-    planning_shape = info.image_shape[-2:] if dimensions == "2.5d" else info.image_shape
-    preferred_patch = default_patch_size(train_config.architecture)
-    batch_size = (
-        default_batch_size(train_config.architecture, device)
-        if train_config.batch_size == AUTO
-        else int(train_config.batch_size)
-    )
-    available_memory = _available_memory_bytes(device)
-    if train_config.patch_size == AUTO:
-        memory_plan = plan_patch_and_microbatch(
-            preferred_patch,
-            planning_shape,
-            architecture_probe.channels,
-            architecture_probe.encoder_blocks,
-            architecture_probe.reference_memory_gb,
-            min(batch_size, train_config.effective_batch_size),
-            effective_batch_size=train_config.effective_batch_size,
-            available_memory_bytes=available_memory,
-            memory_fraction=train_config.memory_fraction,
-            input_channels=input_channels,
-            deep_supervision=deep_supervision,
-        )
-        patch_size = memory_plan.resolved_patch
-        microbatch_size = memory_plan.resolved_microbatch
-    else:
-        patch_size = train_config.patch_size
-        microbatch_size = max(
-            value
-            for value in range(1, min(batch_size, train_config.effective_batch_size) + 1)
-            if train_config.effective_batch_size % value == 0
-        )
-        reference_bytes = architecture_probe.reference_memory_gb * (1024**3)
-        usable_bytes = min(reference_bytes, available_memory) if available_memory else reference_bytes
-        memory_plan = RuntimeMemoryPlan(
-            preferred_patch,
-            patch_size,
-            batch_size,
-            microbatch_size,
-            architecture_probe.reference_memory_gb,
-            available_memory / (1024**3) if available_memory is not None else None,
-            usable_bytes * train_config.memory_fraction / (1024**3),
-            ("user_patch_override",),
-        )
+    deep_supervision = geometry.architecture.deep_supervision
+    preferred_patch = geometry.memory.preferred_patch
+    memory_plan = geometry.memory
+    patch_size = memory_plan.resolved_patch
+    batch_size = memory_plan.microbatch_cap
+    microbatch_size = memory_plan.resolved_microbatch
     assert isinstance(patch_size, tuple)
     dataset_fingerprint = dataset_plan.to_dict()
     if detected_task in {"binary_semantic", "multiclass_semantic"}:
-        diagnostic_masks: list[np.ndarray] = []
-        for pair in train_pairs:
-            mask = load_mask(pair.mask, dimensions=dimensions)
-            if dimensions == "3d" and dataset_plan.target_spacing is not None:
-                dummy_image = np.zeros((1, *mask.shape), dtype=np.float32)
-                _image, mask = resample_image_mask(
-                    dummy_image, mask, case_spacings[pair.stem], dataset_plan.target_spacing
-                )
-            diagnostic_masks.append(mask)
+
+        def diagnostic_masks():
+            for pair in train_pairs:
+                check_cancel()
+                mask = load_domain_mask(pair, dimensions=dimensions)
+                if dimensions == "3d" and dataset_plan.target_spacing is not None:
+                    mask = resample_mask(mask, case_spacings[pair.stem], dataset_plan.target_spacing)
+                yield mask
+
         dataset_fingerprint["semantic_scale_diagnostics"] = semantic_scale_diagnostics(
-            diagnostic_masks,
+            diagnostic_masks(),
             dimensions=dimensions,
             patch_size=patch_size,
             label_values=label_values,
@@ -644,43 +708,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             (train_pairs, train_instance_sizes, training_scale_estimates, 0),
             (val_pairs, val_instance_sizes, validation_scale_estimates, 100_000),
         ):
-            for index, pair in enumerate(split_pairs_):
-                if dimensions == "3d":
-                    estimate, repair = estimate_3d_instance_size(
-                        load_mask(pair.mask, dimensions="3d"),
-                        case_spacings[pair.stem],
-                        max_instances=scale_cfg.max_instances_per_image,
-                        exclude_border=scale_cfg.exclude_border_instances,
-                        min_instance_voxels=scale_cfg.min_instance_area,
-                        seed=train_config.seed + seed_offset + index,
-                        measure=scale_cfg.object_size_measure,
-                    )
-                    repaired_instance_components += repair.repaired_components
-                elif dimensions == "2.5d":
-                    estimate, repair = estimate_volume_instance_size(
-                        load_mask(pair.mask, dimensions="2.5d"),
-                        max_instances=scale_cfg.max_instances_per_image,
-                        exclude_xy_border=scale_cfg.exclude_border_instances,
-                        min_instance_area=scale_cfg.min_instance_area,
-                        seed=train_config.seed + seed_offset + index,
-                        measure=scale_cfg.object_size_measure,
-                    )
-                    repaired_instance_components += repair.repaired_components
-                    if repair.repaired_components:
-                        logger.warning(
-                            "Canonicalized %s disconnected instance component(s) in %s",
-                            repair.repaired_components,
-                            pair.mask.name,
-                        )
-                else:
-                    estimate = estimate_instance_size(
-                        load_mask(pair.mask, dimensions="2d"),
-                        max_instances=scale_cfg.max_instances_per_image,
-                        exclude_border=scale_cfg.exclude_border_instances,
-                        min_instance_area=scale_cfg.min_instance_area,
-                        seed=train_config.seed + seed_offset + index,
-                        measure=scale_cfg.object_size_measure,
-                    )
+            for pair in split_pairs_:
+                check_cancel()
+                estimate, repairs = geometry.instance_estimates[(pair.stem, pair.region)]
+                repaired_instance_components += repairs
                 if estimate is not None:
                     destination[pair.stem] = estimate.median_diameter_px
                     estimates.append(estimate)
@@ -756,9 +787,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         else int(train_config.steps_per_epoch)
     )
     if source_model is not None:
-        backbone_learning_rate, adapted_learning_rate = resolve_finetune_learning_rates(
-            source_model.learning_rate
-        )
+        backbone_learning_rate, adapted_learning_rate = resolve_finetune_learning_rates(source_model.base_learning_rate)
         learning_rate = backbone_learning_rate
     else:
         learning_rate = (
@@ -768,6 +797,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         )
         backbone_learning_rate = learning_rate
         adapted_learning_rate = None
+    base_learning_rate = source_model.base_learning_rate if source_model is not None else learning_rate
     foreground_oversampling = (
         True if train_config.foreground_oversampling == AUTO else bool(train_config.foreground_oversampling)
     )
@@ -797,48 +827,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     )
     logger.info("loss_weights=%s target_sparsity=%s", effective_loss_weights, target_sparsity)
 
-    arch = (
-        target_architecture(
-            source_model,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            context_slices=resolved_context_slices,
-        )
-        if source_model is not None
-        else architecture_defaults(
-            train_config.architecture,
-            input_channels=input_channels,
-            output_channels=output_channels,
-            normalization=train_config.model_normalization,
-            deep_supervision=deep_supervision,
-        )
-    )
-    arch.context_slices = resolved_context_slices
-    if source_model is not None:
-        if arch.dimensions != dimensions:
-            raise ModelLoadError(
-                f"Source model dimensions {arch.dimensions} are incompatible with target dataset dimensions {dimensions}"
-            )
-    elif dimensions == "3d" and dataset_plan.target_spacing is not None:
-        kernels, strides = derive_stage_geometry(
-            patch_size,
-            dataset_plan.target_spacing,
-            arch.depth,
-            anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
-            minimum_feature_map=spacing_cfg.minimum_feature_map_size,
-        )
-        arch.kernels = kernels
-        arch.strides = strides
-    else:
-        kernels, strides = derive_stage_geometry(
-            patch_size,
-            (1.0, 1.0),
-            arch.depth,
-            anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
-            minimum_feature_map=spacing_cfg.minimum_feature_map_size,
-        )
-        arch.kernels = kernels
-        arch.strides = strides
+    arch = geometry.architecture
     model = build_unet(arch).to(device)
     finetune_report: FineTuneReport | None = None
     adapted_parameter_names: set[str] = set()
@@ -860,14 +849,8 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             finetune_report.reinitialized_tensors,
         )
 
-    resolved_context_policy = (
-        "adjacent"
-        if train_config.context.stride_policy == "nearest_physical" and not dataset_plan.context_spacing_reliable
-        else train_config.context.stride_policy
-    )
-    resolved_context_spacing = (
-        dataset_plan.context_spacing if train_config.context.spacing == AUTO else float(train_config.context.spacing)
-    )
+    resolved_context_policy = geometry.context_policy
+    resolved_context_spacing = geometry.context_spacing
     train_dataset = make_dataset(
         train_pairs,
         detected_task,
@@ -890,12 +873,14 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         case_spacings=case_spacings,
         target_spacing=dataset_plan.target_spacing,
         sample_count=steps_per_epoch * microbatch_size * accumulation_steps,
+        max_empty_plane_fraction=train_config.max_empty_plane_fraction,
     )
     train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
     train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
     train_dataset.augmentation.include_empty_patches_after_max_retries = (
-        train_config.include_empty_patches_after_max_retries
+        train_config.include_empty_patches_after_max_retries and not train_config.skip_empty_patches
     )
+    train_dataset.augmentation.max_padding_ratio = train_config.max_padding_ratio
     if instance_scale_enabled:
         train_dataset.augmentation.instance_scale_enabled = True
         train_dataset.augmentation.target_object_diameter_px = target_diameter
@@ -929,6 +914,48 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         val_dataset.augmentation.target_object_diameter_px = target_diameter
         val_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
         val_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
+    val_dataset.augmentation.max_padding_ratio = train_config.max_padding_ratio
+    train_dataset.set_epoch(1)
+    resolved_dataset_plan = geometry.to_dict()
+    resolved_dataset_plan.update(
+        padding_policy={
+            "max_padding_ratio_per_side": train_config.max_padding_ratio,
+            "spatial_validity": "real_support_only",
+            "infeasible_transform_fallback": "bounded_scale_clamp_or_identity_spatial_transform",
+        },
+        sampling_policy={
+            "unit": "eligible_planes" if dimensions in {"2d", "2.5d"} else "volume_patches",
+            "max_empty_plane_fraction": train_config.max_empty_plane_fraction,
+            "seed": train_config.seed,
+            "epoch_sample_budget": len(train_dataset),
+            "pool_size": train_dataset.pool_size,
+        },
+        epoch_sampling=train_dataset.sampling_summary,
+        training_instance_sizes=train_instance_sizes,
+        validation_instance_sizes=val_instance_sizes,
+    )
+    write_json(output_dir / "dataset_plan.json", resolved_dataset_plan)
+    callbacks.emit(
+        "dataset_summary",
+        message=f"{dimensions} training: using {len(train_pairs)} training sources, {len(val_pairs)} validation domains, and {train_dataset.pool_size} eligible training entries.",
+        training_source_count=len(train_pairs),
+        validation_source_count=len(val_pairs),
+        pool_size=train_dataset.pool_size,
+        epoch_sample_budget=len(train_dataset),
+        dataset_plan_path=str(output_dir / "dataset_plan.json"),
+        source_counts={
+            split: {
+                kind: sum(
+                    record.get("source_kind") == kind and record.get("requested_split") == split
+                    for record in geometry.records
+                )
+                for kind in ("image_2d", "singleton_stack", "volume")
+            }
+            for split in ("train", "val")
+        },
+        validation_pool_size=len(val_dataset),
+        light_validation_sample_budget=min(len(val_dataset), train_config.validation.light_steps * microbatch_size),
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=microbatch_size,
@@ -996,6 +1023,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "effective_batch_size": resolved_effective_batch,
             "steps_per_epoch": steps_per_epoch,
             "learning_rate": learning_rate,
+            "base_learning_rate": base_learning_rate,
+            "learning_rate_provenance": source_model.learning_rate_provenance
+            if source_model
+            else "scratch_initial_learning_rate",
             "starting_point": "fine_tune" if source_model is not None else "scratch",
             "source_model": str(source_model.requested_path) if source_model is not None else None,
             "source_checkpoint": str(source_model.checkpoint_path) if source_model is not None else None,
@@ -1020,6 +1051,24 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             "effective_loss_weights": effective_loss_weights,
             "target_sparsity": target_sparsity,
             "lr_scheduler": lr_scheduler.config_dict(),
+            "task": detected_task,
+            "axes": model_config["input_axes"],
+            "device": str(device),
+            "input_channels": source_input_channels,
+            "output_classes": output_channels,
+            "context_slices": resolved_context_slices if dimensions == "2.5d" else None,
+            "context": {
+                "stride_policy": resolved_context_policy,
+                "stride": train_config.context.stride,
+                "spacing": resolved_context_spacing,
+            },
+            "spacing": {**asdict(train_config.spacing), "target_spacing": dataset_plan.target_spacing},
+            "progress_update_interval": progress_update_interval,
+            "log_update_interval": log_update_interval,
+            "augmentation": asdict(train_dataset.augmentation),
+            "instance_scale_normalization": {**asdict(scale_cfg), "enabled": instance_scale_enabled},
+            "target_object_size": target_diameter if instance_scale_enabled else None,
+            "dataset_plan_path": str(output_dir / "dataset_plan.json"),
         }
     )
     write_json(output_dir / "config.json", model_config)
@@ -1027,6 +1076,9 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "format_version": 1,
         "architecture": arch.name,
         "preset_reference_memory_gb": arch.reference_memory_gb,
+        "base_learning_rate": base_learning_rate,
+        "source_learning_rate": source_model.learning_rate if source_model else None,
+        "backbone_learning_rate": backbone_learning_rate,
         "output_channels": (
             ["foreground", "boundary", "distance"] if detected_task == "instance_friendly" else ["logits"]
         ),
@@ -1070,6 +1122,14 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         output_adaptation=finetune_report.output_adaptation if finetune_report is not None else None,
         source_learning_rate=source_model.learning_rate if source_model is not None else None,
         backbone_learning_rate=backbone_learning_rate,
+        base_learning_rate=base_learning_rate,
+        learning_rate_provenance=source_model.learning_rate_provenance
+        if source_model
+        else "scratch_initial_learning_rate",
+        dataset_plan_path=str(output_dir / "dataset_plan.json"),
+        config_path=str(output_dir / "config.json"),
+        max_padding_ratio=train_config.max_padding_ratio,
+        max_empty_plane_fraction=train_config.max_empty_plane_fraction,
         adapted_layers_learning_rate=(
             finetune_report.adapted_layers_learning_rate if finetune_report is not None else None
         ),
@@ -1094,6 +1154,13 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
     global_step = 0
     latest_preview_path: str | None = None
     for epoch in range(1, train_config.epochs + 1):
+        active_training.update(epoch=epoch, step=global_step)
+        check_cancel()
+        train_dataset.set_epoch(epoch)
+        write_json(
+            output_dir / "sampling" / f"epoch_{epoch:04d}.json",
+            {"epoch": epoch, "sources": train_dataset.sampling_summary},
+        )
         model.train()
         train_losses: list[dict[str, float]] = []
         optimizer.zero_grad(set_to_none=True)
@@ -1133,6 +1200,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            active_training["step"] = global_step
             lr_scheduler.step_batch()
             if global_step % log_update_interval == 0:
                 logger.info("step=%s/%s epoch=%s train=%s", global_step, total_steps, epoch, component_floats)
@@ -1215,6 +1283,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 target_spacing=dataset_plan.target_spacing,
                 instance_sizes=val_instance_sizes,
                 target_object_size=target_diameter if instance_scale_enabled else None,
+                label_values=label_values,
+                min_scale=scale_cfg.min_effective_scale,
+                max_scale=scale_cfg.max_effective_scale,
+                check_cancel=check_cancel,
             )
             epoch_record["full_validation"] = full_metrics
             score = float(full_metrics["mean_dice"])
@@ -1290,7 +1362,10 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
                 epoch_record,
                 model_config,
             )
-        write_json(output_dir / "metrics.json", {"history": history, "best_score": best_score})
+        write_json(
+            output_dir / "metrics.json",
+            {"history": history, "best_score": best_score if math.isfinite(best_score) else None},
+        )
         preview_event = _save_previews(
             output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count
         )
@@ -1328,6 +1403,7 @@ def train(config: dict[str, Any], task: Any = None) -> dict[str, Any]:
         "dataset_statistics_path": str(output_dir / "dataset_statistics.json") if instance_scale_enabled else None,
         "dataset_fingerprint_path": str(output_dir / "dataset_fingerprint.json"),
         "model_metadata_path": str(output_dir / "model_metadata.json"),
+        "dataset_plan_path": str(output_dir / "dataset_plan.json"),
         "latest_preview_path": latest_preview_path,
         "config": model_config,
     }

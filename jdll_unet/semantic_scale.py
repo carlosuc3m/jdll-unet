@@ -60,7 +60,7 @@ def semantic_scale_diagnostics(
 
     for mask in masks:
         cases += 1
-        planes = mask if dimensions == "2.5d" else (mask,)
+        planes = mask if dimensions in {"2d", "2.5d"} and mask.ndim == 3 else (mask,)
         for plane in planes:
             for key in keys:
                 binary = plane > 0 if key == "foreground" else plane == key

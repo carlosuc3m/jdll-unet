@@ -261,7 +261,7 @@ def _write_source_model(
         output_channels=output_channels,
     )
     model = build_unet(architecture)
-    training = {"learning_rate": learning_rate} if learning_rate is not None else {}
+    training = {"learning_rate": learning_rate, "starting_point": "scratch"} if learning_rate is not None else {}
     config = {
         "format": "jdll-unet",
         "format_version": 1,

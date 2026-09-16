@@ -11,7 +11,8 @@ import numpy as np
 
 from .config import architecture_defaults
 from .errors import TaskDetectionError
-from .io import ImageMaskPair, discover_dataset, load_mask, read_class_names
+from .geometry import load_domain_mask
+from .io import ImageMaskPair, discover_dataset, read_class_names
 
 try:  # pragma: no cover - fallback exists for minimal environments
     from scipy import ndimage as ndi
@@ -132,7 +133,7 @@ def detect_task_from_pairs(
             "reason": "Point annotations require a detection workflow rather than this UNet backend.",
         }
 
-    stats = [mask_statistics(load_mask(pair.mask, dimensions=dimensions), str(pair.mask)) for pair in pairs]
+    stats = [mask_statistics(load_domain_mask(pair, dimensions=dimensions), str(pair.mask)) for pair in pairs]
     label_sets = _all_label_sets(stats)
     all_labels = sorted(set().union(*label_sets)) if label_sets else []
     non_empty_label_sets = [labels for labels in label_sets if labels]

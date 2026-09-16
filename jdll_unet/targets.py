@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .errors import DatasetError
+
 try:  # pragma: no cover
     from scipy import ndimage as ndi
 except Exception:  # pragma: no cover
@@ -41,7 +43,7 @@ def multiclass_target(mask: np.ndarray, label_values: list[int] | None = None) -
     return out
 
 
-def boundary_target(mask: np.ndarray, width: int = 1) -> np.ndarray:
+def boundary_target(mask: np.ndarray, width: int = 1, validity: np.ndarray | None = None) -> np.ndarray:
     """Mixed boundary: outside ring, two-sided ID interfaces, and object voxels at array edges."""
 
     labels = mask.astype(np.int64, copy=False)
@@ -54,6 +56,8 @@ def boundary_target(mask: np.ndarray, width: int = 1) -> np.ndarray:
         left = labels[tuple(before)]
         right = labels[tuple(after)]
         differences = left != right
+        if validity is not None:
+            differences &= validity[tuple(before)] & validity[tuple(after)]
         both_objects = differences & (left != 0) & (right != 0)
         left_object = differences & (left != 0) & (right == 0)
         right_object = differences & (left == 0) & (right != 0)
@@ -64,16 +68,21 @@ def boundary_target(mask: np.ndarray, width: int = 1) -> np.ndarray:
         last: list[slice | int] = [slice(None)] * labels.ndim
         first[axis] = 0
         last[axis] = -1
-        boundary[tuple(first)] |= labels[tuple(first)] != 0
-        boundary[tuple(last)] |= labels[tuple(last)] != 0
+        boundary[tuple(first)] |= (labels[tuple(first)] != 0) & (
+            validity[tuple(first)] if validity is not None else True
+        )
+        boundary[tuple(last)] |= (labels[tuple(last)] != 0) & (validity[tuple(last)] if validity is not None else True)
     if width > 1 and ndi is not None:
         boundary = ndi.binary_dilation(boundary, iterations=int(width) - 1)
+    if validity is not None:
+        boundary &= validity
     return boundary.astype(np.float32)[None, ...]
 
 
 def normalized_instance_distance(
     mask: np.ndarray,
     spacing: tuple[float, ...] | None = None,
+    validity: np.ndarray | None = None,
 ) -> np.ndarray:
     target = np.zeros(mask.shape, dtype=np.float32)
     if ndi is None:
@@ -83,7 +92,7 @@ def normalized_instance_distance(
             continue
         instance = mask == instance_id
         distance = ndi.distance_transform_edt(instance, sampling=spacing).astype(np.float32)
-        maximum = float(distance.max())
+        maximum = float(distance[validity].max()) if validity is not None else float(distance.max())
         if maximum > 0:
             target[instance] = distance[instance] / maximum
     return target[None, ...]
@@ -93,12 +102,18 @@ def instance_targets(
     mask: np.ndarray,
     boundary_width: int = 1,
     spacing: tuple[float, ...] | None = None,
+    validity: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     mask = canonical_instance_labels(mask)
+    distance_mask = mask
+    if validity is not None and not np.all(validity) and ndi is not None:
+        # Unknown padded support must not introduce an object/background interface.
+        nearest = ndi.distance_transform_edt(~validity, return_distances=False, return_indices=True)
+        distance_mask = mask[tuple(nearest)]
     return {
         "foreground": binary_target(mask),
-        "boundary": boundary_target(mask, width=boundary_width),
-        "distance": normalized_instance_distance(mask, spacing=spacing),
+        "boundary": boundary_target(mask, width=boundary_width, validity=validity),
+        "distance": normalized_instance_distance(distance_mask, spacing=spacing, validity=validity),
         "instances": mask.astype(np.int64, copy=False)[None, ...],
     }
 
@@ -109,7 +124,20 @@ def prepare_target(
     label_values: list[int] | None = None,
     boundary_width: int = 1,
     spacing: tuple[float, ...] | None = None,
+    validity: np.ndarray | None = None,
 ) -> np.ndarray | dict[str, np.ndarray]:
+    if validity is not None:
+        if validity.shape != mask.shape or not np.any(validity):
+            raise DatasetError("Target requires nonempty real support matching its spatial shape")
+        mask = np.where(validity, mask, 0)
+        if task == "instance_friendly":
+            result = instance_targets(mask, boundary_width=boundary_width, spacing=spacing, validity=validity)
+        else:
+            semantic = prepare_target(task, mask, label_values, boundary_width, spacing)
+            assert isinstance(semantic, np.ndarray)
+            result = {"semantic": semantic}
+        result["valid"] = np.ascontiguousarray(validity[None], dtype=bool)
+        return result
     if task == "binary_semantic":
         return binary_target(mask)
     if task == "multiclass_semantic":

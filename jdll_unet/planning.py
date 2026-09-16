@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-import tifffile
 from scipy import ndimage as ndi
 
 from .errors import ConfigError, DataFormatError
+from .image_reading import current_read_session
 from .io import ImageMaskPair
 
 
@@ -83,10 +83,10 @@ def _sidecar_spacing(path: Path) -> tuple[float, float, float] | None:
 
 
 def _ome_spacing(path: Path) -> tuple[float, float, float] | None:
-    if path.suffix.lower() not in {".tif", ".tiff"}:
-        return None
-    try:
-        with tifffile.TiffFile(path) as tif:
+    def read(tif: Any, file_format: str) -> tuple[float, float, float] | None:
+        if file_format != "TIFF":
+            return None
+        try:
             metadata = tif.ome_metadata
             imagej = tif.imagej_metadata or {}
             if metadata:
@@ -102,17 +102,19 @@ def _ome_spacing(path: Path) -> tuple[float, float, float] | None:
             if "spacing" in imagej:
                 z = float(imagej["spacing"])
                 page = tif.pages[0]
-                xres = page.tags.get("XResolution")  # type: ignore[union-attr]
-                yres = page.tags.get("YResolution")  # type: ignore[union-attr]
+                xres = page.tags.get("XResolution")
+                yres = page.tags.get("YResolution")
                 if xres and yres:
                     xv = xres.value
                     yv = yres.value
                     x_size = float(xv[1]) / float(xv[0])
                     y_size = float(yv[1]) / float(yv[0])
                     return _positive_spacing((z, y_size, x_size))
-    except (OSError, ValueError, ET.ParseError, tifffile.TiffFileError):
+        except (ValueError, ET.ParseError):
+            return None
         return None
-    return None
+
+    return current_read_session().read(path, read, pixels=False)
 
 
 def read_spacing(path: Path) -> tuple[tuple[float, float, float] | None, str]:
@@ -134,6 +136,7 @@ def build_dataset_plan(
     target_spacing: str | tuple[float, float, float] = "auto",
     anisotropy_threshold: float = 3.0,
     max_upsampling: float = 3.0,
+    validation_pairs: list[ImageMaskPair] | None = None,
 ) -> DatasetPlan:
     if dimensions == "2d":
         return DatasetPlan(dimensions, (), 0.0, default_spacing, None, anisotropy_threshold, None, None, False)
@@ -168,6 +171,12 @@ def build_dataset_plan(
         anisotropic_axis = int(np.argmax(target)) if float(target.max() / target.min()) >= anisotropy_threshold else None
     context_reliable = known_fraction >= known_fraction_threshold
     context_spacing = float(np.median(resolved[:, 0])) if context_reliable else None
+    if validation_pairs:
+        cases += tuple(
+            CaseSpacing(pair.stem, spacing or fill, source if spacing is not None else missing_source, spacing)
+            for pair in validation_pairs
+            for spacing, source in [read_spacing(pair.image)]
+        )
     return DatasetPlan(
         dimensions,
         cases,
@@ -179,6 +188,48 @@ def build_dataset_plan(
         context_spacing,
         context_reliable,
     )
+
+
+def validate_network_shape(architecture: Any, patch: tuple[int, ...], microbatch: int) -> dict[str, Any]:
+    """Validate the actual forward/normalization path without allocating activations."""
+    import torch
+
+    from .model import build_unet
+
+    ndim = 3 if architecture.dimensions == "3d" else 2
+    depth = architecture.depth
+    strides = architecture.strides or ((2,) * ndim,) * (depth - 1)
+    kernels = architecture.kernels or ((3,) * ndim,) * depth
+    channels = architecture.channels or tuple(architecture.base_channels * 2**level for level in range(depth))
+    if len(patch) != ndim or len(strides) != depth - 1 or len(kernels) != depth or len(channels) != depth:
+        raise ConfigError(
+            "Architecture patch, channels, kernels and strides must agree with its actual depth/dimensions"
+        )
+    if any(len(s) != ndim or any(v < 1 for v in s) for s in strides):
+        raise ConfigError("Architecture strides must contain positive per-axis integers")
+    if any(len(k) != ndim or any(v < 1 or v % 2 == 0 for v in k) for k in kernels):
+        raise ConfigError("This UNet requires positive odd spatial kernels")
+    minimum = tuple(int(v) for v in np.prod(np.asarray(strides, dtype=int), axis=0)) if strides else (1,) * ndim
+    if any(p < length for p, length in zip(patch, minimum, strict=True)):
+        raise ConfigError(f"Patch {patch} is smaller than network minimum {minimum} from strides {strides}")
+    try:
+        with torch.device("meta"):
+            model = build_unet(architecture)
+            model.train()
+            model(torch.empty((microbatch, architecture.input_channels, *patch)))
+            model.eval()
+            model(torch.empty((1, architecture.input_channels, *patch)))
+    except (ValueError, RuntimeError) as exc:
+        raise ConfigError(
+            f"Patch {patch} is incompatible with the source network forward/normalization path: {exc}"
+        ) from exc
+    return {
+        "cumulative_downsampling": minimum,
+        "minimum_axis_lengths": minimum,
+        "normalization": architecture.normalization,
+        "validated_patch": patch,
+        "divisibility_required": False,
+    }
 
 
 def resolve_context_stride(policy: str, *, fixed_stride: int, target_spacing: float | None, z_spacing: float) -> int:
@@ -237,9 +288,16 @@ def resample_image_mask(
     factors = np.asarray(source_spacing) / np.asarray(target_spacing)
     if np.allclose(factors, 1.0):
         return image, mask
+    factors = np.maximum(1, np.rint(np.asarray(mask.shape) * factors)) / np.asarray(mask.shape)
     resampled_image = np.stack([ndi.zoom(channel, factors, order=1, mode="nearest", prefilter=False) for channel in image])
     resampled_mask = ndi.zoom(mask, factors, order=0, mode="nearest", prefilter=False)
     return np.ascontiguousarray(resampled_image.astype(np.float32)), np.ascontiguousarray(resampled_mask.astype(mask.dtype))
+
+
+def resample_mask(mask: np.ndarray, source_spacing: tuple[float, ...], target_spacing: tuple[float, ...]) -> np.ndarray:
+    shape = np.asarray(mask.shape)
+    factors = np.maximum(1, np.rint(shape * np.asarray(source_spacing) / np.asarray(target_spacing))) / shape
+    return ndi.zoom(mask, factors, order=0, mode="nearest", prefilter=False)
 
 
 def restore_continuous_maps(

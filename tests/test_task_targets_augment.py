@@ -231,7 +231,8 @@ def test_training_dataset_moves_to_next_image_after_empty_patch(tmp_path: Path):
     )
 
     _, target = dataset[0]
-    assert target.sum().item() == 64
+    assert target["semantic"].sum().item() == 64
+    assert target["valid"].all()
 
 
 def test_validation_keeps_empty_patch(tmp_path: Path):
@@ -253,7 +254,8 @@ def test_validation_keeps_empty_patch(tmp_path: Path):
     )
 
     _, target = dataset[0]
-    assert target.sum().item() == 0
+    assert target["semantic"].sum().item() == 0
+    assert target["valid"].all()
 
 
 def test_training_fails_clearly_when_all_masks_are_empty(tmp_path: Path):
