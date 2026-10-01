@@ -1,0 +1,70 @@
+{
+  "case": "Blast_099",
+  "python": "/home/carlos/micromamba/envs/ofm/bin/python",
+  "load_average": [
+    32.8115234375,
+    40.25537109375,
+    40.34033203125
+  ],
+  "available_ram_gib": 7.210205078125,
+  "extra_address_space_gib": 4.0,
+  "stages": {
+    "inspection": {
+      "seconds": 1.4696384679991752,
+      "rss_mib_after": 896.84765625,
+      "included_analysis_seconds": 0.7498305069748312,
+      "analysis_calls": 1
+    },
+    "task_detection": {
+      "seconds": 6.475302116945386,
+      "rss_mib_after": 893.4765625,
+      "included_analysis_seconds": 0.0,
+      "analysis_calls": 0
+    },
+    "instance_preparation_reuse": {
+      "seconds": 5.144299939274788e-05,
+      "rss_mib_after": 893.4765625,
+      "included_analysis_seconds": 0.0,
+      "analysis_calls": 0
+    },
+    "spacing_plan": {
+      "seconds": 0.004454438923858106,
+      "rss_mib_after": 893.8515625,
+      "included_analysis_seconds": 0.0,
+      "analysis_calls": 0
+    },
+    "instance_size_estimation": {
+      "seconds": 0.0006786930607631803,
+      "rss_mib_after": 894.01953125,
+      "included_analysis_seconds": 0.0,
+      "analysis_calls": 0
+    },
+    "legacy_size_estimation": {
+      "seconds": 45.56489456805866,
+      "rss_mib_after": 896.59765625,
+      "included_analysis_seconds": 0.0,
+      "analysis_calls": 0
+    }
+  },
+  "status": "complete",
+  "statistics_calls": 1,
+  "shape": [
+    101,
+    960,
+    962
+  ],
+  "data_cache_mib": 512.0,
+  "label_count": 75,
+  "task": "instance_friendly",
+  "estimate": {
+    "median_diameter": 12.575077005561086,
+    "sampled_instances": 21,
+    "available_instances": 75
+  },
+  "legacy_estimate": {
+    "original_labels": 75,
+    "sampled_instances": 21,
+    "median_diameter": 12.575077005561086
+  },
+  "peak_rss_mib": 2493.234375
+}

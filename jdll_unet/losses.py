@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -13,19 +14,59 @@ Logits = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 Target = torch.Tensor | dict[str, torch.Tensor]
 
 
-def valid_support(target: Target, logits: torch.Tensor) -> torch.Tensor | None:
+def valid_support(target: Target, logits: torch.Tensor, *, check_values: bool = True) -> torch.Tensor | None:
     valid = target.get("valid") if isinstance(target, dict) else None
     if valid is not None:
-        if valid.shape != logits[:, :1].shape or not torch.all(valid.flatten(1).any(1)):
-            raise DatasetError(
-                "Every target requires nonempty real support with matching shape, including auxiliary heads"
-            )
+        if valid.shape != logits[:, :1].shape:
+            raise DatasetError("Target validity shape does not match logits")
+        if check_values and not valid.flatten(1).any(1).all():
+            raise DatasetError("Every target requires nonempty real support, including auxiliary heads")
         valid = valid.bool()
     return valid
 
 
+def _resize_validity(valid: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
+    pool: Any = F.adaptive_avg_pool3d if valid.ndim == 5 else F.adaptive_avg_pool2d
+    return pool(valid.float(), size) >= 1 - 1e-6
+
+
+def _validate_loss_support(target: Target, logits: Logits, cpu_validity: torch.Tensor | None) -> None:
+    valid = target.get("valid") if isinstance(target, dict) else None
+    if valid is None:
+        if cpu_validity is not None:
+            raise DatasetError("CPU validity requires a matching target validity mask")
+        return
+    heads = list(logits) if isinstance(logits, (list, tuple)) else [logits]
+    if valid.shape != heads[0][:, :1].shape:
+        raise DatasetError("Target validity shape does not match logits")
+    if cpu_validity is not None:
+        if cpu_validity.device.type != "cpu" or cpu_validity.shape != valid.shape:
+            raise DatasetError("CPU validity must be the original CPU mask with matching shape")
+        valid = cpu_validity
+    # Head shapes are host metadata. Check their exact pooled support using the
+    # original CPU mask, avoiding GPU scalar reads in the training loss path.
+    sizes = {tuple(head.shape[2:]) for head in heads[1:]}
+    if valid.device.type == "cpu":
+        for head_support in [valid, *(_resize_validity(valid, size) for size in sizes)]:
+            host_support = head_support.detach()
+            array = (host_support.float() if host_support.dtype == torch.bfloat16 else host_support).numpy()
+            if not np.any(array.reshape(array.shape[0], -1), axis=1).all():
+                raise DatasetError("Every target requires nonempty real support, including auxiliary heads")
+        return
+    support = [valid.flatten(1).any(1)]
+    for size in sizes:
+        support.append(_resize_validity(valid, size).flatten(1).any(1))
+    if not torch.stack(support).all():
+        raise DatasetError("Every target requires nonempty real support, including auxiliary heads")
+
+
 def masked_mean(value: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
-    return value.mean() if valid is None else value.masked_select(valid.expand_as(value)).mean()
+    if valid is None:
+        return value.mean()
+    support = valid.expand_as(value)
+    masked = torch.where(support, value, torch.zeros_like(value))
+    dtype = torch.float32 if value.dtype in {torch.float16, torch.bfloat16} else value.dtype
+    return masked.sum(dtype=dtype) / support.sum().clamp_min(1).to(dtype=dtype)
 
 
 def primary_logits(logits: Logits) -> torch.Tensor:
@@ -42,7 +83,7 @@ def binary_dice_loss(
         target = target * valid
     dims = tuple(range(1, probs.ndim))
     intersection = (probs * target).sum(dim=dims)
-    denom = probs.sum(dim=dims) + target.sum(dim=dims)
+    denom = probs.sum(dim=dims, dtype=torch.float32) + target.sum(dim=dims)
     dice = (2 * intersection + eps) / (denom + eps)
     return 1.0 - dice.mean()
 
@@ -58,7 +99,7 @@ def multiclass_dice_loss(
         one_hot = one_hot * valid
     dims = (0, *range(2, probs.ndim))
     intersection = (probs * one_hot).sum(dim=dims)
-    denom = probs.sum(dim=dims) + one_hot.sum(dim=dims)
+    denom = probs.sum(dim=dims, dtype=torch.float32) + one_hot.sum(dim=dims)
     dice = (2 * intersection + eps) / (denom + eps)
     if classes > 1:
         dice = dice[1:]
@@ -107,7 +148,11 @@ def compute_loss(
     weights: dict[str, float] | None = None,
     focal_gamma: float = 2.0,
     focal_alpha: float | None = None,
+    *,
+    cpu_validity: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute losses; training may supply the original CPU validity mask to avoid GPU scalar reads."""
+    _validate_loss_support(target, logits, cpu_validity)
     if isinstance(logits, (list, tuple)):
         primary_loss, components = _compute_single_loss(task, logits[0], target, weights, focal_gamma, focal_alpha)
         aux_losses = []
@@ -133,8 +178,7 @@ def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) ->
         result = {}
         for key, value in target.items():
             if key == "valid":
-                pool: Any = F.adaptive_avg_pool3d if value.ndim == 5 else F.adaptive_avg_pool2d
-                result[key] = pool(value.float(), size) >= 1 - 1e-6
+                result[key] = _resize_validity(value, tuple(size))
             elif key == "semantic":
                 semantic = resize_target_for_logits(task, value, logits)
                 assert isinstance(semantic, torch.Tensor)
@@ -172,7 +216,9 @@ def _compute_single_loss(
     focal_alpha: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     weights = weights or {}
-    valid = valid_support(target, logits)
+    # Probability transforms and reductions need FP32 even when convolutions use AMP.
+    logits = logits.float()
+    valid = valid_support(target, logits, check_values=False)
     if task != "instance_friendly" and isinstance(target, dict):
         target = target["semantic"]
     if task == "binary_semantic":
@@ -217,17 +263,16 @@ def _compute_single_loss(
             if valid is not None:
                 foreground_pixels &= valid
             predicted_distance = torch.sigmoid(distance_logits)
-            distance_loss = (
-                F.smooth_l1_loss(predicted_distance[foreground_pixels], distance_target[foreground_pixels], beta=0.1)
-                if torch.any(foreground_pixels)
-                else predicted_distance.sum() * 0.0
+            distance_error = F.smooth_l1_loss(predicted_distance, distance_target, beta=0.1, reduction="none")
+            distance_loss = masked_mean(distance_error, foreground_pixels)
+
+            background_pixels = foreground <= 0.5
+            if valid is not None:
+                background_pixels &= valid
+            background_error = F.smooth_l1_loss(
+                predicted_distance, torch.zeros_like(predicted_distance), beta=0.1, reduction="none"
             )
-            background_pixels = (foreground <= 0.5) & (valid if valid is not None else True)
-            distance_background = (
-                F.smooth_l1_loss(predicted_distance[background_pixels], torch.zeros_like(predicted_distance[background_pixels]), beta=0.1)
-                if torch.any(background_pixels)
-                else predicted_distance.sum() * 0.0
-            )
+            distance_background = masked_mean(background_error, background_pixels)
         else:
             distance_loss = logits.sum() * 0.0
             distance_background = logits.sum() * 0.0

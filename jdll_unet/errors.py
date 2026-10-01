@@ -25,6 +25,10 @@ class ModelLoadError(ValueError, JdllUnetError):
     """Raised when a model folder or checkpoint cannot be loaded safely."""
 
 
+class TrainingError(RuntimeError, JdllUnetError):
+    """Raised when training cannot safely apply an update or report results."""
+
+
 class InferenceError(ValueError, JdllUnetError):
     """Raised when inference inputs or options are invalid."""
 

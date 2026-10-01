@@ -54,7 +54,7 @@ class LearningRateScheduler:
     def config_dict(self) -> dict[str, Any]:
         payload = asdict(self.config)
         payload["type"] = self.type
-        payload["step_scope"] = "epoch" if self.type in {"poly", "plateau"} else "batch"
+        payload["step_scope"] = self.config.step_scope
         return payload
 
     def state_dict(self) -> dict[str, Any]:
@@ -71,6 +71,29 @@ class LearningRateScheduler:
             "bad_epochs": self.bad_epochs,
             "config": self.config_dict(),
         }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore progress without restarting or changing the schedule."""
+        for key, expected in (
+            ("type", self.type), ("config", self.config_dict()),
+            ("total_steps", self.total_steps), ("total_epochs", self.total_epochs),
+            ("base_lrs", self.base_lrs), ("min_lrs", self.min_lrs),
+        ):
+            if state.get(key) != expected:
+                raise ConfigError(f"Cannot resume: scheduler {key} differs from the checkpoint")
+        rates = state["current_lrs"]
+        if len(rates) != len(self.optimizer.param_groups) or any(
+            not math.isfinite(lr) or lr < 0 for lr in rates
+        ):
+            raise ConfigError("Cannot resume: invalid checkpoint learning rates")
+        for key in ("step_count", "epoch_count", "bad_epochs"):
+            if not isinstance(state.get(key), int) or state[key] < 0:
+                raise ConfigError(f"Cannot resume: invalid scheduler {key}")
+        self.step_count = state["step_count"]
+        self.epoch_count = state["epoch_count"]
+        self.best_score = state["best_score"]
+        self.bad_epochs = state["bad_epochs"]
+        self._set_lrs(rates)
 
     def step_batch(self) -> None:
         self.step_count += 1

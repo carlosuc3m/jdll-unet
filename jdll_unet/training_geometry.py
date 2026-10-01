@@ -9,28 +9,34 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from .annotations import AnnotationPreparation
 from .config import (
     AUTO,
     ArchitectureConfig,
     TrainingConfig,
     default_batch_size,
     default_deep_supervision,
+    default_effective_batch_size,
     default_patch_size,
 )
 from .dataset import DatasetInfo, inspect_dataset
 from .errors import DatasetError
 from .geometry import (
+    DomainReader,
     assert_disjoint,
     case_record,
     eligible_centers,
     inspect_sources,
     load_domain_mask,
     padding_extents,
+    resolve_data_cache_bytes,
     spatial_holdout,
     split_sources,
     stable_seed,
 )
+from .image_reading import current_read_session
 from .io import ImageMaskPair, discover_dataset, read_class_labels
+from .label_statistics import analyze_mask
 from .planning import (
     DatasetPlan,
     RuntimeMemoryPlan,
@@ -43,9 +49,7 @@ from .planning import (
 )
 from .scale import (
     InstanceSizeEstimate,
-    estimate_3d_instance_size,
-    estimate_instance_size,
-    estimate_volume_instance_size,
+    estimate_from_analysis,
 )
 from .targets import target_output_channels
 from .task_detect import detect_task_from_pairs
@@ -66,6 +70,7 @@ class TrainingGeometry:
     network_shape: dict[str, Any]
     instance_estimates: dict[tuple[str, tuple], tuple[InstanceSizeEstimate | None, int]]
     case_sampling: list[dict[str, Any]]
+    annotation_diagnostics: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +83,7 @@ class TrainingGeometry:
             "sources": self.records,
             "training_domains": [case_record(pair) for pair in self.train],
             "validation_domains": [case_record(pair) for pair in self.val],
+            "annotation_preparation": self.annotation_diagnostics,
         }
 
 
@@ -85,36 +91,21 @@ def measure_case_instances(
     pair: ImageMaskPair, cfg: TrainingConfig, dimensions: str, spacing: tuple[float, float, float]
 ) -> tuple[InstanceSizeEstimate | None, int]:
     options = cfg.instance_scale_normalization
-    mask = load_domain_mask(pair, dimensions)
-    seed = stable_seed(cfg.seed, 0, str(pair.image.resolve()) + str(pair.region))
-    kwargs: dict[str, Any] = {
-        "max_instances": options.max_instances_per_image,
-        "seed": seed,
-        "measure": options.object_size_measure,
-    }
-    repairs = 0
-    if dimensions == "3d":
-        estimate, repair = estimate_3d_instance_size(
-            mask,
-            spacing,
-            exclude_border=options.exclude_border_instances,
-            min_instance_voxels=options.min_instance_area,
-            **kwargs,
-        )
-        repairs = repair.repaired_components
-    elif mask.ndim == 3:
-        estimate, repair = estimate_volume_instance_size(
-            mask,
-            exclude_xy_border=options.exclude_border_instances,
-            min_instance_area=options.min_instance_area,
-            **kwargs,
-        )
-        repairs = repair.repaired_components
+    preparation = current_read_session().annotations
+    mask = None
+    if preparation is not None:
+        analysis = preparation.statistics(pair, dimensions)
     else:
-        estimate = estimate_instance_size(
-            mask, exclude_border=options.exclude_border_instances, min_instance_area=options.min_instance_area, **kwargs
-        )
-    return estimate, repairs
+        mask = load_domain_mask(pair, dimensions, raw=True)
+        analysis = analyze_mask(mask, pair.mask)
+    if options.object_size_measure == "principal_axes" and mask is None:
+        mask = load_domain_mask(pair, dimensions, raw=True)
+    seed = stable_seed(cfg.seed, 0, str(pair.image.resolve()) + str(pair.region))
+    return estimate_from_analysis(
+        analysis, mask=mask, volume_xy=len(analysis.shape) == 3 and dimensions != "3d", spacing=spacing,
+        max_instances=options.max_instances_per_image, seed=seed, measure=options.object_size_measure,
+        exclude_border=options.exclude_border_instances, min_size=options.min_instance_area,
+    ), 0
 
 
 def resolve_training_geometry(
@@ -127,6 +118,14 @@ def resolve_training_geometry(
     emit: Callable[..., Any],
     check_cancel: Callable[[], None],
 ) -> TrainingGeometry:
+    session = current_read_session()
+    session.domain_reader = DomainReader(max_bytes=resolve_data_cache_bytes(cfg.data_cache_mb), session=session)
+    if session.annotations is not None:
+        session.annotations.close()
+    preparation = AnnotationPreparation(
+        cfg.annotation_preparation, emit=emit, cache_dir=cfg.output_dir / ".annotation_cache"
+    )
+    session.annotations = preparation
     discovered = discover_dataset(cfg.dataset_path)
     dimensions = source_arch.dimensions
     train, train_records = inspect_sources(discovered.train, dimensions, emit, check_cancel)
@@ -174,6 +173,9 @@ def resolve_training_geometry(
     runtime_name = cfg.architecture if cfg.architecture.endswith(dimensions) else f"resenc-tiny-{dimensions}"
     preferred = default_patch_size(runtime_name)
     requested_patch = cfg.patch_size
+    # Resolve against the actual device without replacing explicit saved settings.
+    if "effective_batch_size" not in cfg._provided_fields:
+        cfg.effective_batch_size = default_effective_batch_size(runtime_name, device)
     batch_cap = default_batch_size(runtime_name, device) if cfg.batch_size == AUTO else int(cfg.batch_size)
     initial_patch = (
         cast(tuple[int, ...], requested_patch)
@@ -227,17 +229,25 @@ def resolve_training_geometry(
     excluded: set[str] = set()
     estimate_cache: dict[tuple, tuple[InstanceSizeEstimate | None, int]] = {}
     failed_holdouts: set[tuple] = set()
+    detection = None
     while True:
         check_cancel()
+        preparation.instance_mode = False
         if not any(any(pair.plane_positive_counts) for pair in train):
             raise DatasetError("All training masks in the assigned training split are empty")
         info = inspect_dataset(train, dimensions)
-        detection = detect_task_from_pairs(train, cfg.dataset_path, requested_task=cfg.task, dimensions=dimensions)
+        if detection is None:
+            detection = detect_task_from_pairs(
+                train, cfg.dataset_path, requested_task=cfg.task, dimensions=dimensions, preparation=preparation
+            )
         task = str(detection["task"])
         if detection.get("ambiguous") or task not in {"binary_semantic", "multiclass_semantic", "instance_friendly"}:
             raise DatasetError(
                 f"Dataset task is ambiguous or unsupported: {detection.get('reason')}; specify the prediction task"
             )
+        preparation.instance_mode = task == "instance_friendly"
+        if preparation.instance_mode:
+            preparation.prepare(train + val, dimensions, check_cancel)
         class_labels = read_class_labels(cfg.dataset_path) if task == "multiclass_semantic" else None
         if class_labels is not None:
             if set(info.label_values) - set(class_labels):
@@ -316,25 +326,24 @@ def resolve_training_geometry(
             )
         else:
             assert isinstance(requested_patch, tuple)
-            microbatch = max(
-                value
-                for value in range(1, min(batch_cap, cfg.effective_batch_size) + 1)
-                if cfg.effective_batch_size % value == 0
-            )
-            budget = (
-                min(arch.reference_memory_gb * 1024**3, available_memory)
-                if available_memory
-                else arch.reference_memory_gb * 1024**3
-            )
-            memory = RuntimeMemoryPlan(
-                preferred,
+            fixed_plan = plan_patch_and_microbatch(
                 requested_patch,
-                batch_cap,
-                microbatch,
+                requested_patch,
+                channels,
+                blocks,
                 arch.reference_memory_gb,
-                available_memory / 1024**3 if available_memory else None,
-                budget * cfg.memory_fraction / 1024**3,
-                ("user_patch_override",),
+                batch_cap,
+                effective_batch_size=cfg.effective_batch_size,
+                available_memory_bytes=available_memory,
+                memory_fraction=cfg.memory_fraction,
+                input_channels=input_channels,
+                deep_supervision=arch.deep_supervision,
+                allow_patch_reduction=False,
+            )
+            memory = replace(
+                fixed_plan,
+                preferred_patch=preferred,
+                reductions=("user_patch_override", *fixed_plan.reductions),
             )
         patch = memory.resolved_patch
         if not inherited:
@@ -544,6 +553,7 @@ def resolve_training_geometry(
                     message=f"Empty validation content retained: {pair.image.name}; foreground performance cannot be measured on this case.",
                     reason="empty_validation_source",
                 )
+        preparation.report()
         return TrainingGeometry(
             train,
             val,
@@ -558,4 +568,5 @@ def resolve_training_geometry(
             network_shape,
             estimates,
             case_sampling,
+            preparation.diagnostics(),
         )

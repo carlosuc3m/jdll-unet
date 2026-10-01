@@ -291,8 +291,8 @@ def test_quality_preset_contract():
             assert default_patch_size(name) == patches[index]
             assert default_deep_supervision(name) is (preset != "tiny")
     assert [default_context_slices(f"resenc-{preset}-2.5d") for preset in presets] == [5, 7, 9, 11]
-    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cpu")) for preset in presets] == [4, 2, 1, 1]
-    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cuda")) for preset in presets] == [4, 4, 2, 1]
+    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cpu")) for preset in presets] == [16, 2, 1, 1]
+    assert [default_batch_size(f"resenc-{preset}-2d", torch.device("cuda")) for preset in presets] == [32, 4, 2, 1]
 
 
 def test_all_quality_presets_construct_and_forward_on_meta_device():

@@ -7,6 +7,7 @@ import tifffile
 import torch
 
 from jdll_unet.appose_api import infer, train
+from jdll_unet.config import parse_training_config
 from jdll_unet.errors import InferenceError
 
 
@@ -39,6 +40,88 @@ def _synthetic_volume_dataset(root: Path, count: int = 3) -> None:
         image = (mask.astype(np.float32) * 160 + np.random.default_rng(index).normal(15, 2, mask.shape)).astype(np.float32)
         tifffile.imwrite(images / f"volume_{index}.tif", image)
         tifffile.imwrite(masks / f"volume_{index}.tif", mask)
+
+
+def test_checkpoint_survives_failure_loading_first_validation_patch(tmp_path, monkeypatch):
+    from jdll_unet.dataset import JdllSegmentationDataset
+
+    dataset = tmp_path / "dataset"
+    output = tmp_path / "model"
+    _synthetic_dataset(dataset)
+    original = JdllSegmentationDataset.__getitem__
+
+    def getitem(self, index):
+        if not self.training:
+            raise RuntimeError("Simulated validation loading failure")
+        return original(self, index)
+
+    monkeypatch.setattr(JdllSegmentationDataset, "__getitem__", getitem)
+    with pytest.raises(RuntimeError, match="Simulated validation"):
+        train({"model_name": "checkpoint", "dataset_path": str(dataset), "output_dir": str(output),
+               "architecture": "tiny-2d", "device": "cpu", "epochs": 1, "steps_per_epoch": 1,
+               "patch_size": [32, 32], "batch_size": 1, "effective_batch_size": 1})
+    checkpoint = torch.load(output / "weights_last.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["epoch"] == 1
+    assert checkpoint["metrics"]["validation_pending"] is True
+    assert not (output / "weights_best.pt").exists()
+
+
+def test_best_model_is_published_before_each_validation_callback(tmp_path):
+    dataset = tmp_path / "dataset"
+    output = tmp_path / "model"
+    _synthetic_dataset(dataset)
+    epochs = []
+
+    def callback(event):
+        if event.get("message", "").startswith("UNet validation epoch"):
+            epochs.append(event["epoch"])
+            assert (output / "model.pt").exists()
+            assert (output / "weights_best.pt").read_bytes() == (output / "model.pt").read_bytes()
+            last = torch.load(output / "weights_last.pt", map_location="cpu", weights_only=False)
+            assert last["epoch"] == event["epoch"]
+            assert "validation_pending" not in last["metrics"]
+
+    train({"model_name": "checkpoint", "dataset_path": str(dataset), "output_dir": str(output),
+           "architecture": "tiny-2d", "device": "cpu", "epochs": 2, "steps_per_epoch": 1,
+           "patch_size": [32, 32], "batch_size": 1, "effective_batch_size": 1,
+           "preview_count": 0, "validation": {"mode": "light"}}, task=callback)
+    assert epochs == [1, 2]
+
+
+@pytest.mark.parametrize("dimensions", ["2d", "2.5d", "3d"])
+def test_exported_training_config_can_start_another_run(tmp_path, dimensions):
+    root = tmp_path / "data"
+    if dimensions == "2d":
+        _synthetic_dataset(root, count=2)
+    else:
+        _synthetic_volume_dataset(root, count=2)
+    first = train({
+        "model_name": "export", "output_dir": tmp_path / "first", "dataset_path": root,
+        "architecture": f"resenc-tiny-{dimensions}", "task": "instance_friendly",
+        "patch_size": [8, 16, 16] if dimensions == "3d" else [16, 16],
+        "batch_size": 1, "effective_batch_size": 1, "epochs": 1, "steps_per_epoch": 1,
+        "instance_scale_normalization": {"target_object_fraction": 0.5},
+        "preview_count": 0, "validation": {"mode": "light", "light_steps": 1},
+    })
+    exported = json.loads(json.dumps(first["config"]["training"]))
+    exported.update(model_name="reuse", output_dir=str(tmp_path / "second"))
+    parsed = parse_training_config(exported)
+    assert parsed.lr_scheduler.type == "poly"
+    plan = json.loads((tmp_path / "first" / "dataset_plan.json").read_text())
+    assert parsed.data_cache_mb == plan["data_cache"]["max_bytes"] / 1024**2
+    second = train(exported)
+    assert second["config"]["architecture_config"] == first["config"]["architecture_config"]
+    assert second["config"]["training"]["lr_scheduler"] == first["config"]["training"]["lr_scheduler"]
+
+
+def test_legacy_exported_inapplicable_context_values(tmp_path):
+    cfg = parse_training_config({
+        "model_name": "legacy", "output_dir": tmp_path, "dataset_path": tmp_path,
+        "architecture": "resenc-tiny-2d", "context_slices": None,
+        "context": {"stride_policy": "adjacent", "spacing": None},
+        "spacing": {"target_spacing": None}, "lr_scheduler": {"type": "poly", "step_scope": "epoch"},
+    })
+    assert cfg.context_slices == 3
 
 
 def test_tiny_training_and_inference_smoke(tmp_path: Path):

@@ -84,6 +84,7 @@ class ResidualEncoderBlock(nn.Module):
         dropout: float = 0.0,
         dimensions: str = "2d",
         kernel_size: int | tuple[int, ...] = 3,
+        normalize_projection: bool = True,
     ) -> None:
         super().__init__()
         if convs_per_level < 1:
@@ -107,11 +108,16 @@ class ResidualEncoderBlock(nn.Module):
             if in_channels == out_channels
             else conv(in_channels, out_channels, kernel_size=1, bias=False)
         )
+        self.projection_norm = (
+            _normalization(normalization, out_channels, dimensions)
+            if normalize_projection and in_channels != out_channels
+            else nn.Identity()
+        )
         self.activation = _activation(activation)
         self.dropout = dropout_layer(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.body(x) + self.projection(x)
+        out = self.body(x) + self.projection_norm(self.projection(x))
         return self.dropout(self.activation(out))
 
 
@@ -141,6 +147,7 @@ class UNet2D(nn.Module):
                     dropout=config.dropout,
                     dimensions=config.dimensions,
                     kernel_size=kernels[level],
+                    **({"normalize_projection": config.normalize_projection} if config.block_type == "residual" else {}),
                 )
             )
             in_channels = out_channels

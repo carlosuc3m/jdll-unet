@@ -23,7 +23,7 @@ from jdll_unet.geometry import (
     split_sources,
     with_region,
 )
-from jdll_unet.io import ImageMaskPair
+from jdll_unet.io import ImageMaskPair, normalize_image
 from jdll_unet.losses import compute_loss
 from jdll_unet.metrics import compute_metrics
 from jdll_unet.model import build_unet
@@ -195,7 +195,11 @@ def test_holdout_domain_enforced_before_transforms_and_statistics(tmp_path):
         sampled, _, valid = apply_augmentation(
             domain, load_domain_mask(training[0]), cfg, np.random.default_rng(seed), return_validity=True
         )
-        np.testing.assert_allclose(sampled[:, valid], 3, atol=1e-5)
+        # Zero padding may lower edge intensities during spatial/intensity filtering,
+        # but the held-out value (9000) must never enter the training domain.
+        assert sampled[:, valid].min() >= -1e-5
+        assert sampled[:, valid].max() <= 3 + 1e-5
+        assert not sampled[:, ~valid].any()
     with pytest.raises(DatasetError, match="No feasible"):
         spatial_holdout(original, 0.25, 42, lambda pair, training: False)
 
@@ -280,7 +284,9 @@ def test_context_centers_and_modality_order(tmp_path):
     dataset = dataset_for([pair], dimensions="2.5d", training=False, context=11)
     dataset.normalization = {"type": "none"}
     assert dataset.items == [(0, 1), (0, 2)]
-    _, stack, mask = dataset._load_item(0)
+    _, stack, mask, statistics, _ = dataset._load_item(0)
+    assert statistics is None
+    stack = np.asarray(stack)
     assert stack.shape == (11, 8, 8)
     np.testing.assert_array_equal(stack[:, 0, 0], [0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0])
     np.testing.assert_array_equal(mask, load_domain_mask(pair)[1])
@@ -724,7 +730,6 @@ def test_configuration_object_preserves_explicit_overrides_and_auto(tmp_path):
 @pytest.mark.parametrize("normalization", ["percentile", "minmax", "zscore", "none"])
 def test_context_normalization_reuses_statistics_and_preserves_volume_policy(tmp_path, normalization):
     from jdll_unet.infer import _context_stack
-    from jdll_unet.io import normalize_image
 
     paths = pair_files(tmp_path, (4, 12, 13))
     raw = np.arange(4 * 12 * 13, dtype=np.uint16).reshape(4, 12, 13)
@@ -734,7 +739,9 @@ def test_context_normalization_reuses_statistics_and_preserves_volume_policy(tmp
     dataset.normalization = {"type": normalization}
     reference = normalize_image(raw[None], dataset.normalization)
     for index in range(4):
-        _, context, _ = dataset._load_item(index)
+        _, context, _, statistics, _ = dataset._load_item(index)
+        assert statistics is None
+        context = np.asarray(context)
         np.testing.assert_allclose(context, _context_stack(reference, index, 3), rtol=1e-6, atol=1e-6)
     assert len(dataset._normalization_statistics) == 1
     assert load_domain_image(pair, reader=dataset.reader, raw=True).dtype == np.uint16

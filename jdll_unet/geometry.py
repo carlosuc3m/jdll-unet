@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import asdict, replace
@@ -15,6 +16,7 @@ import numpy as np
 from .errors import ConfigError, DataFormatError, DatasetError
 from .image_reading import ImageReadSession, current_read_session
 from .io import ImageMaskPair, load_image, load_mask, validate_mask_labels
+from .label_statistics import analyze_mask
 
 
 def source_identity(path: Path) -> str:
@@ -107,15 +109,17 @@ class DomainReader:
 
         self.max_bytes = max_bytes
         self.session = session or current_read_session()
-        self.cache: OrderedDict[tuple[str, int, int, str], np.ndarray] = OrderedDict()
+        self.cache: OrderedDict[tuple[str, int, int, int, str], np.ndarray] = OrderedDict()
         self.bytes = 0
 
-    def read(self, path: Path, *, role: str = "image") -> np.ndarray:
+    def read(self, path: Path, *, role: str = "image", selection: tuple[slice, ...] | None = None) -> np.ndarray:
         stat = path.stat()
-        key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, role)
+        key = (str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, role)
         if key in self.cache:
             self.cache.move_to_end(key)
-            return self.cache[key]
+            return self.cache[key] if selection is None else self.cache[key][selection]
+        if selection is not None:
+            return self.session.region(path, selection, role=role)
         array = self.session.pixels(path, role=role, memmap=True)
         if array.nbytes <= self.max_bytes:
             while self.cache and self.bytes + array.nbytes > self.max_bytes:
@@ -127,7 +131,44 @@ class DomainReader:
         return array
 
 
-def _planning_reader() -> DomainReader:
+def available_host_memory() -> int | None:
+    """Prefer reclaimable available RAM over Linux's much smaller free-page count."""
+    available = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key == "MemAvailable":
+                available = int(value.split()[0]) * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    if available is None:
+        try:
+            available = int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+        except (AttributeError, OSError, ValueError):
+            return None
+    # Container-visible RAM can be much smaller than the host's MemAvailable.
+    for root, limit_name, usage_name in (
+        ("/sys/fs/cgroup", "memory.max", "memory.current"),
+        ("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
+    ):
+        try:
+            limit = int((Path(root) / limit_name).read_text())
+            used = int((Path(root) / usage_name).read_text())
+            available = min(available, max(0, limit - used))
+        except (OSError, ValueError):
+            pass
+    return max(0, available)
+
+
+def resolve_data_cache_bytes(requested_mb: float | str) -> int:
+    if requested_mb != "auto":
+        return int(float(requested_mb) * 1024**2)
+    available = available_host_memory()
+    return min(512 * 1024**2, available // 10) if available is not None else 64 * 1024**2
+
+
+def domain_reader() -> DomainReader:
     session = current_read_session()
     if session.domain_reader is None:
         session.domain_reader = DomainReader(session=session)
@@ -135,12 +176,18 @@ def _planning_reader() -> DomainReader:
 
 
 def load_domain_mask(
-    pair: ImageMaskPair, dimensions: str | None = "2d", reader: DomainReader | None = None, *, raw: bool = False
+    pair: ImageMaskPair, dimensions: str | None = "2d", reader: DomainReader | None = None, *,
+    raw: bool = False, original: bool = False
 ) -> np.ndarray:
-    reader = reader or _planning_reader()
-    if pair.mask_axes is None:
-        return load_mask(pair.mask, dimensions=dimensions, session=reader.session)
-    array = _normalize_array(reader.read(pair.mask, role="mask"), pair.mask_axes, mask=True)
+    reader = reader or domain_reader()
+    preparation = reader.session.annotations
+    array = preparation.prepared_mask(pair, dimensions, reader) if preparation is not None and not original else None
+    if array is None:
+        array = (
+            load_mask(pair.mask, dimensions=dimensions, session=reader.session)
+            if pair.mask_axes is None else
+            _normalize_array(reader.read(pair.mask, role="mask"), pair.mask_axes, mask=True)
+        )
     if pair.region:
         array = array[tuple(slice(start, end) for start, end in pair.region)]
     if not raw:
@@ -151,7 +198,7 @@ def load_domain_mask(
 def load_domain_image(
     pair: ImageMaskPair, dimensions: str = "2d", reader: DomainReader | None = None, *, raw: bool = False
 ) -> np.ndarray:
-    reader = reader or _planning_reader()
+    reader = reader or domain_reader()
     if pair.image_axes is None:
         return load_image(pair.image, dimensions=dimensions, session=reader.session)
     array = _normalize_array(reader.read(pair.image), pair.image_axes, mask=False)
@@ -162,13 +209,17 @@ def load_domain_image(
 
 def with_region(pair: ImageMaskPair, bounds: tuple[tuple[int, int], ...], origin: str) -> ImageMaskPair:
     current = replace(pair, region=bounds, split_origin=origin, eligible_centers=None)
-    mask = load_domain_mask(current)
-    counts = tuple(int(value) for value in np.count_nonzero(mask > 0, axis=(-2, -1)).reshape(-1))
-    return replace(current, plane_positive_counts=counts, label_values=tuple(int(v) for v in np.unique(mask) if v > 0))
+    reader = domain_reader()
+    preparation = reader.session.annotations
+    analysis = (
+        preparation.statistics(current, None, reader) if preparation is not None else
+        analyze_mask(load_domain_mask(current, reader=reader, raw=True), current.mask)
+    )
+    return replace(current, plane_positive_counts=analysis.plane_positive_counts, label_values=analysis.labels)
 
 
 def inspect_pair(pair: ImageMaskPair, *, reader: DomainReader | None = None) -> tuple[ImageMaskPair, dict[str, Any]]:
-    reader = reader or _planning_reader()
+    reader = reader or domain_reader()
     image_shape, image_candidates, image_provenance = _array_info(pair.image, session=reader.session)
     mask_shape, mask_candidates, mask_provenance = _array_info(pair.mask, role="mask", session=reader.session)
     matches = []
@@ -214,15 +265,22 @@ def inspect_pair(pair: ImageMaskPair, *, reader: DomainReader | None = None) -> 
         image_channels=channels,
         source_kind=kind,
     )
-    image = load_domain_image(resolved, reader=reader)
-    raw_mask = _normalize_array(reader.read(pair.mask, role="mask"), mask_axes, mask=True)
-    if not np.all(np.isfinite(image)) or not np.all(np.isfinite(raw_mask)):
-        raise DataFormatError(f"Non-finite image or label values: {pair.image}, {pair.mask}")
-    if np.any(raw_mask < 0) or np.any(raw_mask > np.iinfo(np.int64).max) or not np.all(raw_mask == np.round(raw_mask)):
-        raise DataFormatError(f"Masks require nonnegative integer labels: {pair.mask}")
-    counts = tuple(int(value) for value in np.count_nonzero(raw_mask > 0, axis=(-2, -1)).reshape(-1))
+    image = load_domain_image(resolved, reader=reader, raw=True)
+    if image.dtype.kind not in "biuf":
+        raise DataFormatError(f"Images require real numeric values: {pair.image}")
+    if image.dtype.kind == "f":
+        for start in range(0, image.size, 1024**2):
+            chunk = image.flat[start : start + 1024**2]
+            if not np.all(np.isfinite(chunk)) or np.any(np.abs(chunk) > np.finfo(np.float32).max):
+                raise DataFormatError(f"Non-finite image values or float32 overflow: {pair.image}")
+    del image
+    preparation = reader.session.annotations
+    analysis = (
+        preparation.statistics(resolved, None, reader, original=True) if preparation is not None else
+        analyze_mask(_normalize_array(reader.read(pair.mask, role="mask"), mask_axes, mask=True), pair.mask)
+    )
     resolved = replace(
-        resolved, plane_positive_counts=counts, label_values=tuple(int(v) for v in np.unique(raw_mask) if v > 0)
+        resolved, plane_positive_counts=analysis.plane_positive_counts, label_values=analysis.labels
     )
     details = {
         **case_record(resolved),
@@ -232,6 +290,8 @@ def inspect_pair(pair: ImageMaskPair, *, reader: DomainReader | None = None) -> 
         "mask_axes_provenance": mask_provenance,
         "mask_channels": mask_channels,
     }
+    if preparation is not None:
+        preparation.source_analysis(resolved, None).geometry = details
     return resolved, details
 
 
@@ -250,7 +310,7 @@ def inspect_sources(
     pairs: list[ImageMaskPair], dimensions: str, emit: Callable[..., Any], check_cancel: Callable[[], None]
 ) -> tuple[list[ImageMaskPair], list[dict[str, Any]]]:
     accepted, records = [], []
-    reader = _planning_reader()
+    reader = domain_reader()
     for pair in pairs:
         check_cancel()
         record: dict[str, Any] = {"image": str(pair.image), "mask": str(pair.mask)}

@@ -1,0 +1,29 @@
+{
+  "case": "Blast_005",
+  "python": "/home/carlos/micromamba/envs/ofm/bin/python",
+  "load_average": [
+    31.447265625,
+    38.24365234375,
+    39.6318359375
+  ],
+  "available_ram_gib": 7.020473480224609,
+  "extra_address_space_gib": 4.0,
+  "stages": {
+    "inspection": {
+      "seconds": 3.1096652779961005,
+      "rss_mib_after": 1082.0234375,
+      "included_analysis_seconds": 1.1458568150410429,
+      "analysis_calls": 1
+    }
+  },
+  "status": "inspection_complete",
+  "statistics_calls": 1,
+  "shape": [
+    101,
+    2048,
+    2048
+  ],
+  "data_cache_mib": 512.0,
+  "label_count": 57,
+  "peak_rss_mib": 1483.515625
+}

@@ -9,11 +9,16 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .annotations import AnnotationPreparation
 from .augment import AugmentationConfig, EmptyPatchError, apply_augmentation, make_augmentation_config
+from .crop_reading import CropArray
+from .crop_sampling import CropSampler
 from .errors import DatasetError
-from .geometry import DomainReader, eligible_centers, load_domain_image, load_domain_mask, split_sources, stable_seed
+from .geometry import domain_reader, eligible_centers, load_domain_image, load_domain_mask, split_sources, stable_seed
 from .io import ImageMaskPair, fit_normalization, load_mask, normalize_image
+from .label_statistics import MaskAnalysis, analyze_mask
 from .planning import resample_image_mask, resolve_context_stride
+from .spatial_augment import SpatialImagePlan, SpatialImageSample
 from .targets import prepare_target
 
 
@@ -108,6 +113,9 @@ class JdllSegmentationDataset(Dataset):
         target_spacing: tuple[float, float, float] | None = None,
         sample_count: int | None = None,
         max_empty_plane_fraction: float = 0.20,
+        defer_photometric: bool = False,
+        defer_spatial: bool = False,
+        empty_patch_fraction: float = 0.0,
     ) -> None:
         self.pairs = pairs
         self.task = task
@@ -127,8 +135,20 @@ class JdllSegmentationDataset(Dataset):
         self.target_spacing = target_spacing
         self.sample_count = sample_count
         self.max_empty_plane_fraction = max_empty_plane_fraction
-        self.reader = DomainReader()
-        self._normalization_statistics: dict[tuple, dict] = {}
+        self.defer_spatial = training and defer_spatial
+        self.defer_photometric = defer_photometric or self.defer_spatial
+        if not math.isfinite(empty_patch_fraction) or not 0 <= empty_patch_fraction < 1:
+            raise ValueError("empty_patch_fraction must be finite and in [0, 1)")
+        self.empty_patch_fraction = empty_patch_fraction if training else 0.0
+        self.epoch_empty_flags: np.ndarray | None = None
+        self._samplers: dict[int, CropSampler] = {}
+        self._mask_analyses: dict[int, MaskAnalysis] = {}
+        self.reader = domain_reader()
+        if task == "instance_friendly":
+            if self.reader.session.annotations is None:
+                self.reader.session.annotations = AnnotationPreparation(emit=self.reader.session.emit)
+            self.reader.session.annotations.prepare(pairs, dimensions, lambda: None, self.reader)
+        self._normalization_statistics: dict[tuple[int, int | None], dict] = {}
         self.epoch = 0
         self.epoch_indices: np.ndarray | None = None
         self.sampling_summary: list[dict] = []
@@ -167,7 +187,7 @@ class JdllSegmentationDataset(Dataset):
             indices = self._source_items.get(pair_index, [])
             counts = pair.plane_positive_counts
             if not counts:
-                mask = load_domain_mask(pair, self.dimensions, self.reader)
+                mask = load_domain_mask(pair, self.dimensions, self.reader, original=self.task != "instance_friendly")
                 counts = tuple(int(v) for v in np.count_nonzero(mask, axis=(-2, -1)).reshape(-1))
             positive: list[int] = []
             empty: list[int] = []
@@ -201,7 +221,11 @@ class JdllSegmentationDataset(Dataset):
         if not pool:
             raise DatasetError("No eligible training samples remain under the foreground/empty-plane policy")
         self.pool_size = len(pool)
+        self._eligible_items = tuple(pool)
         self.epoch_indices = rng.choice(pool, size=len(self), replace=True)
+        self.epoch_empty_flags = np.zeros(len(self), dtype=bool)
+        quota_rng = np.random.default_rng(stable_seed(self.seed, epoch, "empty_patch_quota"))
+        self.epoch_empty_flags[quota_rng.permutation(len(self))[:math.ceil(len(self) * self.empty_patch_fraction)]] = True
         source_positions: dict[int, list[int]] = {}
         for position, item in enumerate(self.epoch_indices):
             source_positions.setdefault(self.items[int(item)][0], []).append(position)
@@ -217,29 +241,77 @@ class JdllSegmentationDataset(Dataset):
             )
 
     def __len__(self) -> int:
-        return self.sample_count if self.training and self.sample_count is not None else len(self.items)
+        return self.sample_count if self.sample_count is not None else len(self.items)
 
-    def _load_item(self, item_index: int) -> tuple[ImageMaskPair, np.ndarray, np.ndarray]:
+    def _normalization_stats(
+        self,
+        pair_index: int,
+        center_z: int | None,
+        image: np.ndarray,
+    ) -> dict:
+        key = (pair_index, center_z if self.dimensions == "2d" else None)
+        statistics = self._normalization_statistics.get(key)
+        if statistics is None:
+            statistics = fit_normalization(image, self.normalization)
+            self._normalization_statistics[key] = statistics
+        return statistics
+
+    def _load_item(
+        self,
+        item_index: int,
+    ) -> tuple[ImageMaskPair, np.ndarray | CropArray, np.ndarray | CropArray, dict | None, bool]:
         pair_index, center_z = self.items[item_index % len(self.items)]
         pair = self.pairs[pair_index]
+        if pair.image_axes is not None:
+            key = (pair_index, center_z if self.dimensions == "2d" else None)
+            if key not in self._normalization_statistics:
+                image = load_domain_image(pair, dimensions=self.dimensions, reader=self.reader, raw=True)
+                if self.dimensions == "2d" and center_z is not None:
+                    image = image[:, center_z]
+                self._normalization_stats(pair_index, center_z, image)
+                del image
+            statistics = self._normalization_statistics[key]
+            shape = pair.domain_shape
+            if self.dimensions == "3d" and pair.stem in self.case_spacings and self.target_spacing is not None:
+                shape = tuple(np.maximum(1, np.rint(np.array(shape) * self.case_spacings[pair.stem] / np.array(self.target_spacing))).astype(int))
+            stride = resolve_context_stride(
+                self.context_stride_policy, fixed_stride=self.context_stride,
+                target_spacing=self.context_target_spacing,
+                z_spacing=self.case_spacings.get(pair.stem, (1, 1, 1))[0],
+            ) if self.dimensions == "2.5d" else 1
+            crop_image = CropArray(pair, self.reader, statistics=statistics, center_z=center_z,
+                              context_slices=self.context_slices if self.dimensions == "2.5d" else 1,
+                              context_stride=stride, resampled_shape=shape)
+            crop_mask = CropArray(pair, self.reader, mask=True, original_mask=self.task != "instance_friendly",
+                             center_z=center_z, resampled_shape=shape)
+            return pair, crop_image, crop_mask, None, self.task == "instance_friendly"
         image = load_domain_image(pair, dimensions=self.dimensions, reader=self.reader, raw=True)
-        mask = load_domain_mask(pair, dimensions=self.dimensions, reader=self.reader, raw=True)
-        if self.dimensions == "2d" and center_z is not None:
-            image, mask = image[:, center_z], mask[center_z]
-        if self.dimensions != "2.5d":
-            image = normalize_image(image, self.normalization)
+        mask = load_domain_mask(
+            pair, dimensions=self.dimensions, reader=self.reader, raw=True, original=self.task != "instance_friendly"
+        )
+        source_has_instance_ids = self.task == "instance_friendly"
         spacing = self.case_spacings.get(pair.stem)
-        if self.dimensions == "3d" and spacing is not None and self.target_spacing is not None:
-            image, mask = resample_image_mask(image, mask, spacing, self.target_spacing)
+
+        if self.dimensions == "2d":
+            if center_z is not None:
+                image, mask = image[:, center_z], mask[center_z]
+            statistics = self._normalization_stats(pair_index, center_z, image)
+            return pair, image, mask, statistics, source_has_instance_ids
+
+        statistics = self._normalization_stats(pair_index, None, image)
+
+        if self.dimensions == "3d":
+            # Legacy, uninspected array callers cannot map native TIFF regions.
+            if spacing is not None and self.target_spacing is not None and not np.allclose(spacing, self.target_spacing):
+                image = normalize_image(image, statistics=statistics)
+                image, mask = resample_image_mask(image, mask, spacing, self.target_spacing)
+                return pair, image, mask, None, source_has_instance_ids
+            return pair, image, mask, statistics, source_has_instance_ids
+
         if self.dimensions != "2.5d":
-            return pair, image, mask
+            raise ValueError(f"Unsupported dataset dimensionality: {self.dimensions}")
+
         assert center_z is not None
-        key = (pair.image, pair.region, pair.image.stat().st_mtime_ns, str(self.normalization))
-        if key not in self._normalization_statistics:
-            if len(self._normalization_statistics) >= 128:
-                self._normalization_statistics.clear()
-            self._normalization_statistics[key] = fit_normalization(image, self.normalization)
-        statistics = self._normalization_statistics[key]
         radius = self.context_slices // 2
         stride = resolve_context_stride(
             self.context_stride_policy,
@@ -248,38 +320,90 @@ class JdllSegmentationDataset(Dataset):
             z_spacing=(spacing or (1.0, 1.0, 1.0))[0],
         )
         channels: list[np.ndarray] = []
+        expanded_stats: list[tuple[float, float]] = []
         for modality in range(image.shape[0]):
+            channel_stats = statistics["channels"][modality]
+            offset = float(channel_stats[0])
             for z in range(center_z - radius * stride, center_z + radius * stride + 1, stride):
                 if 0 <= z < image.shape[1]:
-                    channel_stats = {"type": statistics["type"], "channels": [statistics["channels"][modality]]}
-                    channels.append(normalize_image(image[modality, z][None], statistics=channel_stats)[0])
+                    channels.append(image[modality, z])
                 else:
-                    channels.append(np.zeros(image.shape[2:], dtype=np.float32))
-        return pair, np.ascontiguousarray(np.stack(channels)), np.ascontiguousarray(mask[center_z], dtype=np.int64)
+                    # Missing context planes were normalized zeros in the original
+                    # pipeline. Filling with the fitted offset reproduces that after
+                    # deferred normalization.
+                    channels.append(np.full(image.shape[2:], offset, dtype=np.float32))
+                expanded_stats.append(channel_stats)
+        context_statistics = {"type": statistics["type"], "channels": expanded_stats}
+        return (
+            pair,
+            np.ascontiguousarray(np.stack(channels)),
+            np.ascontiguousarray(mask[center_z], dtype=np.int64),
+            context_statistics,
+            source_has_instance_ids,
+        )
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
-        rng = np.random.default_rng(stable_seed(self.seed, self.epoch, str(index)))
+    def _sampler(self, item_index: int, mask: np.ndarray | CropArray) -> CropSampler:
+        if item_index not in self._samplers:
+            pair_index, center_z = self.items[item_index]
+            pair = self.pairs[pair_index]
+            preparation = self.reader.session.annotations
+            if preparation is not None:
+                whole = tuple((0, size) for size in pair.spatial_shape)
+                analysis_pair = replace(pair, region=()) if pair.region == whole else pair
+                analysis = preparation.statistics(analysis_pair, self.dimensions, self.reader,
+                                                  original=self.task != "instance_friendly")
+            elif pair_index in self._mask_analyses:
+                analysis = self._mask_analyses[pair_index]
+            else:
+                original = load_domain_mask(pair, self.dimensions, self.reader, raw=True,
+                                            original=self.task != "instance_friendly")
+                analysis = analyze_mask(original, pair.mask)
+                self._mask_analyses[pair_index] = analysis
+            self._samplers[item_index] = CropSampler(analysis, tuple(mask.shape),
+                stable_seed(self.seed, 0, f"{pair.source_id}:{pair.stem}:{center_z}"),
+                center_z=center_z, instances=self.task == "instance_friendly")
+        return self._samplers[item_index]
+
+    def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor | SpatialImageSample, torch.Tensor | dict[str, torch.Tensor]]:
+        rng = np.random.default_rng(stable_seed(self.seed, self.epoch if self.training else 0, str(index)))
+        empty = None
         if self.training:
             if self.epoch_indices is None:
                 self.set_epoch(self.epoch)
             assert self.epoch_indices is not None
+            if self.empty_patch_fraction:
+                assert self.epoch_empty_flags is not None
+                empty = bool(self.epoch_empty_flags[index])
             index = int(self.epoch_indices[index])
+        else:
+            index %= len(self.items)
         source_items = self._source_items[self.items[index][0]]
         candidates = (
             [index, *rng.permutation(source_items)[: self.augmentation.empty_patch_max_retries].tolist()]
             if self.training
             else [index]
         )
+        if empty is not None:
+            candidates.extend(int(i) for i in rng.permutation(self._eligible_items)[: self.augmentation.empty_patch_max_retries])
+        loaded = {}
+        cfg = replace(self.augmentation, skip_empty_patches=not empty) if empty is not None else self.augmentation
+        require_background = empty is False and self.task == "instance_friendly"
         for item_index in candidates:
-            pair, image, mask = self._load_item(item_index)
-            if self.training and item_index != index and not np.any(mask > 0):
+            if item_index not in loaded:
+                loaded[item_index] = self._load_item(item_index)
+            pair, image, mask, normalization_statistics, source_has_instance_ids = loaded[item_index]
+            sampler = self._sampler(item_index, mask) if self.training or self.sample_count is not None else None
+            if self.training and sampler is not None and empty is not True and cfg.skip_empty_patches and not sampler.has_foreground:
                 continue
             object_diameter = self.instance_sizes.get(pair.stem, self.fallback_instance_size)
+            image_plan = SpatialImagePlan() if self.defer_spatial else None
             try:
                 image, mask, validity = apply_augmentation(
                     image,
                     mask,
-                    self.augmentation,
+                    cfg,
                     rng=rng,
                     training=self.training,
                     object_diameter_px=object_diameter,
@@ -292,20 +416,25 @@ class JdllSegmentationDataset(Dataset):
                             else None
                         )
                     ),
+                    normalization_statistics=normalization_statistics,
+                    defer_photometric=self.defer_photometric,
+                    image_plan=image_plan,
                     return_validity=True,
+                    sampler=sampler, empty=empty, require_background=require_background,
                 )
                 break
             except EmptyPatchError:
                 continue
         else:
-            pair, image, mask = self._load_item(index)
+            pair, image, mask, normalization_statistics, source_has_instance_ids = loaded[index]
             fallback = replace(
-                self.augmentation,
+                cfg,
                 foreground_oversampling=True,
                 foreground_probability=1.0,
                 affine_probability=0,
                 elastic_probability=0,
             )
+            image_plan = SpatialImagePlan() if self.defer_spatial else None
             try:
                 image, mask, validity = apply_augmentation(
                     image,
@@ -314,13 +443,30 @@ class JdllSegmentationDataset(Dataset):
                     rng=rng,
                     training=self.training,
                     object_diameter_px=self.instance_sizes.get(pair.stem, self.fallback_instance_size),
+                    normalization_statistics=normalization_statistics,
+                    defer_photometric=self.defer_photometric,
+                    image_plan=image_plan,
                     return_validity=True,
+                    sampler=self._sampler(index, mask) if self.training else None,
+                    empty=empty, require_background=require_background,
                 )
             except EmptyPatchError as exc:
-                raise DatasetError("No foreground patch could be sampled in the assigned source domain") from exc
+                category = "empty" if empty else "foreground"
+                raise DatasetError(f"No {category} patch could be sampled under the configured patch policy") from exc
         spacing = self.target_spacing if self.dimensions == "3d" else None
-        target = prepare_target(self.task, mask, label_values=self.label_values, spacing=spacing, validity=validity)
-        image_t = torch.from_numpy(image)
+        target = prepare_target(
+            self.task,
+            mask,
+            label_values=self.label_values,
+            spacing=spacing,
+            validity=validity,
+            canonicalize_instances=not source_has_instance_ids,
+            defer_dense=self.defer_spatial,
+        )
+        tensor_image = torch.from_numpy(image)
+        image_t: torch.Tensor | SpatialImageSample = tensor_image
+        if image_plan is not None:
+            image_t = SpatialImageSample(tensor_image, image_plan)
         if isinstance(target, dict):
             return image_t, {key: torch.from_numpy(value) for key, value in target.items()}
         return image_t, torch.from_numpy(target)
@@ -360,6 +506,9 @@ def make_dataset(
     target_spacing: tuple[float, float, float] | None = None,
     sample_count: int | None = None,
     max_empty_plane_fraction: float = 0.20,
+    defer_photometric: bool = False,
+    defer_spatial: bool = False,
+    empty_patch_fraction: float = 0.0,
 ) -> JdllSegmentationDataset:
     aug = make_augmentation_config(
         profile=profile,
@@ -387,4 +536,7 @@ def make_dataset(
         target_spacing=target_spacing,
         sample_count=sample_count,
         max_empty_plane_fraction=max_empty_plane_fraction,
+        defer_photometric=defer_photometric,
+        defer_spatial=defer_spatial,
+        empty_patch_fraction=empty_patch_fraction,
     )

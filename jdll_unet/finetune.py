@@ -84,7 +84,7 @@ def _architecture_from_payload(payload: Any, source: str) -> ArchitectureConfig:
         for key in ("kernels", "strides"):
             if key in values:
                 values[key] = tuple(tuple(int(item) for item in value) for value in values[key])
-        architecture = ArchitectureConfig(**values)
+        architecture = ArchitectureConfig.from_dict(values)
         build_unet(architecture)
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise ModelLoadError(f"Unsupported source architecture metadata in {source}: {exc}") from exc

@@ -1,14 +1,18 @@
-"""2D instance-size measurement and scale normalization utilities."""
+"""Instance-size measurement and scale normalization for 2D, 2.5D and 3D."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy import ndimage as ndi
+
+from .io import validate_mask_labels
+from .label_statistics import LabelRegion, MaskAnalysis, analyze_mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,20 +35,129 @@ def canonicalize_instance_volume(mask: np.ndarray) -> InstanceLabelRepair:
 
     if mask.ndim != 3:
         raise ValueError("Instance volume canonicalization requires a Z,Y,X mask")
-    source_labels = [int(value) for value in np.unique(mask) if int(value) != 0]
-    output = np.zeros(mask.shape, dtype=np.int64)
+    from .annotations import component_labels_and_sources
+
+    validate_mask_labels(mask, Path("<array>"))
+    output, source_ids = component_labels_and_sources(mask)
+    source_labels = {int(value) for value in source_ids[1:]}
     next_label = max(source_labels, default=0) + 1
     repaired = 0
-    structure = ndi.generate_binary_structure(3, 1)
-    for source_label in source_labels:
-        components, count = ndi.label(mask == source_label, structure=structure)
-        for component in range(1, int(count) + 1):
-            assigned = source_label if component == 1 else next_label
-            if component > 1:
-                next_label += 1
-                repaired += 1
-            output[components == component] = assigned
+    seen = set()
+    for component, value in enumerate(source_ids[1:], start=1):
+        label = int(value)
+        if label in seen:
+            if next_label > np.iinfo(np.int64).max:
+                raise ValueError("Cannot repair instance labels beyond the int64 range")
+            source_ids[component] = next_label
+            next_label += 1
+            repaired += 1
+        seen.add(label)
+    flat = output.reshape(-1)
+    for start in range(0, flat.size, 1024**2):
+        chunk = flat[start : start + 1024**2]
+        chunk[:] = source_ids[chunk]
     return InstanceLabelRepair(output, len(source_labels), repaired)
+
+
+def _principal_axes(
+    mask: np.ndarray, label: int, region: LabelRegion, spacing: tuple[float, ...]
+) -> tuple[float, ...]:
+    crop = mask[tuple(slice(start, end) for start, end in region.bounds)]
+    count = 0
+    mean = np.zeros(crop.ndim)
+    products = np.zeros((crop.ndim, crop.ndim))
+    # Merge centered moments from bounded coordinate blocks, never a whole object cloud.
+    for start in range(0, crop.size, 1024**2):
+        indexes = np.flatnonzero(crop.flat[start : start + 1024**2] == label)
+        if not len(indexes):
+            continue
+        coords = np.asarray(np.unravel_index(indexes + start, crop.shape), dtype=np.float64).T
+        coords *= np.asarray(spacing)
+        block_mean = coords.mean(axis=0)
+        coords -= block_mean
+        delta = block_mean - mean
+        total = count + len(indexes)
+        products += coords.T @ coords + np.outer(delta, delta) * (count * len(indexes) / total)
+        mean += delta * (len(indexes) / total)
+        count = total
+    covariance = products / (count - 1) if count > 1 else products
+    return tuple(float(value) for value in 2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(covariance), 0.0)))
+
+
+def estimate_from_analysis(
+    analysis: MaskAnalysis,
+    *,
+    mask: np.ndarray | None = None,
+    volume_xy: bool = False,
+    spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    max_instances: int = 21,
+    exclude_border: bool = True,
+    min_size: int = 4,
+    seed: int = 0,
+    measure: str = "equivalent_sphere_diameter",
+) -> InstanceSizeEstimate | None:
+    """Select eligible identities before doing any object-specific coordinate work."""
+    if max_instances < 1:
+        raise ValueError("max_instances must be positive")
+    if any(not math.isfinite(value) or value <= 0 for value in spacing):
+        raise ValueError("spacing must contain finite positive values")
+    volume = len(analysis.shape) == 3
+    if volume_xy and not volume:
+        raise ValueError("Volume cross-section estimation requires a Z,Y,X mask")
+    complete: list[tuple[int, LabelRegion, int | None]] = []
+    border: list[tuple[int, LabelRegion, int | None]] = []
+    for label in analysis.labels:
+        region = analysis.objects[label]
+        selected_z = None
+        if volume_xy:
+            first_z, end_z = region.bounds[0]
+            touches = first_z == 0 or end_z == analysis.shape[0]
+            sections = [(z, plane[label]) for z, plane in enumerate(analysis.planes) if label in plane]
+            if touches:
+                selected_z, region = max(sections, key=lambda item: item[1].count)
+            else:
+                center = (first_z + end_z - 1) / 2.0
+                selected_z, region = min(sections, key=lambda item: (abs(item[0] - center), -item[1].count))
+            if exclude_border and region.touches_border(analysis.shape[-2:]):
+                continue
+        else:
+            touches = region.touches_border(analysis.shape)
+            if not volume and exclude_border and touches:
+                continue
+            touches = touches and exclude_border
+        if region.count >= min_size:
+            (border if touches else complete).append((label, region, selected_z))
+    selected: list[tuple[int, LabelRegion, int | None]] = []
+    rng = np.random.default_rng(seed)
+    for candidates in (complete, border):
+        remaining = max_instances - len(selected)
+        if remaining <= 0:
+            break
+        indexes = np.arange(len(candidates)) if len(candidates) <= remaining else rng.choice(len(candidates), remaining, replace=False)
+        selected.extend(candidates[int(index)] for index in indexes)
+    if not selected:
+        return None
+    values = []
+    axes_values = []
+    for label, region, selected_z in selected:
+        if measure == "principal_axes":
+            if mask is None:
+                raise ValueError("Principal-axis estimation requires the source mask")
+            axes = _principal_axes(
+                mask if selected_z is None else mask[selected_z], label, region,
+                spacing if volume and not volume_xy else (1.0, 1.0),
+            )
+            axes_values.append(axes)
+            values.append(float(np.median(axes)))
+        elif volume and not volume_xy:
+            values.append((6.0 * region.count * math.prod(spacing) / math.pi) ** (1.0 / 3.0))
+        else:
+            values.append(math.sqrt(4.0 * region.count / math.pi))
+    median_axes = (
+        tuple(float(value) for value in np.median(np.asarray(axes_values), axis=0))
+        if axes_values and volume and not volume_xy else None
+    )
+    return InstanceSizeEstimate(float(np.median(values)), len(selected), len(complete) + len(border), median_axes)
 
 
 def estimate_volume_instance_size(
@@ -54,68 +167,20 @@ def estimate_volume_instance_size(
     min_instance_area: int = 4,
     seed: int = 0,
     measure: str = "equivalent_sphere_diameter",
+    *,
+    canonicalize_instances: bool = True,
 ) -> tuple[InstanceSizeEstimate | None, InstanceLabelRepair]:
     """Estimate one XY object diameter for a complete instance volume."""
 
-    repair = canonicalize_instance_volume(mask)
-    z_size, height, width = mask.shape
-    interior: list[float] = []
-    z_border: list[float] = []
-    for label in (int(value) for value in np.unique(repair.labels) if int(value) != 0):
-        object_mask = repair.labels == label
-        zz = np.nonzero(object_mask)[0]
-        touches_z = zz.min() == 0 or zz.max() == z_size - 1
-        if touches_z:
-            areas = [(int(z), int(np.count_nonzero(object_mask[z]))) for z in np.unique(zz)]
-            selected_z = max(areas, key=lambda item: item[1])[0]
-        else:
-            center = (int(zz.min()) + int(zz.max())) / 2.0
-            candidates = sorted(
-                np.unique(zz), key=lambda z: (abs(float(z) - center), -np.count_nonzero(object_mask[z]))
-            )
-            selected_z = int(candidates[0])
-        plane_y, plane_x = np.nonzero(object_mask[selected_z])
-        area = len(plane_y)
-        if area < min_instance_area:
-            continue
-        if exclude_xy_border and (
-            plane_y.min() == 0
-            or plane_x.min() == 0
-            or plane_y.max() == height - 1
-            or plane_x.max() == width - 1
-        ):
-            continue
-        if measure == "principal_axes":
-            coords = np.column_stack((plane_y, plane_x)).astype(np.float64)
-            axes = 2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(coords.T)), 0.0)) if len(coords) > 1 else np.zeros(2)
-            diameter = float(np.median(axes))
-        else:
-            diameter = math.sqrt(4.0 * area / math.pi)
-        (z_border if touches_z else interior).append(diameter)
-    rng = np.random.default_rng(seed)
-    selected: list[float] = []
-    for candidates in (interior, z_border):
-        remaining = max_instances - len(selected)
-        if remaining <= 0:
-            break
-        if len(candidates) <= remaining:
-            selected.extend(candidates)
-        else:
-            indices = rng.choice(len(candidates), size=remaining, replace=False)
-            selected.extend(candidates[int(index)] for index in indices)
-    available = len(interior) + len(z_border)
-    estimate = None
-    if selected:
-        estimate = InstanceSizeEstimate(float(np.median(selected)), len(selected), available)
-    return estimate, repair
-
-
-def _instance_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
-    labels = [int(value) for value in np.unique(mask) if int(value) != 0]
-    if labels == [1]:
-        components, count = ndi.label(mask != 0)
-        return components, int(count)
-    return mask.astype(np.int64, copy=False), len(labels)
+    if mask.ndim != 3:
+        raise ValueError("Volume instance size estimation requires a Z,Y,X mask")
+    repair = canonicalize_instance_volume(mask) if canonicalize_instances else None
+    labels = repair.labels if repair is not None else mask
+    analysis = analyze_mask(labels)
+    return estimate_from_analysis(
+        analysis, mask=labels, volume_xy=True, max_instances=max_instances,
+        exclude_border=exclude_xy_border, min_size=min_instance_area, seed=seed, measure=measure,
+    ), repair or InstanceLabelRepair(mask, len(analysis.objects), 0)
 
 
 def estimate_instance_size(
@@ -125,38 +190,21 @@ def estimate_instance_size(
     min_instance_area: int = 4,
     seed: int = 0,
     measure: str = "equivalent_sphere_diameter",
+    *,
+    canonicalize_instances: bool = True,
 ) -> InstanceSizeEstimate | None:
     """Estimate median equivalent diameter from a reproducible instance sample."""
 
     if mask.ndim != 2:
         raise ValueError("Instance size estimation currently supports 2D masks only")
-    components, _ = _instance_components(mask)
-    measurements: list[float] = []
-    height, width = mask.shape
-    for label in (int(value) for value in np.unique(components) if int(value) != 0):
-        yy, xx = np.nonzero(components == label)
-        area = len(yy)
-        if area < min_instance_area:
-            continue
-        if exclude_border and (yy.min() == 0 or xx.min() == 0 or yy.max() == height - 1 or xx.max() == width - 1):
-            continue
-        if measure == "principal_axes":
-            coords = np.column_stack((yy, xx)).astype(np.float64)
-            axes = 2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(coords.T)), 0.0)) if len(coords) > 1 else np.zeros(2)
-            measurements.append(float(np.median(axes)))
-        else:
-            measurements.append(math.sqrt(4.0 * area / math.pi))
-    available = len(measurements)
-    if available == 0:
-        return None
-    if available > max_instances:
-        rng = np.random.default_rng(seed)
-        indices = rng.choice(available, size=max_instances, replace=False)
-        measurements = [measurements[int(index)] for index in indices]
-    return InstanceSizeEstimate(
-        median_diameter_px=float(np.median(measurements)),
-        sampled_instances=len(measurements),
-        available_instances=available,
+    analysis = analyze_mask(mask)
+    components = mask
+    if canonicalize_instances and analysis.labels == (1,):
+        components = ndi.label(mask != 0)[0]
+        analysis = analyze_mask(components)
+    return estimate_from_analysis(
+        analysis, mask=components, max_instances=max_instances,
+        exclude_border=exclude_border, min_size=min_instance_area, seed=seed, measure=measure,
     )
 
 
@@ -168,39 +216,20 @@ def estimate_3d_instance_size(
     min_instance_voxels: int = 4,
     seed: int = 0,
     measure: str = "equivalent_sphere_diameter",
+    *,
+    canonicalize_instances: bool = True,
 ) -> tuple[InstanceSizeEstimate | None, InstanceLabelRepair]:
     """Estimate physical 3D instance size, preferring complete objects."""
 
-    repair = canonicalize_instance_volume(mask)
-    complete: list[tuple[float, tuple[float, ...]]] = []
-    border: list[tuple[float, tuple[float, ...]]] = []
-    shape = np.asarray(mask.shape)
-    voxel_volume = float(np.prod(spacing))
-    for label in (int(value) for value in np.unique(repair.labels) if int(value) != 0):
-        coords = np.argwhere(repair.labels == label)
-        if len(coords) < min_instance_voxels:
-            continue
-        touches = bool(np.any(coords.min(axis=0) == 0) or np.any(coords.max(axis=0) == shape - 1))
-        physical = coords.astype(np.float64) * np.asarray(spacing)
-        axes = tuple(float(value) for value in (2.0 * np.sqrt(np.maximum(np.linalg.eigvalsh(np.cov(physical.T)), 0.0))))
-        volume = len(coords) * voxel_volume
-        diameter = 2.0 * (3.0 * volume / (4.0 * math.pi)) ** (1.0 / 3.0)
-        (border if touches else complete).append((diameter, axes))
-    selected: list[tuple[float, tuple[float, ...]]] = []
-    rng = np.random.default_rng(seed)
-    for candidates in (complete, border):
-        remaining = max_instances - len(selected)
-        if remaining <= 0:
-            break
-        indexes = np.arange(len(candidates)) if len(candidates) <= remaining else rng.choice(len(candidates), remaining, replace=False)
-        selected.extend(candidates[int(index)] for index in indexes)
-    if not selected and border:
-        selected = border[:max_instances]
-    if not selected:
-        return None, repair
-    values = [float(np.median(axes)) if measure == "principal_axes" else diameter for diameter, axes in selected]
-    median_axes = tuple(float(value) for value in np.median(np.asarray([axes for _diameter, axes in selected]), axis=0))
-    return InstanceSizeEstimate(float(np.median(values)), len(selected), len(complete) + len(border), median_axes), repair
+    if mask.ndim != 3:
+        raise ValueError("3D instance size estimation requires a Z,Y,X mask")
+    repair = canonicalize_instance_volume(mask) if canonicalize_instances else None
+    labels = repair.labels if repair is not None else mask
+    analysis = analyze_mask(labels)
+    return estimate_from_analysis(
+        analysis, mask=labels, spacing=spacing, max_instances=max_instances,
+        exclude_border=exclude_border, min_size=min_instance_voxels, seed=seed, measure=measure,
+    ), repair or InstanceLabelRepair(mask, len(analysis.objects), 0)
 
 
 def resize_3d_pair_to_shape(

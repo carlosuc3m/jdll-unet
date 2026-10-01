@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,16 +10,11 @@ from statistics import median
 
 import numpy as np
 
+from .annotations import AnnotationPreparation, component_labels_and_sources
 from .config import architecture_defaults
 from .errors import TaskDetectionError
 from .geometry import load_domain_mask
-from .io import ImageMaskPair, discover_dataset, read_class_names
-
-try:  # pragma: no cover - fallback exists for minimal environments
-    from scipy import ndimage as ndi
-except Exception:  # pragma: no cover
-    ndi = None
-
+from .io import ImageMaskPair, discover_dataset, read_class_names, validate_mask_labels
 
 SUPPORTED_TASKS = {"binary_semantic", "multiclass_semantic", "instance_friendly"}
 
@@ -30,50 +26,28 @@ class MaskStats:
     connected_components_per_label: dict[int, int]
     labels_are_sequential_ids: bool
     many_components_share_one_label_value: bool
+    connectivity_analyzed: bool = True
 
 
-def _component_count(binary: np.ndarray) -> int:
-    if not np.any(binary):
-        return 0
-    if ndi is not None:
-        _, count = ndi.label(binary)
-        return int(count)
-    seen = np.zeros(binary.shape, dtype=bool)
-    count = 0
-    offsets: list[tuple[int, ...]] = []
-    for axis in range(binary.ndim):
-        for delta in (-1, 1):
-            offset_vector = [0] * binary.ndim
-            offset_vector[axis] = delta
-            offsets.append(tuple(offset_vector))
-    for start in np.ndindex(binary.shape):
-        if not binary[start] or seen[start]:
-            continue
-        count += 1
-        stack: list[tuple[int, ...]] = [start]
-        seen[start] = True
-        while stack:
-            current = stack.pop()
-            for neighbor_offset in offsets:
-                neighbor = tuple(coord + step for coord, step in zip(current, neighbor_offset, strict=True))
-                if all(0 <= coord < limit for coord, limit in zip(neighbor, binary.shape, strict=True)) and binary[neighbor] and not seen[neighbor]:
-                    seen[neighbor] = True
-                    stack.append(neighbor)
-    return count
-
-
-def mask_statistics(mask: np.ndarray, path: str = "") -> MaskStats:
-    labels = sorted(int(v) for v in np.unique(mask) if int(v) != 0)
-    components = {label: _component_count(mask == label) for label in labels}
+def _mask_stats(labels: list[int], path: str, components: dict[int, int] | None = None) -> MaskStats:
     sequential = bool(labels) and labels == list(range(1, len(labels) + 1))
-    many_components = any(count > 3 for count in components.values())
     return MaskStats(
         path=path,
         unique_nonzero_labels=labels,
-        connected_components_per_label=components,
+        connected_components_per_label=components if components is not None else {},
         labels_are_sequential_ids=sequential,
-        many_components_share_one_label_value=many_components,
+        many_components_share_one_label_value=any(count > 3 for count in (components or {}).values()),
+        connectivity_analyzed=components is not None,
     )
+
+
+def mask_statistics(mask: np.ndarray, path: str = "", *, analyze_connectivity: bool = True) -> MaskStats:
+    validate_mask_labels(mask, Path(path))
+    if analyze_connectivity:
+        _, source_ids = component_labels_and_sources(mask)
+        components = dict(Counter(int(value) for value in source_ids[1:]))
+        return _mask_stats(sorted(components), path, components)
+    return _mask_stats([int(value) for value in np.unique(mask) if value != 0], path)
 
 
 def _metadata_signals(dataset_path: Path) -> dict[str, object]:
@@ -99,6 +73,7 @@ def detect_task_from_pairs(
     dataset_path: Path | str | None = None,
     requested_task: str = "auto",
     dimensions: str | None = None,
+    preparation: AnnotationPreparation | None = None,
 ) -> dict[str, object]:
     """Infer the task from mask statistics and lightweight metadata."""
 
@@ -133,24 +108,27 @@ def detect_task_from_pairs(
             "reason": "Point annotations require a detection workflow rather than this UNet backend.",
         }
 
-    stats = [mask_statistics(load_domain_mask(pair, dimensions=dimensions), str(pair.mask)) for pair in pairs]
+    if preparation is None:
+        stats = [
+            mask_statistics(
+                load_domain_mask(pair, dimensions=dimensions, original=True, raw=True),
+                str(pair.mask), analyze_connectivity=False,
+            )
+            for pair in pairs
+        ]
+    else:
+        stats = []
+        for pair in pairs:
+            components = preparation.cached_detection_components(pair, dimensions)
+            stats.append(_mask_stats(
+                list(preparation.detection_labels(pair, dimensions)), str(pair.mask), components,
+            ))
     label_sets = _all_label_sets(stats)
     all_labels = sorted(set().union(*label_sets)) if label_sets else []
     non_empty_label_sets = [labels for labels in label_sets if labels]
     median_unique = median([len(labels) for labels in label_sets]) if label_sets else 0
     consistent = len({tuple(sorted(labels)) for labels in non_empty_label_sets}) <= 1
     small_stable = bool(non_empty_label_sets) and consistent and len(set().union(*non_empty_label_sets)) <= 8
-    one_component_values = 0
-    total_values = 0
-    for item in stats:
-        for count in item.connected_components_per_label.values():
-            total_values += 1
-            if count <= 1:
-                one_component_values += 1
-    most_one_component = total_values > 0 and one_component_values / total_values >= 0.7
-    sequential_ids = sum(item.labels_are_sequential_ids and len(item.unique_nonzero_labels) > 3 for item in stats)
-    many_components_same_label = sum(item.many_components_share_one_label_value for item in stats)
-
     score = 0
     reasons: list[str] = []
     if metadata["annotation_source"] == "roi_manager_one_roi_per_object":
@@ -159,24 +137,38 @@ def detect_task_from_pairs(
     if median_unique > 10:
         score += 3
         reasons.append("Masks contain many unique labels per image.")
-    if most_one_component and median_unique > 3:
-        score += 3
-        reasons.append("Most label values have one connected component.")
     if not consistent and non_empty_label_sets:
         score += 2
         reasons.append("Label values are not stable across images.")
-    if sequential_ids:
-        score += 2
-        reasons.append("Masks look like sequential object-id label images.")
     if metadata["class_names"]:
         score -= 4
         reasons.append("Class names metadata exists.")
     if small_stable:
         score -= 3
         reasons.append("The label set is small and stable across images.")
-    if many_components_same_label:
-        score -= 2
-        reasons.append("Many components share the same label value.")
+    # Connectivity contributes at most +3/-2. Skip it only when those bounds
+    # cannot change the task, preserving the existing classification thresholds.
+    binary = not all_labels or all_labels == [1]
+    decided = binary or score - 2 >= 4 or score + (3 if median_unique > 3 else 0) <= -2
+    if not decided:
+        for index, (pair, item) in enumerate(zip(pairs, stats, strict=True)):
+            if item.connectivity_analyzed:
+                continue
+            if preparation is not None:
+                components = preparation.detection_components(pair, dimensions)
+                stats[index] = _mask_stats(item.unique_nonzero_labels, item.path, components)
+            else:
+                stats[index] = mask_statistics(
+                    load_domain_mask(pair, dimensions=dimensions, original=True, raw=True), str(pair.mask)
+                )
+    if all(item.connectivity_analyzed for item in stats):
+        component_counts = [count for item in stats for count in item.connected_components_per_label.values()]
+        if component_counts and median_unique > 3 and sum(count <= 1 for count in component_counts) / len(component_counts) >= 0.7:
+            score += 3
+            reasons.append("Most label values have one connected component.")
+        if any(item.many_components_share_one_label_value for item in stats):
+            score -= 2
+            reasons.append("Many components share the same label value.")
 
     if not all_labels or all_labels == [1]:
         task = "binary_semantic"

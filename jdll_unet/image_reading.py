@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import struct
+import warnings
 import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import tifffile
 from PIL import Image
 
 from .errors import DataFormatError
+
+if TYPE_CHECKING:
+    from .annotations import AnnotationPreparation
 
 T = TypeVar("T")
 FORMATS = {".tif": "TIFF", ".tiff": "TIFF", ".png": "PNG", ".bmp": "BMP", ".jpg": "JPEG", ".jpeg": "JPEG"}
@@ -58,12 +62,42 @@ def decode_pixels(reader: Any, file_format: str, role: str, *, memmap: bool = Fa
     return np.asarray(reader)
 
 
+def decode_region(reader: Any, file_format: str, role: str, selection: tuple[slice, ...]) -> np.ndarray:
+    """Decode intersecting TIFF strips/tiles when Zarr is available; otherwise use the regular reader."""
+    if file_format == "TIFF":
+        series = reader.series[0]
+        if series.dataoffset is not None and series[0].is_memmappable:
+            return series.asarray(out="memmap")[selection]
+        try:
+            import zarr
+        except ImportError:
+            pass
+        else:
+            try:
+                store = series.aszarr()
+                try:
+                    array = zarr.open(store, mode="r")
+                except BaseException:
+                    store.close()
+                    raise
+            except (ImportError, NotImplementedError, TypeError):
+                warnings.warn("TIFF region backend is unavailable or incompatible; using full-image decoding.",
+                              RuntimeWarning, stacklevel=2)
+            else:
+                try:
+                    return np.asarray(array[selection])
+                finally:
+                    store.close()
+    return decode_pixels(reader, file_format, role)[selection]
+
+
 class ImageReadSession:
     def __init__(self, emit: Callable[..., Any] | None = None) -> None:
         self.emit = emit
         self.preferences: dict[tuple[str, str, str], str] = {}
         self.notices: set[tuple[tuple[str, str, str], str]] = set()
         self.domain_reader: Any = None
+        self.annotations: AnnotationPreparation | None = None
 
     def __getstate__(self) -> dict[str, Any]:
         # DataLoader workers need routing state, not UI callbacks or another pixel cache.
@@ -138,6 +172,9 @@ class ImageReadSession:
     def pixels(self, path: Path | str, *, role: str = "image", memmap: bool = False) -> np.ndarray:
         return self.read(path, lambda reader, fmt: decode_pixels(reader, fmt, role, memmap=memmap), role=role)
 
+    def region(self, path: Path | str, selection: tuple[slice, ...], *, role: str = "image") -> np.ndarray:
+        return self.read(path, lambda reader, fmt: decode_region(reader, fmt, role, selection), role=role)
+
 
 _active_session: ContextVar[ImageReadSession | None] = ContextVar("image_read_session", default=None)
 
@@ -153,5 +190,9 @@ def image_reading_session(emit: Callable[..., Any] | None = None) -> Iterator[Im
     try:
         yield session
     finally:
-        session.domain_reader = None
-        _active_session.reset(token)
+        try:
+            session.domain_reader = None
+            if session.annotations is not None:
+                session.annotations.close()
+        finally:
+            _active_session.reset(token)

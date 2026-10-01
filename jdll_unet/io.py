@@ -256,12 +256,23 @@ def _collapse_mask_channels(arr: np.ndarray, path: Path, dimensions: str | None)
 
 
 def validate_mask_labels(arr: np.ndarray, path: Path) -> None:
-    if not np.all(np.isfinite(arr)):
-        raise DataFormatError(f"Mask {path} contains non-finite values")
-    if np.issubdtype(arr.dtype, np.floating) and not np.all(arr == np.round(arr)):
-        raise DataFormatError(f"Mask {path} contains non-integer floating values")
-    if np.any(arr < 0) or np.any(arr > np.iinfo(np.int64).max):
-        raise DataFormatError(f"Mask {path} requires nonnegative integer labels within int64 range")
+    if arr.dtype.kind not in "biuf":
+        raise DataFormatError(f"Mask {path} requires real nonnegative integer labels")
+    if arr.dtype.kind == "b" or (arr.dtype.kind == "u" and arr.dtype.itemsize < 8):
+        return
+    for start in range(0, arr.size, 1024**2):
+        chunk = arr.flat[start : start + 1024**2]
+        if arr.dtype.kind == "f":
+            if not np.all(np.isfinite(chunk)):
+                raise DataFormatError(f"Mask {path} contains non-finite values")
+            if not np.all(chunk == np.round(chunk)):
+                raise DataFormatError(f"Mask {path} contains non-integer floating values")
+            # int64.max rounds UP to 2**63 as a float; comparing with it accepts overflow.
+            outside = np.any(chunk >= 2**63) or np.any(chunk < 0)
+        else:
+            outside = np.any(chunk > np.iinfo(np.int64).max) if arr.dtype.kind == "u" else np.any(chunk < 0)
+        if outside:
+            raise DataFormatError(f"Mask {path} requires nonnegative integer labels within int64 range")
 
 
 def load_mask(
@@ -306,21 +317,34 @@ def fit_normalization(image: np.ndarray, normalization: dict | object | None = N
     low, high, eps = float(setting("low", 1.0)), float(setting("high", 99.8)), float(setting("eps", 1e-6))
     parameters = []
     for source_channel in image:
-        channel = source_channel.astype(np.float32, copy=False)
         if kind == "none":
             offset, scale = 0.0, 1.0
+        elif kind == "percentile" and source_channel.dtype.kind == "u" and source_channel.dtype.itemsize <= 2:
+            # Exact integer percentiles without whole-volume float/partition copies.
+            counts = np.zeros(np.iinfo(source_channel.dtype).max + 1, dtype=np.int64)
+            for start in range(0, source_channel.size, 1024**2):
+                values = source_channel.flat[start : start + 1024**2]
+                counts += np.bincount(values, minlength=len(counts))
+            cumulative = np.cumsum(counts)
+            ranks = (source_channel.size - 1) * np.array([low, high]) / 100
+            lower = np.searchsorted(cumulative, np.floor(ranks).astype(np.int64), side="right")
+            upper = np.searchsorted(cumulative, np.ceil(ranks).astype(np.int64), side="right")
+            offset, maximum = lower + (upper - lower) * (ranks - np.floor(ranks))
+            scale = max(float(maximum - offset), eps)
         elif kind == "percentile":
+            channel = source_channel.astype(np.float32, copy=False)
             offset, maximum = np.percentile(channel, [low, high])
             scale = max(float(maximum - offset), eps)
         elif kind == "minmax":
-            offset = channel.min()
-            scale = max(float(channel.max() - offset), eps)
+            offset = float(source_channel.min())
+            scale = max(float(source_channel.max()) - offset, eps)
         elif kind == "zscore":
+            channel = source_channel.astype(np.float32, copy=False)
             offset = channel.mean()
             scale = max(float(channel.std()), eps)
         else:
             raise DataFormatError(f"Unsupported normalization type: {kind}")
-        parameters.append((offset, scale))
+        parameters.append((float(offset), scale))
     return {"type": kind, "channels": parameters}
 
 
@@ -333,8 +357,10 @@ def normalize_image(
     if stats["type"] == "none":
         return img
     for channel, (offset, scale) in enumerate(stats["channels"]):
-        normalized = (img[channel] - offset) / scale
-        img[channel] = np.clip(normalized, 0.0, 1.0) if stats["type"] == "percentile" else normalized
+        np.subtract(img[channel], np.float32(offset), out=img[channel])
+        np.divide(img[channel], np.float32(scale), out=img[channel])
+        if stats["type"] == "percentile":
+            np.clip(img[channel], 0.0, 1.0, out=img[channel])
     return img
 
 

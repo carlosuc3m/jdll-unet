@@ -72,6 +72,19 @@ class LRSchedulerConfig:
     plateau_patience: int = 5
     plateau_threshold: float = 1e-4
 
+    @property
+    def step_scope(self) -> str:
+        return "epoch" if self.type in {"poly", "plateau"} else "batch"
+
+
+@dataclass(slots=True)
+class AnnotationPreparationConfig:
+    repair_disconnected_instances: bool = True
+    ram_cache_mb: float = 128.0
+    cache_dir: str | None = None
+    disk_reserve_mb: float = 256.0
+    warning_fraction: float = 0.1
+
 
 @dataclass(slots=True)
 class InstanceScaleNormalizationConfig:
@@ -134,6 +147,18 @@ class ArchitectureConfig:
     kernels: tuple[tuple[int, ...], ...] = ()
     strides: tuple[tuple[int, ...], ...] = ()
     reference_memory_gb: int = 4
+    normalize_projection: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.normalize_projection, bool):
+            raise ConfigError("normalize_projection must be a boolean")
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> ArchitectureConfig:
+        """Load saved architecture metadata without changing legacy checkpoint behavior."""
+        values = dict(payload)
+        values.setdefault("normalize_projection", False)
+        return cls(**values)
 
 
 @dataclass(slots=True, init=False)
@@ -158,6 +183,7 @@ class TrainingConfig:
     optimizer: str = "adamw"
     weight_decay: float = 1e-5
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+    annotation_preparation: AnnotationPreparationConfig = field(default_factory=AnnotationPreparationConfig)
     instance_scale_normalization: InstanceScaleNormalizationConfig = field(
         default_factory=InstanceScaleNormalizationConfig
     )
@@ -166,12 +192,14 @@ class TrainingConfig:
     foreground_probability: float | str = AUTO
     skip_empty_images: bool = True
     skip_empty_patches: bool = True
+    empty_patch_fraction: float = 0.0
     empty_patch_max_retries: int = 8
     include_empty_patches_after_max_retries: bool = False
     max_padding_ratio: float = 1.0
     max_empty_plane_fraction: float = 0.20
     augmentation_profile: str = AUTO
     num_workers: int = 0
+    data_cache_mb: float | str = AUTO
     mixed_precision: bool | str = AUTO
     deep_supervision: bool | str = AUTO
     context_slices: int | str = AUTO
@@ -180,7 +208,7 @@ class TrainingConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     effective_batch_size: int = 4
     steps_per_epoch: int | str = AUTO
-    minimum_steps_per_epoch: int = 250
+    minimum_steps_per_epoch: int | None = None
     expected_patches_per_case: int = 10
     memory_fraction: float = 0.8
     focal_gamma: float = 2.0
@@ -199,6 +227,7 @@ class TrainingConfig:
     postprocessing: PostprocessingConfig = field(default_factory=PostprocessingConfig)
     loss_weights: dict[str, float] = field(default_factory=_default_loss_weights)
     augmentation: dict[str, Any] = field(default_factory=dict)
+    minimum_patches_per_epoch: int = 1000
     _provided_fields: frozenset[str] = field(default_factory=frozenset, init=False, repr=False, compare=False)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -237,6 +266,7 @@ class TrainingConfig:
             "context",
             "spacing",
             "instance_scale_normalization",
+            "effective_batch_size",
         }
         for option in fields(type(self)):
             if option.name in inheritable and option.name not in self._provided_fields:
@@ -339,10 +369,14 @@ def _lr_scheduler_config(value: Any) -> LRSchedulerConfig:
         return LRSchedulerConfig(type=value)
     if isinstance(value, Mapping):
         valid = {field.name for field in LRSchedulerConfig.__dataclass_fields__.values()}
-        unknown = sorted(set(value) - valid)
+        unknown = sorted(set(value) - valid - {"step_scope"})
         if unknown:
             raise ConfigError(f"Unknown LRSchedulerConfig field(s): {', '.join(unknown)}")
-        return LRSchedulerConfig(**{key: value[key] for key in value if key in valid})
+        parsed = LRSchedulerConfig(**{key: value[key] for key in value if key in valid})
+        _validate_lr_scheduler(parsed)
+        if "step_scope" in value and value["step_scope"] != parsed.step_scope:
+            raise ConfigError(f"lr_scheduler.step_scope must be {parsed.step_scope!r} for {parsed.type!r}")
+        return parsed
     raise ConfigError("lr_scheduler must be a string or mapping")
 
 
@@ -437,11 +471,11 @@ def _validate_auto_positive_float(value: float | str, name: str) -> None:
         raise ConfigError(f"{name} must be positive")
 
 
-def _max_empty_plane_fraction(value: Any) -> float:
+def _max_empty_plane_fraction(value: Any, name: str = "max_empty_plane_fraction") -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
-        raise ConfigError("max_empty_plane_fraction must be a finite number in [0, 1), not a boolean")
+        raise ConfigError(f"{name} must be a finite number in [0, 1), not a boolean")
     if not 0 <= value < 1 or not math.isfinite(value):
-        raise ConfigError("max_empty_plane_fraction must be finite and in [0, 1)")
+        raise ConfigError(f"{name} must be finite and in [0, 1)")
     return float(value)
 
 
@@ -489,11 +523,15 @@ def parse_training_config(
             instance_scale_normalization=_nested_dataclass(
                 InstanceScaleNormalizationConfig, raw.get("instance_scale_normalization")
             ),
+            annotation_preparation=_nested_dataclass(
+                AnnotationPreparationConfig, raw.get("annotation_preparation")
+            ),
             validation_fraction=float(raw.get("validation_fraction", 0.15)),
             foreground_oversampling=_auto_or_bool(raw.get("foreground_oversampling", AUTO), "foreground_oversampling"),
             foreground_probability=_auto_or_float(raw.get("foreground_probability", AUTO), "foreground_probability"),
             skip_empty_images=_coerce_bool(raw.get("skip_empty_images", True), "skip_empty_images"),
             skip_empty_patches=_coerce_bool(raw.get("skip_empty_patches", True), "skip_empty_patches"),
+            empty_patch_fraction=_max_empty_plane_fraction(raw.get("empty_patch_fraction", 0.0), "empty_patch_fraction"),
             empty_patch_max_retries=int(raw.get("empty_patch_max_retries", 8)),
             include_empty_patches_after_max_retries=_coerce_bool(
                 raw.get("include_empty_patches_after_max_retries", False),
@@ -503,15 +541,21 @@ def parse_training_config(
             max_padding_ratio=float(raw.get("max_padding_ratio", 1.0)),
             max_empty_plane_fraction=_max_empty_plane_fraction(raw.get("max_empty_plane_fraction", 0.20)),
             num_workers=int(raw.get("num_workers", 0)),
+            data_cache_mb=_auto_or_float(raw.get("data_cache_mb", AUTO), "data_cache_mb"),
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", AUTO), "deep_supervision"),
-            context_slices=_auto_or_int(raw.get("context_slices", AUTO), "context_slices"),
+            context_slices=_auto_or_int(
+                AUTO if raw.get("context_slices") is None else raw["context_slices"], "context_slices"
+            ),
             context=_nested_dataclass(ContextConfig, raw.get("context")),
             spacing=_nested_dataclass(SpacingConfig, raw.get("spacing")),
             validation=_nested_dataclass(ValidationConfig, raw.get("validation")),
             effective_batch_size=int(raw.get("effective_batch_size", 4)),
             steps_per_epoch=_auto_or_int(raw.get("steps_per_epoch", AUTO), "steps_per_epoch"),
-            minimum_steps_per_epoch=int(raw.get("minimum_steps_per_epoch", 250)),
+            minimum_steps_per_epoch=(
+                int(raw["minimum_steps_per_epoch"]) if raw.get("minimum_steps_per_epoch") is not None else None
+            ),
+            minimum_patches_per_epoch=int(raw.get("minimum_patches_per_epoch", 1000)),
             expected_patches_per_case=int(raw.get("expected_patches_per_case", 10)),
             memory_fraction=float(raw.get("memory_fraction", 0.8)),
             focal_gamma=float(raw.get("focal_gamma", 2.0)),
@@ -561,6 +605,10 @@ def parse_training_config(
         raise ConfigError("weight_decay cannot be negative")
     if parsed.num_workers < 0:
         raise ConfigError("num_workers cannot be negative")
+    if parsed.data_cache_mb != AUTO and (
+        not math.isfinite(float(parsed.data_cache_mb)) or float(parsed.data_cache_mb) < 0
+    ):
+        raise ConfigError("data_cache_mb must be 'auto' or a finite nonnegative number")
     if parsed.preview_count < 0:
         raise ConfigError("preview_count cannot be negative")
     if parsed.focal_gamma <= 0:
@@ -589,8 +637,10 @@ def parse_training_config(
         raise ConfigError("context.stride must be at least 1")
     if parsed.context.spacing not in (AUTO, None) and float(parsed.context.spacing) <= 0:
         raise ConfigError("context.spacing must be 'auto' or positive")
-    if parsed.effective_batch_size < 1 or parsed.minimum_steps_per_epoch < 1 or parsed.expected_patches_per_case < 1:
+    if min(parsed.effective_batch_size, parsed.minimum_patches_per_epoch, parsed.expected_patches_per_case) < 1:
         raise ConfigError("effective batch and training-step settings must be positive")
+    if parsed.minimum_steps_per_epoch is not None and parsed.minimum_steps_per_epoch < 1:
+        raise ConfigError("minimum_steps_per_epoch must be null or positive")
     if not 0 < parsed.memory_fraction <= 1:
         raise ConfigError("memory_fraction must be in (0, 1]")
     _validate_auto_positive_int(parsed.steps_per_epoch, "steps_per_epoch")
@@ -618,6 +668,23 @@ def parse_training_config(
     _validate_auto_positive_float(parsed.learning_rate, "learning_rate")
     parsed.model_normalization = _model_normalization(parsed.model_normalization)
     _validate_lr_scheduler(parsed.lr_scheduler)
+    preparation = parsed.annotation_preparation
+    preparation.repair_disconnected_instances = _coerce_bool(
+        preparation.repair_disconnected_instances, "annotation_preparation.repair_disconnected_instances"
+    )
+    for name in ("ram_cache_mb", "disk_reserve_mb", "warning_fraction"):
+        try:
+            value = float(getattr(preparation, name))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"annotation_preparation.{name} must be a finite nonnegative number") from exc
+        if not math.isfinite(value) or value < 0 or (name == "warning_fraction" and value > 1):
+            raise ConfigError(f"Invalid annotation_preparation.{name}")
+        setattr(preparation, name, value)
+    if preparation.cache_dir is not None:
+        if not isinstance(preparation.cache_dir, (str, Path)) or not str(preparation.cache_dir).strip():
+            raise ConfigError("annotation_preparation.cache_dir must be a nonempty path or null")
+        preparation.cache_dir = str(preparation.cache_dir)
+
     scale_cfg = parsed.instance_scale_normalization
     scale_cfg.enabled = _coerce_bool(scale_cfg.enabled, "instance_scale_normalization.enabled")
     scale_cfg.exclude_border_instances = _coerce_bool(
@@ -765,7 +832,18 @@ def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = 
     return tuple(min(preferred[index], int(image_shape[index])) for index in range(len(preferred)))
 
 
+def _is_tiny_2d(architecture: str) -> bool:
+    name = architecture.lower().removeprefix("resenc-").removeprefix("residual-")
+    return name == "tiny-2d"
+
+
+def default_effective_batch_size(architecture: str, device: torch.device) -> int:
+    return {"cpu": 16, "cuda": 32}.get(device.type, 4) if _is_tiny_2d(architecture) else 4
+
+
 def default_batch_size(architecture: str, device: torch.device) -> int:
+    if _is_tiny_2d(architecture):
+        return default_effective_batch_size(architecture, device)
     name = architecture.lower()
     if name.endswith("-3d"):
         return 2 if device.type != "cpu" and "tiny" in name else 1
@@ -776,6 +854,24 @@ def default_batch_size(architecture: str, device: torch.device) -> int:
     if "medium" in name:
         return 2 if device.type == "cpu" else 4
     return 4
+
+
+def resolve_steps_per_epoch(
+    config: TrainingConfig, architecture: str, training_cases: int, effective_batch_size: int
+) -> int:
+    """Resolve optimizer updates using the actual batch after accumulation."""
+    if config.steps_per_epoch != AUTO:
+        return int(config.steps_per_epoch)
+    patches = config.expected_patches_per_case * training_cases
+    name = architecture.lower().removeprefix("resenc-").removeprefix("residual-")
+    if name.startswith("tiny-"):
+        patches = max(config.minimum_patches_per_epoch, patches)
+        minimum_steps = 1
+    else:
+        minimum_steps = 250
+    if config.minimum_steps_per_epoch is not None:
+        minimum_steps = config.minimum_steps_per_epoch
+    return max(minimum_steps, math.ceil(patches / effective_batch_size))
 
 
 def default_context_slices(architecture: str) -> int:

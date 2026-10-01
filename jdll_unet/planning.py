@@ -352,6 +352,7 @@ def plan_patch_and_microbatch(
     minimum_size: int = 8,
     input_channels: int = 1,
     deep_supervision: bool = False,
+    allow_patch_reduction: bool = True,
 ) -> RuntimeMemoryPlan:
     """Resolve microbatch first, then shrink a preferred patch to the usable budget."""
 
@@ -382,6 +383,8 @@ def plan_patch_and_microbatch(
     while microbatch > 1 and estimate() > budget:
         microbatch = max(value for value in eligible_microbatches if value < microbatch)
         reductions.append("microbatch_reduced_for_memory")
+    if not allow_patch_reduction and estimate() > budget:
+        raise ConfigError("Requested patch is estimated to exceed the memory budget even with microbatch one")
     while estimate() > budget:
         candidates = [axis for axis, value in enumerate(patch) if value > minimum_size]
         if not candidates:

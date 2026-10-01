@@ -132,7 +132,7 @@ def load_model(model_path: str | Path, device: str | torch.device = "cpu") -> tu
     arch_payload = config.get("architecture_config") or state.get("architecture_config")
     if not arch_payload:
         raise ModelLoadError(f"Missing architecture_config for {checkpoint}")
-    arch = ArchitectureConfig(**arch_payload)
+    arch = ArchitectureConfig.from_dict(arch_payload)
     model = build_unet(arch).to(requested_device)
     model.load_state_dict(state.get("state_dict", state))
     model.eval()
@@ -167,7 +167,7 @@ def _pad_image(image: np.ndarray, patch_size: tuple[int, ...]) -> tuple[np.ndarr
     pads = [max(0, patch - size) for patch, size in zip(patch_size, spatial_shape, strict=True)]
     if all(pad == 0 for pad in pads):
         return image, spatial_shape
-    padded = np.pad(image, ((0, 0), *((0, pad) for pad in pads)), mode="edge")
+    padded = np.pad(image, ((0, 0), *((0, pad) for pad in pads)), mode="constant")
     return padded, spatial_shape
 
 
@@ -200,7 +200,10 @@ def tiled_predict(
     *,
     layout: _TileLayout | None = None,
     progress: _InferenceProgress | None = None,
+    blend_mode: str = "constant",
 ) -> np.ndarray:
+    if blend_mode not in {"constant", "gaussian"}:
+        raise InferenceError("tile_blending must be constant or gaussian")
     image, original_shape = _pad_image(image, tile_size)
     spatial_shape = tuple(int(item) for item in image.shape[1:])
     layout = layout or _tile_layout(original_shape, tile_size, overlap)
@@ -209,6 +212,14 @@ def tiled_predict(
     output_channels = int(cast(ArchitectureConfig, model.config).output_channels)
     accum = torch.zeros((output_channels, *spatial_shape), dtype=torch.float32, device=device)
     counts = torch.zeros((1, *spatial_shape), dtype=torch.float32, device=device)
+    importance = torch.ones(tile_size, dtype=torch.float32, device=device)
+    if blend_mode == "gaussian":
+        for axis, length in enumerate(tile_size):
+            coordinate = (torch.arange(length, device=device) - (length - 1) / 2) / (length / 8)
+            axis_shape = [1] * len(tile_size)
+            axis_shape[axis] = length
+            importance *= torch.exp(-0.5 * coordinate.square()).reshape(axis_shape)
+        importance = (importance / importance.max()).clamp_min(1e-6)
     with torch.inference_mode():
         for starts in product(*layout.starts_by_axis):
             starts = tuple(int(value) for value in starts)
@@ -221,11 +232,11 @@ def tiled_predict(
             if patch_logits.shape[1:] != tuple(tile_size):
                 mode = "trilinear" if len(tile_size) == 3 else "bilinear"
                 patch_logits = F.interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
-            accum[(slice(None), *spatial_slices)] += patch_logits
-            counts[(slice(None), *spatial_slices)] += 1.0
+            accum[(slice(None), *spatial_slices)] += patch_logits * importance
+            counts[(slice(None), *spatial_slices)] += importance
             if progress is not None:
                 progress.patch_end()
-    logits_array = (accum / counts.clamp_min(1.0)).detach().cpu().numpy()
+    logits_array = (accum / counts.clamp_min(torch.finfo(counts.dtype).tiny)).detach().cpu().numpy()
     crop = tuple(slice(0, size) for size in original_shape)
     return logits_array[(slice(None), *crop)]
 
@@ -298,6 +309,7 @@ def _predict_25d(
     *,
     layout: _TileLayout | None = None,
     progress: _InferenceProgress | None = None,
+    blend_mode: str = "constant",
 ) -> np.ndarray:
     predictions = [
         tiled_predict(
@@ -308,6 +320,7 @@ def _predict_25d(
             overlap,
             layout=layout,
             progress=progress,
+            blend_mode=blend_mode,
         )
         for z in range(volume.shape[1])
     ]
@@ -438,6 +451,9 @@ def _infer_impl(
                 image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
     progress.stage = "planning"
     overlap = _parse_overlap(config.get("tile_overlap", 0.25))
+    blend_mode = str(config.get("tile_blending", "constant")).lower()
+    if blend_mode not in {"constant", "gaussian"}:
+        raise InferenceError("tile_blending must be constant or gaussian")
     progress.stage = "preprocessing"
     inference_scale = 1.0
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
@@ -525,6 +541,7 @@ def _infer_impl(
             context_stride,
             layout=layout,
             progress=progress,
+            blend_mode=blend_mode,
         )
         if dimensions == "2.5d"
         else tiled_predict(
@@ -535,6 +552,7 @@ def _infer_impl(
             overlap=overlap,
             layout=layout,
             progress=progress,
+            blend_mode=blend_mode,
         )
     )
     progress.check("reconstruction")
@@ -639,6 +657,7 @@ def _infer_impl(
         "total_patches": total_patches,
         "tile_size": list(tile_size),
         "tile_overlap": overlap,
+        "tile_blending": blend_mode,
         "output_keys": sorted(outputs),
     }
     progress.check("postprocessing")

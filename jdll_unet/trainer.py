@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from .augment import apply_tensor_photometric_augmentation
 from .callbacks import CallbackDispatcher
 from .config import (
     AUTO,
@@ -31,10 +33,11 @@ from .config import (
     model_folder_config,
     parse_training_config,
     resolve_device,
+    resolve_steps_per_epoch,
     write_json,
 )
 from .dataset import JdllSegmentationDataset, make_dataset, partition_empty_pairs
-from .errors import DatasetError, ModelLoadError
+from .errors import DatasetError, ModelLoadError, TrainingError
 from .finetune import (
     FineTuneReport,
     SourceModel,
@@ -61,7 +64,8 @@ from .scale import (
 )
 from .schedulers import LearningRateScheduler
 from .semantic_scale import semantic_scale_diagnostics
-from .targets import boundary_target
+from .spatial_augment import SpatialImageBatch, collate_spatial_samples
+from .targets import boundary_target, complete_device_targets
 from .training_geometry import resolve_training_geometry
 
 
@@ -217,6 +221,7 @@ def _full_volume_validation(
                 label_values=label_values,
                 spacing=spacing if dimensions == "3d" else None,
                 validity=np.ones(current_mask.shape, dtype=bool),
+                canonicalize_instances=current_read_session().annotations is None,
             )
             assert isinstance(target, dict)
             tensors = {key: torch.from_numpy(value[None]) for key, value in target.items()}
@@ -302,8 +307,69 @@ def _resolve_loss_weights(
     return weights, stats
 
 
-def _tensor_losses_to_float(losses: dict[str, torch.Tensor]) -> dict[str, float]:
-    return {key: float(value.detach().cpu().item()) for key, value in losses.items()}
+def _training_dtype(mixed_precision: bool, device: torch.device) -> torch.dtype:
+    if mixed_precision and device.type == "cuda":
+        with torch.cuda.device(device):
+            try:
+                supported = torch.cuda.is_bf16_supported(including_emulation=False)
+            except TypeError:  # Older torch has no emulation argument.
+                supported = torch.cuda.is_bf16_supported() and torch.cuda.get_device_capability()[0] >= 8
+        if supported:
+            return torch.bfloat16
+    # FP16 can overflow finite UNet activations before gradient scaling applies.
+    return torch.float32
+
+
+def _check_optimizer_update(
+    model: torch.nn.Module, losses: list[torch.Tensor], *, epoch: int, step: int
+) -> None:
+    loss_finite = torch.isfinite(torch.stack(losses)).all()
+    norms = [torch.linalg.vector_norm(parameter.grad.detach()) for parameter in model.parameters()
+             if parameter.grad is not None]
+    gradient_finite = torch.isfinite(torch.stack(norms)).all() if norms else torch.ones_like(loss_finite)
+    # One host transfer per optimizer update, not per layer or microbatch.
+    loss_ok, gradients_ok = torch.stack((loss_finite, gradient_finite)).cpu().tolist()
+    if not loss_ok or not gradients_ok:
+        reason = "loss" if not loss_ok else "gradients or gradient norms"
+        raise TrainingError(
+            f"Non-finite training {reason} at epoch {epoch}, optimizer step {step}; "
+            "the optimizer update was not applied. Check input data and numerical stability."
+        )
+
+
+def _tensor_losses_to_float(
+    losses: dict[str, torch.Tensor], *, context: str = "loss reporting"
+) -> dict[str, float]:
+    if not losses:
+        return {}
+    keys = list(losses)
+    values = torch.stack([losses[key].detach().float() for key in keys]).cpu().tolist()
+    result = {key: float(value) for key, value in zip(keys, values, strict=True)}
+    invalid = [key for key, value in result.items() if not math.isfinite(value)]
+    if invalid:
+        raise TrainingError(f"Non-finite {context}: {', '.join(invalid)}")
+    return result
+
+
+def _accumulate_tensor_losses(
+    sums: dict[str, torch.Tensor],
+    losses: dict[str, torch.Tensor],
+) -> None:
+    for key, value in losses.items():
+        detached = value.detach().float()
+        if key not in sums:
+            sums[key] = detached.clone()
+        else:
+            sums[key].add_(detached)
+
+
+def _mean_tensor_losses(
+    sums: dict[str, torch.Tensor],
+    count: int,
+) -> dict[str, torch.Tensor]:
+    if count <= 0:
+        return {}
+    return {key: value / count for key, value in sums.items()}
 
 
 def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
@@ -351,6 +417,78 @@ def _save_checkpoint(
         },
         path,
     )
+
+
+def _restore_completed_epoch(
+    checkpoint_path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LearningRateScheduler,
+    model_config: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Internal recovery for a completed epoch, retaining model selection history."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    saved = json.loads(json.dumps(checkpoint["model_config"]))
+    current = json.loads(json.dumps(model_config))
+    for key in ("task", "architecture_config", "label_values", "normalization"):
+        if saved.get(key) != current.get(key):
+            raise TrainingError(f"Cannot resume: {key} differs from the checkpoint")
+    # Decoded-source caching can adapt to available RAM without changing training.
+    ignored = {"model_name", "output_dir", "dataset_plan_path", "data_cache_mb"}
+    old_training = {key: value for key, value in saved["training"].items() if key not in ignored}
+    new_training = {key: value for key, value in current["training"].items() if key not in ignored}
+    if old_training != new_training:
+        differences = sorted(key for key in old_training.keys() | new_training.keys()
+                             if old_training.get(key) != new_training.get(key))
+        raise TrainingError(f"Cannot resume with changed training settings: {', '.join(differences)}")
+    epoch = checkpoint["epoch"]
+    record = checkpoint["metrics"]
+    state = checkpoint["scheduler_state_dict"]
+    if (record.get("validation_pending") or record.get("cancelled")
+            or state["epoch_count"] != epoch
+            or state["step_count"] != epoch * new_training["steps_per_epoch"]):
+        raise TrainingError("Resume requires a completed, validated epoch checkpoint")
+    if not 0 < epoch < new_training["epochs"]:
+        raise TrainingError("Checkpoint has no remaining epochs to train")
+    saved_metrics = json.loads((checkpoint_path.parent / "metrics.json").read_text())
+    history = saved_metrics["history"]
+    if [row["epoch"] for row in history] != list(range(1, epoch + 1)) or history[-1] != record:
+        raise TrainingError("Cannot resume: metric history does not match the checkpoint epoch")
+    full_best = -float("inf")
+    full_bad = 0
+    scores = []
+    for row in history:
+        if "full_validation" in row:
+            score = float(row["full_validation"]["mean_dice"])
+            full_bad = 0 if score > full_best else full_bad + 1
+            full_best = max(full_best, score)
+        if new_training["validation"]["mode"] == "light":
+            scores.append(primary_metric(current["task"], row["val_metrics"]))
+        elif "full_validation" in row:
+            scores.append(float(row["full_validation"]["mean_dice"]))
+    best_score = max(scores, default=-float("inf"))
+    if saved_metrics["best_score"] != (best_score if math.isfinite(best_score) else None):
+        raise TrainingError("Cannot resume: best score does not match the metric history")
+    best_path = checkpoint_path.parent / "weights_best.pt"
+    if scores:
+        if not best_path.is_file():
+            raise TrainingError("Cannot resume: best checkpoint is missing")
+        best = torch.load(best_path, map_location="cpu", weights_only=False)
+        if not 1 <= best["epoch"] <= epoch or best["metrics"] != history[best["epoch"] - 1]:
+            raise TrainingError("Cannot resume: best checkpoint does not match the metric history")
+        del best
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(state)
+    if checkpoint_path.parent.resolve() != output_dir.resolve():
+        _atomic_copy(checkpoint_path, output_dir / "weights_last.pt")
+        if scores:
+            _atomic_copy(best_path, output_dir / "weights_best.pt")
+            _atomic_copy(best_path, output_dir / "model.pt")
+        write_json(output_dir / "metrics.json", saved_metrics)
+    return {"epoch": epoch, "step": state["step_count"], "history": history,
+            "best_score": best_score, "full_validation_best": full_best, "full_validation_bad": full_bad}
 
 
 def _save_previews(
@@ -547,7 +685,9 @@ def train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[str
                 logger.removeHandler(handler)
 
 
-def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[str, Any]:
+def _train(
+    config: dict[str, Any] | TrainingConfig, task: Any = None, *, resume_from: Path | None = None
+) -> dict[str, Any]:
     source_model: SourceModel | None = None
     if isinstance(config, TrainingConfig):
         config = config.request_dict()
@@ -598,6 +738,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
     _set_seed(train_config.seed)
     device = resolve_device(train_config.device)
     logger.info("Starting training on device=%s", device)
+    logger.info("Training implementation: %s", Path(__file__).resolve())
     if source_model is not None:
         message = f"Fine-tuning from base LR {source_model.base_learning_rate:g}: backbone LR {source_model.base_learning_rate * 0.1:g}; adapted layers use {source_model.base_learning_rate:g} when present."
         if source_model.learning_rate_provenance == "fallback_default":
@@ -702,7 +843,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
     training_scale_estimates: list[InstanceSizeEstimate] = []
     validation_scale_estimates: list[InstanceSizeEstimate] = []
     fallback_instance_size: float | None = None
-    repaired_instance_components = 0
+    repaired_instance_components = geometry.annotation_diagnostics["repaired_components"]
     if instance_scale_enabled:
         for split_pairs_, destination, estimates, seed_offset in (
             (train_pairs, train_instance_sizes, training_scale_estimates, 0),
@@ -710,8 +851,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         ):
             for pair in split_pairs_:
                 check_cancel()
-                estimate, repairs = geometry.instance_estimates[(pair.stem, pair.region)]
-                repaired_instance_components += repairs
+                estimate, _ = geometry.instance_estimates[(pair.stem, pair.region)]
                 if estimate is not None:
                     destination[pair.stem] = estimate.median_diameter_px
                     estimates.append(estimate)
@@ -778,13 +918,8 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         )
     accumulation_steps = math.ceil(train_config.effective_batch_size / microbatch_size)
     resolved_effective_batch = microbatch_size * accumulation_steps
-    steps_per_epoch = (
-        max(
-            train_config.minimum_steps_per_epoch,
-            math.ceil(train_config.expected_patches_per_case * len(train_pairs) / resolved_effective_batch),
-        )
-        if train_config.steps_per_epoch == AUTO
-        else int(train_config.steps_per_epoch)
+    steps_per_epoch = resolve_steps_per_epoch(
+        train_config, geometry.architecture.name, len(train_pairs), resolved_effective_batch
     )
     if source_model is not None:
         backbone_learning_rate, adapted_learning_rate = resolve_finetune_learning_rates(source_model.base_learning_rate)
@@ -812,6 +947,11 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         else train_config.augmentation_profile
     )
     mixed_precision = default_mixed_precision(train_config.mixed_precision, device)
+    training_dtype = _training_dtype(mixed_precision, device)
+    if mixed_precision and training_dtype == torch.float32:
+        logger.warning("Native BF16 is unavailable on %s; using FP32 to avoid FP16 activation overflow", device)
+    mixed_precision = training_dtype != torch.float32
+    logger.info("Training precision=%s", str(training_dtype).removeprefix("torch."))
     progress_update_interval = (
         default_progress_update_interval(device)
         if train_config.progress_update_interval == AUTO
@@ -874,6 +1014,15 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         target_spacing=dataset_plan.target_spacing,
         sample_count=steps_per_epoch * microbatch_size * accumulation_steps,
         max_empty_plane_fraction=train_config.max_empty_plane_fraction,
+        empty_patch_fraction=train_config.empty_patch_fraction,
+        defer_photometric=device.type == "cuda",
+        defer_spatial=device.type == "cuda",
+    )
+    logger.info(
+        "Image augmentation backend=%s; foreground/boundary targets=%s; label geometry and exact distances=cpu; num_workers=%s",
+        "cuda" if train_dataset.defer_spatial else "cpu",
+        "cuda" if train_dataset.defer_spatial else "cpu",
+        train_config.num_workers,
     )
     train_dataset.augmentation.skip_empty_patches = train_config.skip_empty_patches
     train_dataset.augmentation.empty_patch_max_retries = train_config.empty_patch_max_retries
@@ -887,6 +1036,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         train_dataset.augmentation.training_scale_jitter = scale_cfg.training_scale_jitter
         train_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
         train_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
+    stratified_validation = dimensions == "3d" and train_config.validation.mode == "light"
     val_dataset = make_dataset(
         val_pairs,
         detected_task,
@@ -894,8 +1044,8 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         normalization=train_config.normalization,
         profile="fast",
         patch_size=patch_size,
-        foreground_oversampling=False,
-        foreground_probability=0.0,
+        foreground_oversampling=stratified_validation,
+        foreground_probability=0.5 if stratified_validation else 0.0,
         augmentation_overrides={},
         training=False,
         dimensions=dimensions,
@@ -908,6 +1058,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         context_target_spacing=resolved_context_spacing,
         case_spacings=case_spacings,
         target_spacing=dataset_plan.target_spacing,
+        sample_count=train_config.validation.light_steps * microbatch_size if stratified_validation else None,
     )
     if instance_scale_enabled:
         val_dataset.augmentation.instance_scale_enabled = True
@@ -917,8 +1068,13 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
     val_dataset.augmentation.max_padding_ratio = train_config.max_padding_ratio
     train_dataset.set_epoch(1)
     resolved_dataset_plan = geometry.to_dict()
+    resolved_dataset_plan["data_cache"] = {
+        "max_bytes": train_dataset.reader.max_bytes,
+        "scope": "shared_run_decoded_sources",
+    }
     resolved_dataset_plan.update(
         padding_policy={
+            "image_padding_mode": "constant_zero",
             "max_padding_ratio_per_side": train_config.max_padding_ratio,
             "spatial_validity": "real_support_only",
             "infeasible_transform_fallback": "bounded_scale_clamp_or_identity_spatial_transform",
@@ -926,6 +1082,8 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         sampling_policy={
             "unit": "eligible_planes" if dimensions in {"2d", "2.5d"} else "volume_patches",
             "max_empty_plane_fraction": train_config.max_empty_plane_fraction,
+            "empty_patch_fraction": train_config.empty_patch_fraction,
+            "crop_sampling": "cached_random_positions",
             "seed": train_config.seed,
             "epoch_sample_budget": len(train_dataset),
             "pool_size": train_dataset.pool_size,
@@ -933,6 +1091,12 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         epoch_sampling=train_dataset.sampling_summary,
         training_instance_sizes=train_instance_sizes,
         validation_instance_sizes=val_instance_sizes,
+        validation_sampling={
+            "policy": "fixed_foreground_and_uniform_crops" if stratified_validation else "center_crop",
+            "foreground_probability": 0.5 if stratified_validation else 0.0,
+            "sample_count": len(val_dataset),
+            "jitter": False,
+        },
     )
     write_json(output_dir / "dataset_plan.json", resolved_dataset_plan)
     callbacks.emit(
@@ -962,6 +1126,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         shuffle=False,
         num_workers=train_config.num_workers,
         pin_memory=device.type == "cuda",
+        collate_fn=collate_spatial_samples if train_dataset.defer_spatial else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -999,9 +1164,9 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         optimizer, train_config.lr_scheduler, total_steps=total_steps, total_epochs=train_config.epochs
     )
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
+        scaler = torch.amp.GradScaler("cuda", enabled=training_dtype == torch.float16)
     except AttributeError:  # pragma: no cover - older torch fallback
-        scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
+        scaler = torch.cuda.amp.GradScaler(enabled=training_dtype == torch.float16)
     model_config = model_folder_config(
         train_config,
         detected_task,
@@ -1018,6 +1183,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             "patch_size": list(patch_size),
             "preferred_patch_size": list(preferred_patch),
             "batch_size": batch_size,
+            "data_cache_mb": train_dataset.reader.max_bytes / 1024**2,
             "microbatch_size": microbatch_size,
             "accumulation_steps": accumulation_steps,
             "effective_batch_size": resolved_effective_batch,
@@ -1041,12 +1207,14 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             "foreground_probability": foreground_probability,
             "skip_empty_images": train_config.skip_empty_images,
             "skip_empty_patches": train_config.skip_empty_patches,
+            "empty_patch_fraction": train_config.empty_patch_fraction,
             "empty_patch_max_retries": train_config.empty_patch_max_retries,
             "include_empty_patches_after_max_retries": train_config.include_empty_patches_after_max_retries,
             "empty_training_images": len(empty_train_pairs),
             "empty_validation_images": len(empty_val_pairs),
             "augmentation_profile": augmentation_profile,
             "mixed_precision": mixed_precision,
+            "resolved_precision": str(training_dtype).removeprefix("torch."),
             "deep_supervision": deep_supervision,
             "effective_loss_weights": effective_loss_weights,
             "target_sparsity": target_sparsity,
@@ -1056,13 +1224,16 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             "device": str(device),
             "input_channels": source_input_channels,
             "output_classes": output_channels,
-            "context_slices": resolved_context_slices if dimensions == "2.5d" else None,
+            "context_slices": resolved_context_slices,
             "context": {
                 "stride_policy": resolved_context_policy,
                 "stride": train_config.context.stride,
                 "spacing": resolved_context_spacing,
             },
-            "spacing": {**asdict(train_config.spacing), "target_spacing": dataset_plan.target_spacing},
+            "spacing": {
+                **asdict(train_config.spacing),
+                "target_spacing": dataset_plan.target_spacing,
+            },
             "progress_update_interval": progress_update_interval,
             "log_update_interval": log_update_interval,
             "augmentation": asdict(train_dataset.augmentation),
@@ -1107,6 +1278,11 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         ),
     }
     write_json(output_dir / "model_metadata.json", model_metadata)
+    resumed = None
+    if resume_from is not None:
+        resumed = _restore_completed_epoch(resume_from, model, optimizer, lr_scheduler, model_config, output_dir)
+        logger.warning("Resuming completed epoch %s; legacy checkpoints do not preserve augmentation RNG state",
+                       resumed["epoch"])
     callbacks.emit(
         "training_plan",
         message="UNet training plan resolved",
@@ -1130,6 +1306,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         config_path=str(output_dir / "config.json"),
         max_padding_ratio=train_config.max_padding_ratio,
         max_empty_plane_fraction=train_config.max_empty_plane_fraction,
+        empty_patch_fraction=train_config.empty_patch_fraction,
         adapted_layers_learning_rate=(
             finetune_report.adapted_layers_learning_rate if finetune_report is not None else None
         ),
@@ -1145,15 +1322,21 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
         memory_plan=memory_plan.to_dict(),
         steps_per_epoch=steps_per_epoch,
         augmentation_profile=augmentation_profile,
+        resolved_precision=str(training_dtype).removeprefix("torch."),
     )
 
-    history: list[dict[str, Any]] = []
-    best_score = -float("inf")
-    full_validation_best = -float("inf")
-    full_validation_bad = 0
-    global_step = 0
+    history: list[dict[str, Any]] = resumed["history"] if resumed else []
+    best_score = resumed["best_score"] if resumed else -float("inf")
+    full_validation_best = resumed["full_validation_best"] if resumed else -float("inf")
+    full_validation_bad = resumed["full_validation_bad"] if resumed else 0
+    global_step = resumed["step"] if resumed else 0
+    first_epoch = resumed["epoch"] + 1 if resumed else 1
+    if resumed:
+        callbacks.emit("training_resumed", message=f"Resuming at epoch {first_epoch}/{train_config.epochs}",
+                       epoch=resumed["epoch"], step=global_step, checkpoint_path=str(resume_from),
+                       learning_rate=lr_scheduler.current_lr, augmentation_rng_restored=False)
     latest_preview_path: str | None = None
-    for epoch in range(1, train_config.epochs + 1):
+    for epoch in range(first_epoch, train_config.epochs + 1):
         active_training.update(epoch=epoch, step=global_step)
         check_cancel()
         train_dataset.set_epoch(epoch)
@@ -1162,7 +1345,11 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             {"epoch": epoch, "sources": train_dataset.sampling_summary},
         )
         model.train()
-        train_losses: list[dict[str, float]] = []
+        epoch_loss_sums: dict[str, torch.Tensor] = {}
+        epoch_loss_count = 0
+        log_loss_sums: dict[str, torch.Tensor] = {}
+        log_loss_count = 0
+        update_losses: list[torch.Tensor] = []
         optimizer.zero_grad(set_to_none=True)
         for microstep, (images, target_batch) in enumerate(train_loader, start=1):
             if callbacks.cancel_requested():
@@ -1178,9 +1365,20 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                     arch,
                     model_config,
                 )
-            images = images.to(device, non_blocking=True)
+            images = (
+                images.materialize(device)
+                if isinstance(images, SpatialImageBatch)
+                else images.to(device, non_blocking=True)
+            )
+            cpu_validity = target_batch.get("valid") if isinstance(target_batch, dict) else None
             target_batch = _move_target(target_batch, device)
-            with torch.autocast(device_type="cuda", enabled=mixed_precision):
+            if train_dataset.defer_spatial:
+                assert isinstance(target_batch, dict)
+                target_batch = complete_device_targets(detected_task, target_batch, label_values)
+            if train_dataset.defer_photometric:
+                valid = target_batch.get("valid") if isinstance(target_batch, dict) else None
+                images = apply_tensor_photometric_augmentation(images, valid, train_dataset.augmentation)
+            with torch.autocast(device_type=device.type, dtype=training_dtype, enabled=mixed_precision):
                 logits = model(images)
                 loss, components = compute_loss(
                     detected_task,
@@ -1189,24 +1387,46 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                     effective_loss_weights,
                     focal_gamma=train_config.focal_gamma,
                     focal_alpha=train_config.focal_alpha,
+                    cpu_validity=cpu_validity,
                 )
             scaler.scale(loss / accumulation_steps).backward()
-            component_floats = _tensor_losses_to_float(components)
-            component_floats["total_loss"] = float(loss.detach().cpu().item())
-            train_losses.append(component_floats)
+            update_losses.append(loss.detach())
+
+            scalar_losses = {**components, "total_loss": loss.detach()}
+            _accumulate_tensor_losses(epoch_loss_sums, scalar_losses)
+            _accumulate_tensor_losses(log_loss_sums, scalar_losses)
+            epoch_loss_count += 1
+            log_loss_count += 1
+
             if microstep % accumulation_steps != 0:
                 continue
+            scaler.unscale_(optimizer)
+            _check_optimizer_update(model, update_losses, epoch=epoch, step=global_step + 1)
+            update_losses.clear()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
             active_training["step"] = global_step
             lr_scheduler.step_batch()
-            if global_step % log_update_interval == 0:
-                logger.info("step=%s/%s epoch=%s train=%s", global_step, total_steps, epoch, component_floats)
-            should_emit_step = (
+
+            should_log_step = global_step % log_update_interval == 0
+            should_emit_step = bool(callbacks.callbacks) and (
                 global_step == 1 or global_step == total_steps or global_step % progress_update_interval == 0
             )
+            if should_log_step or should_emit_step:
+                reported_losses = _tensor_losses_to_float(_mean_tensor_losses(log_loss_sums, log_loss_count))
+                log_loss_sums.clear()
+                log_loss_count = 0
+            if should_log_step:
+                logger.info(
+                    "step=%s/%s epoch=%s train=%s",
+                    global_step,
+                    total_steps,
+                    epoch,
+                    reported_losses,
+                )
+
             if should_emit_step and not callbacks.emit(
                 "progress",
                 message=f"UNet training epoch {epoch}/{train_config.epochs}",
@@ -1217,7 +1437,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                 total_epochs=train_config.epochs,
                 total_steps=total_steps,
                 learning_rate=lr_scheduler.current_lr,
-                losses={f"train/{key}": value for key, value in component_floats.items()},
+                losses={f"train/{key}": value for key, value in reported_losses.items()},
                 metrics={},
             ):
                 return _cancel_training(
@@ -1233,6 +1453,15 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                     model_config,
                 )
 
+        train_loss_means = _tensor_losses_to_float(_mean_tensor_losses(epoch_loss_sums, epoch_loss_count))
+
+        _save_checkpoint(
+            output_dir / "weights_last.pt", model, optimizer, lr_scheduler, epoch,
+            detected_task, arch,
+            {"epoch": epoch, "train_losses": train_loss_means, "validation_pending": True},
+            model_config,
+        )
+
         model.eval()
         val_losses: list[dict[str, float]] = []
         val_metrics: list[dict[str, float]] = []
@@ -1241,6 +1470,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                 if val_step >= train_config.validation.light_steps:
                     break
                 images = images.to(device, non_blocking=True)
+                cpu_validity = target_batch.get("valid") if isinstance(target_batch, dict) else None
                 target_batch = _move_target(target_batch, device)
                 logits = model(images)
                 loss, components = compute_loss(
@@ -1250,15 +1480,17 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                     effective_loss_weights,
                     focal_gamma=train_config.focal_gamma,
                     focal_alpha=train_config.focal_alpha,
+                    cpu_validity=cpu_validity,
                 )
-                losses = _tensor_losses_to_float(components)
-                losses["total_loss"] = float(loss.detach().cpu().item())
+                losses = _tensor_losses_to_float(
+                    {**components, "total_loss": loss}, context=f"validation loss at epoch {epoch}, batch {val_step + 1}"
+                )
                 val_losses.append(losses)
                 val_metrics.append(compute_metrics(detected_task, logits, target_batch))
 
         epoch_record: dict[str, Any] = {
             "epoch": epoch,
-            "train_losses": _mean_dict(train_losses),
+            "train_losses": train_loss_means,
             "val_losses": _mean_dict(val_losses),
             "val_metrics": _mean_dict(val_metrics),
         }
@@ -1308,6 +1540,21 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             epoch_record["val_losses"],
             epoch_record["val_metrics"],
         )
+        _save_checkpoint(
+            output_dir / "weights_last.pt", model, optimizer, lr_scheduler, epoch,
+            detected_task, arch, epoch_record, model_config,
+        )
+        if selector_update and score >= best_score:
+            best_score = score
+            _save_checkpoint(
+                output_dir / "weights_best.pt", model, optimizer, lr_scheduler, epoch,
+                detected_task, arch, epoch_record, model_config,
+            )
+            _atomic_copy(output_dir / "weights_best.pt", output_dir / "model.pt")
+        write_json(
+            output_dir / "metrics.json",
+            {"history": history, "best_score": best_score if math.isfinite(best_score) else None},
+        )
         if not callbacks.emit(
             "progress",
             message=f"UNet validation epoch {epoch}",
@@ -1322,7 +1569,7 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
             metrics={f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
             last_checkpoint_path=str(output_dir / "weights_last.pt"),
             best_checkpoint_path=str(output_dir / "weights_best.pt")
-            if score >= best_score or (output_dir / "weights_best.pt").exists()
+            if (output_dir / "weights_best.pt").exists()
             else None,
         ):
             return _cancel_training(
@@ -1338,34 +1585,6 @@ def _train(config: dict[str, Any] | TrainingConfig, task: Any = None) -> dict[st
                 model_config,
             )
 
-        _save_checkpoint(
-            output_dir / "weights_last.pt",
-            model,
-            optimizer,
-            lr_scheduler,
-            epoch,
-            detected_task,
-            arch,
-            epoch_record,
-            model_config,
-        )
-        if selector_update and score >= best_score:
-            best_score = score
-            _save_checkpoint(
-                output_dir / "weights_best.pt",
-                model,
-                optimizer,
-                lr_scheduler,
-                epoch,
-                detected_task,
-                arch,
-                epoch_record,
-                model_config,
-            )
-        write_json(
-            output_dir / "metrics.json",
-            {"history": history, "best_score": best_score if math.isfinite(best_score) else None},
-        )
         preview_event = _save_previews(
             output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count
         )

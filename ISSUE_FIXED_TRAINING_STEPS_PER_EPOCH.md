@@ -44,8 +44,11 @@ explicitly.
 ## Resolution
 
 Training now samples cases, center slices, patches, scales, and augmentations
-from a deterministic index-derived random stream. The automatic optimizer-step
-budget is `max(250, ceil(10 * training_cases / effective_batch_size))`.
+from a deterministic index-derived random stream. Small (`tiny`) models use
+`ceil(max(1000, 10 * training_cases) / effective_batch_size)` automatic optimizer
+steps. Medium, big and large retain
+`max(250, ceil(10 * training_cases / effective_batch_size))`.
+Explicit step counts and step minima remain overrides.
 Microbatch accumulation is counted separately, callbacks report optimizer
 steps, polynomial scheduling advances by epoch, and validation remains finite
 and deterministic.
