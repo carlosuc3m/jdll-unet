@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .losses import Logits, masked_mean, primary_logits, valid_support
-from .postprocess import postprocess_instance
+from .postprocess import _remove_small, postprocess_binary, postprocess_instance
 
 try:  # pragma: no cover
     from scipy import ndimage as ndi
@@ -21,10 +21,10 @@ def _safe_float(value: torch.Tensor | float) -> float:
 
 
 def binary_metrics(
-    logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, valid: torch.Tensor | None = None
+    logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, valid: torch.Tensor | None = None,
+    *, prediction: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    probs = torch.sigmoid(logits)
-    pred = probs >= threshold
+    pred = torch.sigmoid(logits) >= threshold if prediction is None else prediction
     target_bool = target.bool()
     if valid is not None:
         pred = pred & valid
@@ -38,9 +38,10 @@ def binary_metrics(
 
 
 def multiclass_metrics(
-    logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None
+    logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None = None,
+    *, prediction: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    pred = torch.argmax(logits, dim=1)
+    pred = torch.argmax(logits, dim=1) if prediction is None else prediction
     classes = int(logits.shape[1])
     result: dict[str, float] = {}
     dices: list[float] = []
@@ -59,7 +60,8 @@ def multiclass_metrics(
     return result
 
 
-def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> dict[str, float]:
+def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor],
+                     postprocessing: dict | None = None) -> dict[str, float]:
     valid = valid_support(target, logits)
     metrics = binary_metrics(logits[:, 0:1], target["foreground"], valid=valid)
     metrics = {f"foreground_{key}": value for key, value in metrics.items()}
@@ -106,7 +108,8 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> d
             truths = np.where(support[:, 0], truths, 0)
         instance_values: list[dict[str, float]] = []
         for index in range(len(truths)):
-            predicted = postprocess_instance(p[index, 0], p[index, 1], p[index, 2], min_object_size=0)["labels"]
+            predicted = postprocess_instance(p[index, 0], p[index, 1], p[index, 2],
+                                             **({"min_object_size": 0, **(postprocessing or {})}))["labels"]
             instance_values.append(_instance_label_metrics(predicted, truths[index]))
         for key in instance_values[0] if instance_values else ():
             metrics[key] = float(np.mean([value[key] for value in instance_values]))
@@ -114,17 +117,36 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor]) -> d
 
 
 def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
-    pred_ids = [int(value) for value in np.unique(prediction) if int(value) != 0]
-    true_ids = [int(value) for value in np.unique(target) if int(value) != 0]
+    if prediction.shape != target.shape:
+        raise ValueError("Instance predictions and targets must have the same shape")
+    pred_areas: dict[int, int] = {}
+    true_areas: dict[int, int] = {}
+    intersections: dict[tuple[int, int], int] = {}
+    # One bounded contingency scan, not one whole-volume scan per object pair.
+    for start in range(0, target.size, 1_048_576):
+        pred = prediction.flat[start:start + 1_048_576]
+        truth = target.flat[start:start + 1_048_576]
+        for values, destination in ((pred, pred_areas), (truth, true_areas)):
+            ids, counts = np.unique(values, return_counts=True)
+            for label, count in zip(ids, counts, strict=True):
+                if label:
+                    destination[int(label)] = destination.get(int(label), 0) + int(count)
+        support = (pred != 0) & (truth != 0)
+        pairs = np.empty(np.count_nonzero(support), dtype=[("true", target.dtype), ("pred", prediction.dtype)])
+        pairs["true"], pairs["pred"] = truth[support], pred[support]
+        values, counts = np.unique(pairs, return_counts=True)
+        for pair, count in zip(values, counts, strict=True):
+            key = (int(pair["true"]), int(pair["pred"]))
+            intersections[key] = intersections.get(key, 0) + int(count)
+    pred_ids, true_ids = sorted(pred_areas), sorted(true_areas)
     candidates: list[tuple[float, int, int, int, int]] = []
-    for true_id in true_ids:
-        truth = target == true_id
-        for pred_id in pred_ids:
-            pred = prediction == pred_id
-            intersection = int(np.count_nonzero(truth & pred))
-            if intersection:
-                union = int(np.count_nonzero(truth | pred))
-                candidates.append((intersection / union, true_id, pred_id, intersection, union))
+    overlaps_by_true = dict.fromkeys(true_ids, 0)
+    overlaps_by_pred = dict.fromkeys(pred_ids, 0)
+    for (true_id, pred_id), intersection in intersections.items():
+        union = true_areas[true_id] + pred_areas[pred_id] - intersection
+        candidates.append((intersection / union, true_id, pred_id, intersection, union))
+        overlaps_by_true[true_id] += 1
+        overlaps_by_pred[pred_id] += 1
     matched_true: set[int] = set()
     matched_pred: set[int] = set()
     matches: list[tuple[float, int, int, int, int]] = []
@@ -144,10 +166,8 @@ def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshol
     recall = tp / (tp + fn) if tp + fn else 1.0
     matched_intersection = sum(item[3] for item in matches)
     matched_union = sum(item[4] for item in matches)
-    unmatched = sum(np.count_nonzero(prediction == value) for value in pred_ids if value not in matched_pred)
-    unmatched += sum(np.count_nonzero(target == value) for value in true_ids if value not in matched_true)
-    overlaps_by_true = {true_id: sum(iou > 0 for iou, tid, *_rest in candidates if tid == true_id) for true_id in true_ids}
-    overlaps_by_pred = {pred_id: sum(iou > 0 for iou, _tid, pid, *_rest in candidates if pid == pred_id) for pred_id in pred_ids}
+    unmatched = sum(pred_areas[value] for value in pred_ids if value not in matched_pred)
+    unmatched += sum(true_areas[value] for value in true_ids if value not in matched_true)
     return {
         "panoptic_quality": recognition * segmentation,
         "object_precision": precision,
@@ -163,6 +183,7 @@ def compute_metrics(
     task: str,
     logits: Logits,
     target: torch.Tensor | dict[str, torch.Tensor],
+    *, postprocessing: dict | None = None,
 ) -> dict[str, float]:
     logits = primary_logits(logits)
     valid = valid_support(target, logits)
@@ -170,13 +191,33 @@ def compute_metrics(
         target = target["semantic"]
     if task == "binary_semantic":
         assert isinstance(target, torch.Tensor)
-        return binary_metrics(logits, target, valid=valid)
+        prediction = None
+        if postprocessing is not None:
+            probabilities = torch.sigmoid(logits).detach().cpu().numpy()
+            if valid is not None:
+                probabilities = np.where(valid.detach().cpu().numpy(), probabilities, -1)
+            masks = [postprocess_binary(p[0], threshold=postprocessing.get("threshold", 0.5),
+                     min_object_size=postprocessing.get("min_object_size", 0),
+                     fill_holes=postprocessing.get("fill_holes", False), connected_components=False)["mask"]
+                     for p in probabilities]
+            prediction = torch.from_numpy(np.stack(masks)[:, None].astype(bool)).to(logits.device)
+        return binary_metrics(logits, target, valid=valid, prediction=prediction)
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
-        return multiclass_metrics(logits, target, valid=valid)
+        prediction = None
+        if postprocessing and postprocessing.get("min_object_size", 0) > 0:
+            labels = logits.argmax(1).detach().cpu().numpy()
+            if valid is not None:
+                labels = np.where(valid[:, 0].detach().cpu().numpy(), labels, 0)
+            for item in labels:
+                for cls in range(1, logits.shape[1]):
+                    region = item == cls
+                    item[region & ~_remove_small(region, postprocessing["min_object_size"])] = 0
+            prediction = torch.from_numpy(labels).to(logits.device)
+        return multiclass_metrics(logits, target, valid=valid, prediction=prediction)
     if task == "instance_friendly":
         assert isinstance(target, dict)
-        return instance_metrics(logits, target)
+        return instance_metrics(logits, target, postprocessing)
     raise ValueError(f"Unsupported task: {task}")
 
 

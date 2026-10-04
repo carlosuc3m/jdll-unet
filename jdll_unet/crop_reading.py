@@ -128,3 +128,46 @@ class CropArray:
     def __array__(self, dtype: DTypeLike | None = None, copy: bool | None = None) -> np.ndarray:
         result = self[(slice(None),) * self.ndim]
         return np.asarray(result, dtype=dtype).copy() if copy else np.asarray(result, dtype=dtype)
+
+
+@dataclass
+class ResizedCropArray:
+    """Crop-first global half-pixel image/nearest-label resize, without full arrays."""
+
+    source: np.ndarray | CropArray | ResizedCropArray
+    spatial_shape: tuple[int, ...]
+    mask: bool = False
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.spatial_shape if self.mask else (self.source.shape[0], *self.spatial_shape)
+
+    def __getitem__(self, selection: tuple[slice, ...]) -> np.ndarray:
+        spatial = selection if self.mask else selection[1:]
+        native_shape = self.source.shape if self.mask else self.source.shape[1:]
+        if tuple(native_shape) == self.spatial_shape:
+            return self.source[selection]
+        coordinates = []
+        ratios = []
+        for s, n, m in zip(spatial, native_shape, self.spatial_shape, strict=True):
+            start, stop, step = s.indices(m)
+            if step != 1 or start >= stop:
+                raise IndexError("Resized crop arrays require nonempty unit-stride slices")
+            ratio = n / m
+            coords = np.arange(start, stop, dtype=np.float64) * ratio
+            if not self.mask:
+                coords += (ratio - 1) / 2
+            coordinates.append(coords)
+            ratios.append(ratio)
+        native = tuple(slice(max(0, int(np.floor(c[0]))), min(n, int(np.ceil(c[-1])) + 1))
+                       for c, n in zip(coordinates, native_shape, strict=True))
+        raw = self.source[native if self.mask else (slice(None), *native)]
+        if self.mask:
+            indices = [np.clip(np.floor(c).astype(np.intp), 0, n - 1) - s.start
+                       for c, n, s in zip(coordinates, native_shape, native, strict=True)]
+            return raw[np.ix_(*indices)]
+        offset = [c[0] - s.start for c, s in zip(coordinates, native, strict=True)]
+        result = np.stack([ndi.affine_transform(channel, np.diag(ratios), offset=offset,
+                          output_shape=tuple(len(c) for c in coordinates), order=1, mode="nearest", prefilter=False)
+                          for channel in raw])
+        return result[selection[0]]

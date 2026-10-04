@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import numpy as np
 import torch
 
@@ -80,7 +82,7 @@ def multiclass_target(mask: np.ndarray, label_values: list[int] | None = None) -
 def boundary_target(mask: np.ndarray, width: int = 1, validity: np.ndarray | None = None) -> np.ndarray:
     """Mixed boundary: outside ring, two-sided ID interfaces, and object voxels at array edges."""
 
-    labels = mask.astype(np.int64, copy=False)
+    labels = mask
     boundary = np.zeros(labels.shape, dtype=bool)
     for axis in range(labels.ndim):
         before: list[slice | int] = [slice(None)] * labels.ndim
@@ -117,12 +119,14 @@ def normalized_instance_distance(
     mask: np.ndarray,
     spacing: tuple[float, ...] | None = None,
     validity: np.ndarray | None = None,
+    regions: Iterable[tuple[int, tuple[slice, ...]]] | None = None,
 ) -> np.ndarray:
     target = np.zeros(mask.shape, dtype=np.float32)
     if ndi is None:
         return target[None, ...]
 
-    for instance_id, bbox in enumerate(ndi.find_objects(mask), start=1):
+    boxes = regions if regions is not None else enumerate(ndi.find_objects(mask), start=1)
+    for instance_id, bbox in boxes:
         if bbox is None:
             continue
         expanded = tuple(

@@ -122,9 +122,63 @@ class ContextConfig:
 class ValidationConfig:
     mode: str = "full"
     light_every: int = 1
-    full_every: int = 5
+    full_every: int | None = None
     light_steps: int = 50
-    early_stopping_patience: int = 20
+    early_stopping_patience: int | None = None
+    minimum_batches: int = 50
+    minimum_samples: int = 100
+    foreground_fraction: float = 0.33
+    minimum_foreground: float = 0.01
+    minimum_source_fraction: float = 0.5
+    max_sampling_overlap: float = 0.10
+    candidate_attempts: int = 16
+    preview_max_bytes: int | str = AUTO
+    tile_overlap: float = 0.25
+    tile_blending: str = "constant"
+
+    def __post_init__(self) -> None:
+        if self.light_steps != self.minimum_batches:
+            if self.light_steps == 50:
+                self.light_steps = self.minimum_batches
+            elif self.minimum_batches == 50:
+                self.minimum_batches = self.light_steps
+            else:
+                raise ConfigError("validation.light_steps and minimum_batches must agree")
+
+
+def _validation_config(value: Any) -> ValidationConfig:
+    if isinstance(value, Mapping):
+        value = dict(value)
+        for name in ("light_steps", "minimum_batches"):
+            if value.get(name) == AUTO:
+                value.pop(name)
+        if "light_steps" in value:
+            if "minimum_batches" in value and value["minimum_batches"] != value["light_steps"]:
+                raise ConfigError("validation.light_steps and minimum_batches must agree when both are supplied")
+            value.setdefault("minimum_batches", value["light_steps"])
+    result = _nested_dataclass(ValidationConfig, value)
+    result.light_steps = result.minimum_batches
+    return result
+
+
+def resolve_validation_config(config: TrainingConfig, dimensions: str, preset: str) -> None:
+    """Resolve dimensional defaults after automatic architecture planning."""
+    validation = config.validation
+    volumetric = dimensions in {"2.5d", "3d"}
+    if validation.full_every is None:
+        validation.full_every = 0 if volumetric or validation.mode == "light" else 5
+    if validation.early_stopping_patience is None:
+        validation.early_stopping_patience = 0 if volumetric else 20
+    if volumetric and validation.light_every != 1:
+        raise ConfigError("Volumetric regular validation runs every epoch; validation.light_every must be 1")
+    if volumetric and validation.early_stopping_patience:
+        raise ConfigError("Volumetric early stopping is disabled; set validation.early_stopping_patience=0 and use cancellation")
+    if volumetric and validation.mode == "light" and validation.full_every:
+        raise ConfigError("validation.mode='light' conflicts with a positive full_every; use mode='full' or full_every=0")
+    if validation.preview_max_bytes == AUTO:
+        validation.preview_max_bytes = (600 if any(part in {"big", "large"} for part in preset.split("-")) else 256) * 1024**2
+    if volumetric and "preview_count" not in config._provided_fields:
+        config.preview_count = 4
 
 
 @dataclass(slots=True)
@@ -267,6 +321,7 @@ class TrainingConfig:
             "spacing",
             "instance_scale_normalization",
             "effective_batch_size",
+            "preview_count",
         }
         for option in fields(type(self)):
             if option.name in inheritable and option.name not in self._provided_fields:
@@ -549,7 +604,7 @@ def parse_training_config(
             ),
             context=_nested_dataclass(ContextConfig, raw.get("context")),
             spacing=_nested_dataclass(SpacingConfig, raw.get("spacing")),
-            validation=_nested_dataclass(ValidationConfig, raw.get("validation")),
+            validation=_validation_config(raw.get("validation")),
             effective_batch_size=int(raw.get("effective_batch_size", 4)),
             steps_per_epoch=_auto_or_int(raw.get("steps_per_epoch", AUTO), "steps_per_epoch"),
             minimum_steps_per_epoch=(
@@ -658,8 +713,27 @@ def parse_training_config(
     validation = parsed.validation
     if validation.mode not in {"light", "full"}:
         raise ConfigError("validation.mode must be 'light' or 'full'")
-    if min(validation.light_every, validation.full_every, validation.light_steps, validation.early_stopping_patience) < 1:
-        raise ConfigError("validation intervals, steps, and patience must be positive")
+    for name in ("light_every", "light_steps", "minimum_batches", "minimum_samples", "candidate_attempts"):
+        value = getattr(validation, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(f"validation.{name} must be a positive integer")
+    for name in ("full_every", "early_stopping_patience"):
+        value = getattr(validation, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ConfigError(f"validation.{name} must be null or a nonnegative integer; 0 disables it")
+    for name in ("foreground_fraction", "minimum_foreground", "minimum_source_fraction", "max_sampling_overlap", "tile_overlap"):
+        value = getattr(validation, name)
+        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or not 0 <= float(value) <= 1:
+            raise ConfigError(f"validation.{name} must be a finite fraction in [0, 1]")
+    if validation.minimum_foreground <= 0 or validation.max_sampling_overlap > 0.10 or validation.tile_overlap >= 1:
+        raise ConfigError("Validation requires positive foreground occupancy, sampling overlap <= 0.10, and tile_overlap < 1")
+    if validation.preview_max_bytes != AUTO and (
+        isinstance(validation.preview_max_bytes, bool) or not isinstance(validation.preview_max_bytes, int)
+        or validation.preview_max_bytes < 1
+    ):
+        raise ConfigError("validation.preview_max_bytes must be 'auto' or a positive integer byte count")
+    if validation.tile_blending not in {"constant", "gaussian"}:
+        raise ConfigError("validation.tile_blending must be 'constant' or 'gaussian'")
     _validate_auto_positive_int(parsed.input_channels, "input_channels")
     _validate_auto_positive_int(parsed.output_classes, "output_classes")
     _validate_auto_positive_int(parsed.batch_size, "batch_size")

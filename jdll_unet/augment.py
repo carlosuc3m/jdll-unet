@@ -185,6 +185,26 @@ class EmptyPatchError(RuntimeError):
     """Signal that patch sampling should continue with another training image."""
 
 
+def instance_crop_shape(cfg: AugmentationConfig, shape: tuple[int, ...], object_size: float,
+                        jitter: float = 1.0) -> tuple[int, ...]:
+    """Resolve nominal/jittered crop geometry with the shared padding safeguard."""
+    if object_size <= 0:
+        raise ValueError("A positive object diameter estimate is required for instance scale normalization")
+    scale = float(np.clip(cfg.target_object_diameter_px / object_size * jitter,
+                          cfg.min_effective_scale, cfg.max_effective_scale))
+    source = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
+    try:
+        padding_extents(shape, source, cfg.max_padding_ratio)
+    except DatasetError:
+        feasible_scale = max(p / max(1, math.floor((1 + 2 * cfg.max_padding_ratio) * n))
+                             for p, n in zip(cfg.patch_size, shape, strict=True))
+        scale = max(scale, feasible_scale)
+        if scale > cfg.max_effective_scale:
+            raise EmptyPatchError("No feasible scale within the padding/scale limits") from None
+        source = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
+    return source
+
+
 def _spatial_affine(
     image: np.ndarray,
     mask: np.ndarray,
@@ -351,26 +371,7 @@ def apply_augmentation(
         if training:
             low, high = cfg.training_scale_jitter
             jitter = float(np.exp(rng.uniform(np.log(low), np.log(high))))
-        scale = float(
-            np.clip(
-                cfg.target_object_diameter_px / object_diameter_px * jitter,
-                cfg.min_effective_scale,
-                cfg.max_effective_scale,
-            )
-        )
-        source_patch_size = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
-        try:
-            padding_extents(tuple(mask.shape), source_patch_size, cfg.max_padding_ratio)
-        except DatasetError:
-            # Clamp infeasible jitter to the smallest feasible scale, keeping shape fixed.
-            feasible_scale = max(
-                p / max(1, math.floor((1 + 2 * cfg.max_padding_ratio) * length))
-                for p, length in zip(cfg.patch_size, mask.shape, strict=True)
-            )
-            scale = max(scale, feasible_scale)
-            if scale > cfg.max_effective_scale:
-                raise EmptyPatchError("No feasible scale within the padding/scale limits") from None
-            source_patch_size = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
+        source_patch_size = instance_crop_shape(cfg, tuple(mask.shape), object_diameter_px, jitter)
         image, mask, validity = sample_patch(
             image,
             mask,

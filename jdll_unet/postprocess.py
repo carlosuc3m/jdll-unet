@@ -134,24 +134,27 @@ def postprocess_instance(
         markers, _ = ndi.label(seeds, structure=structure)
         components, count = ndi.label(foreground, structure=structure)
         next_marker = int(markers.max()) + 1
-        for component_id in range(1, count + 1):
-            component = components == component_id
-            if np.any(markers[component]):
+        for component_id, bbox in enumerate(ndi.find_objects(components, max_label=count), start=1):
+            if bbox is None:
                 continue
-            values = np.where(component, clean, -np.inf)
+            component = components[bbox] == component_id
+            local_markers = markers[bbox]
+            if np.any(local_markers[component]):
+                continue
+            values = np.where(component, clean[bbox], -np.inf)
             index = int(np.argmax(values))
             if np.isfinite(values.flat[index]):
-                markers.flat[index] = next_marker
+                local_markers.flat[index] = next_marker
                 next_marker += 1
         labels = watershed(-clean + boundary_weight * boundary_probability, markers, mask=foreground, connectivity=structure)
-        cleaned = np.zeros(labels.shape, dtype=np.uint32)
-        next_id = 1
-        for instance_id in range(1, int(labels.max()) + 1):
-            region = labels == instance_id
-            if int(region.sum()) >= min_object_size:
-                cleaned[region] = next_id
-                next_id += 1
-        labels = cleaned
+        # Watershed marker IDs are compact (unlike arbitrary source annotation
+        # IDs), so a count lookup replaces repeated whole-volume object scans.
+        sizes = np.bincount(labels.reshape(-1))
+        keep = sizes >= min_object_size
+        keep[0] = False
+        mapping = np.zeros(len(sizes), dtype=np.uint32)
+        mapping[keep] = np.arange(1, np.count_nonzero(keep) + 1, dtype=np.uint32)
+        labels = mapping[labels]
     return {
         "foreground_mask": foreground.astype(np.uint8),
         "boundary_mask": separators.astype(np.uint8),

@@ -483,10 +483,107 @@ saved configurations with explicit steps or a minimum of 250 retain those
 settings. To adopt the new automatic small-model policy, set
 `steps_per_epoch="auto"` and `minimum_steps_per_epoch=null` (or omit the latter).
 
-Light patch validation runs every epoch. Full tiled per-case validation runs
-every five epochs by default, selects checkpoints, and drives early stopping
-after 20 unimproved full validations. Setting `validation.mode` to `light`
-disables full-case selection.
+For 2.5D/3D, fixed patch validation runs every epoch and selects checkpoints.
+Full-volume validation is optional and diagnostic only, disabled by default
+(including the final epoch). Early stopping is disabled; use cooperative
+cancellation. Existing 2D behavior is unchanged: full validation defaults to
+every five epochs plus the final epoch, with full-case checkpoint selection and
+patience of 20 full validations; `validation.mode="light"` uses patch selection.
+
+### Volumetric Validation
+
+The configurable volumetric defaults are:
+
+```json
+{
+  "preview_count": 4,
+  "validation": {
+    "minimum_batches": 50,
+    "minimum_samples": 100,
+    "foreground_fraction": 0.33,
+    "minimum_foreground": 0.01,
+    "minimum_source_fraction": 0.5,
+    "max_sampling_overlap": 0.10,
+    "candidate_attempts": 16,
+    "preview_max_bytes": "auto",
+    "tile_overlap": 0.25,
+    "tile_blending": "constant",
+    "full_every": 0,
+    "early_stopping_patience": 0
+  }
+}
+```
+
+`B` is the resolved validation microbatch, not the effective accumulated
+training batch. The base budget is `max(50, ceil(100 / B)) * B` patches:
+100 at B=1/2, 200 at B=4. Sampling uses a seeded spatial lattice, normally with
+no overlap; insufficient capacity permits up to the configured overlap per
+axis. This is independent of inference tile overlap. If that capacity is still
+below the base budget, use all available lattice patches, remove foreground
+requirements, and allow a partial final batch. This is a bounded feasible
+packing, not a claim of globally optimal arbitrary-coordinate packing.
+
+Normally `ceil(0.33 * samples)` patches are forced positives, measured on real
+target support (the central plane for 2.5D). At least half of eligible positive
+sources contribute where feasible. The other samples are unconstrained, not
+necessarily empty. Cached foreground reservoirs supply candidates; masks are
+checked before images. Search stops when the quota/coverage is met or after
+`candidate_attempts * forced_quota` attempts. For sparse annotations, lower the
+occupancy threshold to the strongest feasible bounded candidate set; if still
+necessary, report a quota/coverage shortfall. Never invent foreground, repeat
+patches, change scale, or discard genuine negative validation cases to fill it.
+
+`validation_plan.json` records source paths/fingerprints, held-out geometry, fixed
+domain/cell coordinates, forced sample indices, requested/achieved counts,
+coverage, and fallback diagnostics. It is reused across epochs and compatible
+resume. Inputs retain nominal scale normalization, without augmentation or
+jitter. One forward supplies the loss, metrics, and retained preview anchors.
+Dice/IoU pool valid voxel counts; multiclass Dice averages foreground classes.
+Instance reconstruction metrics and binary Dice loss average per patch.
+Pointwise losses weight their actual valid foreground/background support;
+multiclass soft Dice pools per-class statistics. Deep supervision uses the same
+rules per head before its configured head-weighted total.
+
+Best selection maximizes regular `dice` (binary), `mean_dice` (multiclass), or
+`foreground_dice` (instance-friendly). The plateau scheduler uses that same
+regular score. Ties preserve the existing overwrite policy but are not reported
+as improvements. Regular history remains in `metrics.json`; full diagnostics
+are separate in `full_validation_metrics.json` and cannot replace the selector.
+Full semantic diagnostics apply configured semantic cleanup; instance object
+metrics use configured reconstruction while foreground Dice remains the standard
+0.5-threshold metric. No automatic threshold optimization is performed.
+
+`weights_last.pt`, `weights_best.pt`, and `model.pt` are published before optional
+diagnostics. An interrupted volumetric epoch uses `weights_pending.pt` or
+`weights_cancelled.pt`, retaining an existing completed last checkpoint. Completed
+volumetric checkpoints preserve RNG state. Resume requires the matching saved
+plan, history, selection contract, and `validation_state.json`; incompatible
+legacy full-selector runs fail explicitly. Manual request tokens do not survive
+resume. This does not provide exact mid-epoch continuation.
+
+Four enlarged previews normally reuse four anchors and evaluate twelve extra
+tiles. Layout is one patch deep and two tiles along each XY axis. 2.5D previews
+predict only the actual center plane, not the context stack. Extra tiles never
+enter regular metrics. Continuous outputs are blended before reconstruction.
+`tile_overlap` and `tile_blending` match inference defaults and may be overridden
+for validation; they do not borrow another backend's tiling policy.
+
+The automatic preview working-memory budget is 256 MiB for tiny/medium and
+600 MiB for big/large. Estimates include channels, labels, stitching, and
+reconstruction workspace; separate source-crop/available-RAM checks also apply.
+Previews reduce extent/count or are skipped when necessary. This is not a
+whole-process RAM/VRAM cap. Full diagnostics read normalized/resampled crops,
+stitch on CPU, and process domains sequentially. Native reconstruction still
+requires sizeable work arrays; unsafe full-domain estimates fail the diagnostic
+without invalidating regular checkpoints. No large-case performance guarantee
+is implied by the small correctness tests.
+
+Compatibility: `light_steps` aliases `minimum_batches`; contradictory explicit
+values are rejected. Volumetric `light_every` must be 1. `mode="light"` disables
+full validation and conflicts with a positive `full_every`; it never changes
+volumetric checkpoint selection. A positive legacy volumetric early-stopping
+patience is rejected with instructions to set it to zero. Saved settings resolve
+automatic defaults and round-trip through the parser.
 
 Augmentation defaults are preset-aware: `tiny` and `medium` use the balanced
 profile, while `big` and `large` use the strong profile. Three-dimensional
@@ -542,6 +639,73 @@ progress phases are `inference_start`, repeated `patch_start`/`patch_end`,
 `merge_start`, and `inference_end`. A callable can return `False` to request
 cooperative cancellation. Cancelled inference raises `InferenceCancelled`
 without clearing the loaded-model cache.
+
+### Full-Validation Control and JDLL Handoff
+
+Existing `train(config, task=callback)` calls remain valid. The optional incoming
+`control` is separate from outgoing callbacks and supports either a thread-safe
+controller or a nonblocking callable returning a request ID, a sequence of IDs,
+or `None`. Callback return value `False` remains cancellation, never a command.
+
+```python
+from jdll_unet import FullValidationController, train
+
+control = FullValidationController()
+# A caller thread can invoke this while train() is running; retries reuse the ID.
+control.request_full_validation("request-001")
+result = train(config, task=callback, control=control)
+```
+
+Java owns transport. For example, create a fresh run-specific signal path and
+atomically replace its contents with a new unique token per click. Pass a Python
+polling adapter as `control`; the adapter reads that token without deleting a
+newer request. Repeated reads of the same token are deduplicated by the backend.
+Do not submit another task to the busy Appose worker. The core package has no
+Java/Appose dependency and does not interpret private Java transport fields in
+the training configuration.
+
+The boundary decision occurs before epoch-end regular validation. Requests
+arriving after it wait until the next boundary, including requests made during
+previews or a running full pass. Multiple pending requests and a periodic trigger
+coalesce into one pass. `full_every=N` first runs at N; a pass started at E moves
+the next periodic attempt to E+N (also when that attempt fails). For example,
+periodic 5 plus manual 8 gives next 13. Disabled periodic mode stays disabled
+after a manual request. No unconditional final pass or extra epoch is created.
+
+Event contract (flat payloads; existing generic messages remain readable):
+
+| Type | Machine-readable information |
+| --- | --- |
+| `validation_plan` | Plan path, actual batch size, sample/batch counts, capacity, quota/coverage and fallback fields. |
+| `validation` | `status=started/progress/completed`, 1-based `epoch`, `current/maximum`, `unit=patches`, losses/metrics and aggregation description on completion. |
+| `checkpoint` | `kind=last/best`, `action=saved/overwritten`, epoch, path, scope; best additionally has metric, direction, value and `improved`. |
+| `preview` | Existing `preview_path` and `latest_preview_path`, emitted only after publication. `validation_previews` reports actual saved previews/additional tiles. |
+| `full_validation` | `run_id`, lifecycle status; an accepted pass additionally carries `pass_id`, `request_ids`, selected epoch, and reason. Progress includes domain/tile counts; completion carries separate full metrics and `next_epoch`. |
+
+Full-control statuses are `ready`, `pending`, `accepted`, `started`, `progress`,
+`completed`, `failed`, `cancelled`, and `closed`. `ready.supported=true` advertises
+volumetric support. `pending` carries one `request_id`; pass events acknowledge
+a list of `request_ids`. Clear the GUI's pending toggle on `accepted`, not by
+repeatedly sending its boolean value. A failed optional pass does not close the
+controller or stop training. `closed.unserved_request_ids` identifies late
+requests for which no further boundary exists. Cancellation takes precedence.
+Keep full metrics and validation phase progress separate from regular `val/*`
+curves and training iteration progress. UNet's selector remains Dice, unlike
+StarDist's validation-loss selector.
+
+Volumetric preview manifests have `format_version=2`, scope, actual preview/tile
+counts, and backward-compatible `items` with PNG paths. Each item adds `assets`
+for image, target, prediction, validity and optional probabilities. Asset records
+contain an absolute NPY path, axes, shape, and dtype. Metadata describes spacing,
+source/held-out region, model-grid origin and resampling transform, class-index
+mapping, and actual 2.5D context indices (`null` for padded context). Source target
+IDs are preserved after any configured annotation preparation; semantic
+predictions use classifier indices, and instance
+predictions use reconstructed IDs. Never infer Z predictions from context channels.
+Epoch-specific assets are completed before atomic manifest/event publication;
+the current and previous published epochs are retained for asynchronous viewers.
+Java should consume these arrays/metadata rather than reconstruct geometry or
+run another inference pass. No Java implementation is included in this change.
 
 ## Minimal Inference Example
 

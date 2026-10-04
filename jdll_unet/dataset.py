@@ -17,7 +17,7 @@ from .errors import DatasetError
 from .geometry import domain_reader, eligible_centers, load_domain_image, load_domain_mask, split_sources, stable_seed
 from .io import ImageMaskPair, fit_normalization, load_mask, normalize_image
 from .label_statistics import MaskAnalysis, analyze_mask
-from .planning import resample_image_mask, resolve_context_stride
+from .planning import resample_image_mask, resample_mask, resolve_context_stride
 from .spatial_augment import SpatialImagePlan, SpatialImageSample
 from .targets import prepare_target
 
@@ -342,23 +342,42 @@ class JdllSegmentationDataset(Dataset):
             source_has_instance_ids,
         )
 
+    def validation_mask(self, item_index: int) -> np.ndarray | CropArray:
+        """Mask-only access for planning; never decode an image or fit normalization."""
+        pair_index, center_z = self.items[item_index]
+        pair = self.pairs[pair_index]
+        spacing = self.case_spacings.get(pair.stem)
+        shape = pair.domain_shape
+        if self.dimensions == "3d" and spacing is not None and self.target_spacing is not None:
+            shape = tuple(int(n) for n in np.maximum(1, np.rint(np.array(shape) * spacing / np.array(self.target_spacing))))
+        if pair.mask_axes is not None:
+            return CropArray(pair, self.reader, mask=True, original_mask=self.task != "instance_friendly",
+                             center_z=center_z, resampled_shape=shape)
+        mask = load_domain_mask(pair, self.dimensions, self.reader, raw=True, original=self.task != "instance_friendly")
+        if self.dimensions == "3d" and spacing is not None and self.target_spacing is not None:
+            mask = resample_mask(mask, spacing, self.target_spacing)
+        return mask[center_z] if center_z is not None else mask
+
+    def mask_analysis(self, pair_index: int, mask: np.ndarray | None = None) -> MaskAnalysis:
+        pair = self.pairs[pair_index]
+        preparation = self.reader.session.annotations
+        if preparation is not None:
+            whole = tuple((0, size) for size in pair.spatial_shape)
+            analysis_pair = replace(pair, region=()) if pair.region == whole else pair
+            return preparation.statistics(analysis_pair, self.dimensions, self.reader, mask=mask,
+                                          original=self.task != "instance_friendly")
+        if pair_index not in self._mask_analyses:
+            if mask is None:
+                mask = load_domain_mask(pair, self.dimensions, self.reader, raw=True,
+                                        original=self.task != "instance_friendly")
+            self._mask_analyses[pair_index] = analyze_mask(mask, pair.mask)
+        return self._mask_analyses[pair_index]
+
     def _sampler(self, item_index: int, mask: np.ndarray | CropArray) -> CropSampler:
         if item_index not in self._samplers:
             pair_index, center_z = self.items[item_index]
             pair = self.pairs[pair_index]
-            preparation = self.reader.session.annotations
-            if preparation is not None:
-                whole = tuple((0, size) for size in pair.spatial_shape)
-                analysis_pair = replace(pair, region=()) if pair.region == whole else pair
-                analysis = preparation.statistics(analysis_pair, self.dimensions, self.reader,
-                                                  original=self.task != "instance_friendly")
-            elif pair_index in self._mask_analyses:
-                analysis = self._mask_analyses[pair_index]
-            else:
-                original = load_domain_mask(pair, self.dimensions, self.reader, raw=True,
-                                            original=self.task != "instance_friendly")
-                analysis = analyze_mask(original, pair.mask)
-                self._mask_analyses[pair_index] = analysis
+            analysis = self.mask_analysis(pair_index)
             self._samplers[item_index] = CropSampler(analysis, tuple(mask.shape),
                 stable_seed(self.seed, 0, f"{pair.source_id}:{pair.stem}:{center_z}"),
                 center_z=center_z, instances=self.task == "instance_friendly")

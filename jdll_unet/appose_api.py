@@ -8,14 +8,15 @@ from .callbacks import CallbackDispatcher
 from .infer import infer as _infer
 from .task_detect import detect_task as _detect_task
 from .trainer import train as _train
+from .validation_control import ValidationControl
 
 
 def _emit_error(task: Any, exc: Exception) -> None:
     CallbackDispatcher(task).emit("error", message=str(exc), error_class=exc.__class__.__name__)
 
 
-def train(config: dict, task: Any = None) -> dict:
-    return _train(config, task=task)
+def train(config: dict, task: Any = None, *, control: ValidationControl | None = None) -> dict:
+    return _train(config, task=task, control=control)
 
 
 def infer(config: dict, inputs: dict, task: Any = None, *, callback: Any = None) -> dict:

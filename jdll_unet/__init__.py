@@ -11,10 +11,12 @@ from .errors import (
     JdllUnetError,
     ModelLoadError,
 )
+from .validation_control import FullValidationController
 
 __all__ = [
     "CallbackDispatcher",
     "CallbackEvent",
+    "FullValidationController",
     "ConfigError",
     "DataFormatError",
     "DatasetError",
