@@ -38,6 +38,7 @@ from .config import (
     write_json,
 )
 from .dataset import JdllSegmentationDataset, make_dataset, partition_empty_pairs
+from .device_ops import MPS_3D_NOTICE, autocast_context, validate_device_dimensions
 from .errors import DatasetError, ModelLoadError, TrainingError
 from .finetune import (
     FineTuneReport,
@@ -799,6 +800,7 @@ def _train(
         if source_model is not None
         else architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     )
+    validate_device_dimensions(device, architecture_probe.dimensions)
 
     def emit_plan(event_type: str, **payload: Any) -> bool:
         logger.info("%s: %s", event_type, payload.get("message", ""))
@@ -845,6 +847,8 @@ def _train(
     )
     train_pairs, val_pairs = geometry.train, geometry.val
     dimensions = geometry.architecture.dimensions
+    if device.type == "mps" and dimensions == "3d":
+        emit_plan("warning", phase="device_compatibility", device="mps", execution="hybrid_3d", message=MPS_3D_NOTICE)
     volumetric = dimensions in {"2.5d", "3d"}
     resolve_validation_config(train_config, dimensions, geometry.architecture.name)
     detected_task = geometry.task
@@ -1460,7 +1464,7 @@ def _train(
             if train_dataset.defer_photometric:
                 valid = target_batch.get("valid") if isinstance(target_batch, dict) else None
                 images = apply_tensor_photometric_augmentation(images, valid, train_dataset.augmentation)
-            with torch.autocast(device_type=device.type, dtype=training_dtype, enabled=mixed_precision):
+            with autocast_context(device, training_dtype):
                 logits = model(images)
                 loss, components = compute_loss(
                     detected_task,

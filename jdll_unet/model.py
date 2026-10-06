@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from .config import ArchitectureConfig, architecture_defaults
+from .device_ops import CompatibleConvTranspose3d, CompatibleMaxPool3d, interpolate
 
 
 def _activation(name: str) -> nn.Module:
@@ -127,7 +127,7 @@ class UNet2D(nn.Module):
         self.config = config
         is_3d = _is_3d(config.dimensions)
         conv = nn.Conv3d if is_3d else nn.Conv2d
-        conv_transpose = nn.ConvTranspose3d if is_3d else nn.ConvTranspose2d
+        conv_transpose = CompatibleConvTranspose3d if is_3d else nn.ConvTranspose2d
         channels = list(config.channels) if config.channels else [config.base_channels * (2**level) for level in range(config.depth)]
         spatial_dims = 3 if is_3d else 2
         kernels = list(config.kernels) if config.kernels else [(3,) * spatial_dims] * len(channels)
@@ -151,7 +151,7 @@ class UNet2D(nn.Module):
                 )
             )
             in_channels = out_channels
-        pool_cls = nn.MaxPool3d if is_3d else nn.MaxPool2d
+        pool_cls = CompatibleMaxPool3d if is_3d else nn.MaxPool2d
         self.pools = nn.ModuleList(pool_cls(kernel_size=stride, stride=stride) for stride in strides)
         self.upconvs = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -192,7 +192,7 @@ class UNet2D(nn.Module):
             x = upconv(x)
             if x.shape[2:] != skip.shape[2:]:
                 mode = "trilinear" if _is_3d(self.config.dimensions) else "bilinear"
-                x = F.interpolate(x, size=skip.shape[2:], mode=mode, align_corners=False)
+                x = interpolate(x, size=skip.shape[2:], mode=mode, align_corners=False)
             x = torch.cat([skip, x], dim=1)
             x = decoder(x)
             if self.config.deep_supervision and decoder_index < len(self.decoders) - 1:

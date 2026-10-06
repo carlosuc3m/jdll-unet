@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from .annotations import _storage_dtype
 from .config import PostprocessingConfig
 from .crop_reading import CropArray
+from .device_ops import autocast_context
 from .errors import TrainingError
 from .geometry import load_domain_mask, padding_extents
 from .infer import _tile_layout
@@ -44,7 +45,7 @@ def regular_validation(model: torch.nn.Module, loader: DataLoader, data: Planned
             check_cancel()
             images = images_cpu.to(device, non_blocking=True)
             targets = {key: value.to(device, non_blocking=True) for key, value in targets_cpu.items()}
-            with torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+            with autocast_context(device, dtype):
                 logits = model(images)
             first = accumulator.samples
             accumulator.update(logits, targets, cpu_validity=targets_cpu.get("valid"))

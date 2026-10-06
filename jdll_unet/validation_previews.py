@@ -18,6 +18,7 @@ from scipy.special import expit
 
 from .annotations import _storage_dtype
 from .config import PostprocessingConfig, write_json
+from .device_ops import autocast_context, interpolate
 from .errors import TrainingError
 from .geometry import available_host_memory as available_ram
 from .losses import primary_logits
@@ -40,10 +41,10 @@ def importance_map(patch: tuple[int, ...], mode: str) -> np.ndarray:
 
 def predict_tile(model: torch.nn.Module, image: np.ndarray, device: torch.device,
                  dtype: torch.dtype = torch.float32) -> np.ndarray:
-    with torch.inference_mode(), torch.autocast(device.type, dtype=dtype, enabled=dtype != torch.float32):
+    with torch.inference_mode(), autocast_context(device, dtype):
         logits = primary_logits(model(torch.from_numpy(image[None]).to(device)))[0]
         if tuple(logits.shape[1:]) != tuple(image.shape[1:]):
-            logits = torch.nn.functional.interpolate(logits[None], size=image.shape[1:],
+            logits = interpolate(logits[None], size=image.shape[1:],
                       mode="trilinear" if image.ndim == 4 else "bilinear", align_corners=False)[0]
         result = logits.detach().float().cpu().numpy()
     if not np.isfinite(result).all():

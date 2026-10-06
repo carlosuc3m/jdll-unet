@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .device_ops import adaptive_avg_pool, interpolate
 from .errors import DatasetError
 
 Logits = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
@@ -26,8 +25,7 @@ def valid_support(target: Target, logits: torch.Tensor, *, check_values: bool = 
 
 
 def _resize_validity(valid: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
-    pool: Any = F.adaptive_avg_pool3d if valid.ndim == 5 else F.adaptive_avg_pool2d
-    return pool(valid.float(), size) >= 1 - 1e-6
+    return adaptive_avg_pool(valid.float(), size) >= 1 - 1e-6
 
 
 def _validate_loss_support(target: Target, logits: Logits, cpu_validity: torch.Tensor | None) -> None:
@@ -186,25 +184,25 @@ def resize_target_for_logits(task: str, target: Target, logits: torch.Tensor) ->
             elif key == "distance":
                 valid = target["valid"].float()
                 mode = "trilinear" if value.ndim == 5 else "bilinear"
-                numerator = F.interpolate(value.float() * valid, size=size, mode=mode, align_corners=False)
-                denominator = F.interpolate(valid, size=size, mode=mode, align_corners=False)
+                numerator = interpolate(value.float() * valid, size=size, mode=mode, align_corners=False)
+                denominator = interpolate(valid, size=size, mode=mode, align_corners=False)
                 result[key] = numerator / denominator.clamp_min(1e-6)
             else:
-                result[key] = F.interpolate(value.float(), size=size, mode="nearest").to(value.dtype)
+                result[key] = interpolate(value.float(), size=size, mode="nearest").to(value.dtype)
         return result
     if task == "multiclass_semantic":
         assert isinstance(target, torch.Tensor)
-        return F.interpolate(target[:, None].float(), size=size, mode="nearest")[:, 0].long()
+        return interpolate(target[:, None].float(), size=size, mode="nearest")[:, 0].long()
     if isinstance(target, dict):
         resized: dict[str, torch.Tensor] = {}
         for key, value in target.items():
             if key == "distance":
                 mode = "trilinear" if value.ndim == 5 else "bilinear"
-                resized[key] = F.interpolate(value.float(), size=size, mode=mode, align_corners=False)
+                resized[key] = interpolate(value.float(), size=size, mode=mode, align_corners=False)
             else:
-                resized[key] = F.interpolate(value.float(), size=size, mode="nearest")
+                resized[key] = interpolate(value.float(), size=size, mode="nearest")
         return resized
-    return F.interpolate(target.float(), size=size, mode="nearest")
+    return interpolate(target.float(), size=size, mode="nearest")
 
 
 def _compute_single_loss(

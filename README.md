@@ -96,6 +96,35 @@ logits shaped `B,C,Z,Y,X`. Multipage TIFF/OME-TIFF image and label stacks are
 loaded as volumes; RGB 2D images are rejected for
 true 3D models instead of being guessed as volumes.
 
+## Apple MPS
+
+Set `"device": "mps"` to request Apple GPU execution in an MPS-enabled PyTorch
+environment. MPS uses float32 without constructing an autocast context, including
+when `mixed_precision` is requested: PyTorch 2.4 rejects MPS autocast even when
+disabled ([PyTorch 2.4 autocast implementation](https://github.com/pytorch/pytorch/blob/v2.4.0/torch/amp/autocast_mode.py)).
+
+2D and 2.5D models keep their convolution, upsampling, and max-pooling layers on
+MPS. True 3D uses an explicit **hybrid CPU/MPS compatibility path**:
+`ConvTranspose3d`, `MaxPool3d`, and volumetric interpolation execute on CPU,
+with differentiable transfers back to MPS; convolution blocks stay on MPS.
+Deep-supervision validity pooling also runs on CPU in every dimension, avoiding
+unsupported operations and non-divisible adaptive-pooling restrictions.
+This conservative routing currently applies to all PyTorch versions, even if a
+newer version implements an operation natively. It preserves the architecture,
+checkpoint parameter layout, and gradients; CPU/CUDA execution is unchanged.
+Hybrid transfers may make 3D slower than CPU-only execution. Training logs and
+callbacks report hybrid mode; individual compatibility operations warn once.
+No global `PYTORCH_ENABLE_MPS_FALLBACK` setting is required for these operations.
+
+3D MPS requires macOS 13.2 or newer for native `Conv3d`; older systems receive a
+clear error directing them to `"device": "cpu"`. The compatibility decisions
+follow the [PyTorch 2.4 operator registry](https://github.com/pytorch/pytorch/blob/v2.4.0/aten/src/ATen/native/native_functions.yaml)
+and [MPS tests](https://github.com/pytorch/pytorch/blob/v2.4.0/test/test_mps.py).
+Local CPU tests cover fallback outputs, gradients, checkpoint compatibility,
+training, validation, previews, and inference. Actual MPS smoke tests live in
+`tests/test_mps_compatibility.py` and skip when Apple hardware is unavailable;
+CPU-only test success does not establish end-to-end support on a Mac.
+
 ## Physical Planning
 
 The trainer reads explicit JSON sidecars and OME/ImageJ TIFF metadata in `Z,Y,X`

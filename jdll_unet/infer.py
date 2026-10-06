@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from .callbacks import CallbackDispatcher
 from .config import ArchitectureConfig, read_json, resolve_device
+from .device_ops import MPS_3D_NOTICE, interpolate, validate_device_dimensions
 from .errors import InferenceCancelled, InferenceError, ModelLoadError
 from .image_reading import image_reading_session
 from .io import load_image, normalize_image
@@ -133,6 +134,7 @@ def load_model(model_path: str | Path, device: str | torch.device = "cpu") -> tu
     if not arch_payload:
         raise ModelLoadError(f"Missing architecture_config for {checkpoint}")
     arch = ArchitectureConfig.from_dict(arch_payload)
+    validate_device_dimensions(requested_device, arch.dimensions)
     model = build_unet(arch).to(requested_device)
     model.load_state_dict(state.get("state_dict", state))
     model.eval()
@@ -231,7 +233,7 @@ def tiled_predict(
             patch_logits = primary_logits(model(patch_t))[0]
             if patch_logits.shape[1:] != tuple(tile_size):
                 mode = "trilinear" if len(tile_size) == 3 else "bilinear"
-                patch_logits = F.interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
+                patch_logits = interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
             accum[(slice(None), *spatial_slices)] += patch_logits * importance
             counts[(slice(None), *spatial_slices)] += importance
             if progress is not None:
@@ -340,6 +342,9 @@ def _infer_impl(
     device = resolve_device(str(config.get("device", "cpu")))
     model, model_config = load_model(model_path, device)
     dimensions = str((model_config.get("architecture_config") or {}).get("dimensions", "2d"))
+    if device.type == "mps" and dimensions == "3d":
+        callbacks.emit("warning", phase="device_compatibility", device="mps", execution="hybrid_3d", message=MPS_3D_NOTICE)
+        progress.check("device_compatibility")
     progress.stage = "preprocessing"
     image = normalize_image(_load_input(inputs, dimensions), model_config.get("normalization"))
     _validate_input_channels(image, model_config)
