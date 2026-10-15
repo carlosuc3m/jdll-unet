@@ -1,5 +1,6 @@
 import functools
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -72,6 +73,19 @@ def test_completed_epoch_resume_retains_optimizer_schedule_history_and_best(inte
     resumed = next(event for event in events if event["type"] == "training_resumed")
     assert resumed["step"] == 1
     assert resumed["learning_rate"] == saved["scheduler_state_dict"]["current_lrs"][0]
+
+
+def test_legacy_checkpoint_can_resume_with_prefetch(interrupted_run, tmp_path, monkeypatch):
+    config = interrupted_run
+    checkpoint = config["output_dir"] / "weights_last.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state["model_config"]["training"].pop("batch_prefetch", None)
+    torch.save(state, checkpoint)
+    monkeypatch.setattr(trainer, "_train", functools.partial(trainer._train, resume_from=checkpoint))
+    output = tmp_path / "prefetched-resume"
+    trainer.train({**config, "output_dir": output, "batch_prefetch": True})
+    assert torch.load(output / "weights_last.pt", weights_only=False, map_location="cpu")["epoch"] == 3
+    assert not any(thread.name.startswith("jdll-batch") for thread in threading.enumerate())
 
 
 @pytest.mark.parametrize("invalid", ["settings", "unfinished", "history"])

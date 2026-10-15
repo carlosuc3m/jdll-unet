@@ -253,6 +253,7 @@ class TrainingConfig:
     max_empty_plane_fraction: float = 0.20
     augmentation_profile: str = AUTO
     num_workers: int = 0
+    batch_prefetch: bool | str = AUTO
     data_cache_mb: float | str = AUTO
     mixed_precision: bool | str = AUTO
     deep_supervision: bool | str = AUTO
@@ -596,6 +597,7 @@ def parse_training_config(
             max_padding_ratio=float(raw.get("max_padding_ratio", 1.0)),
             max_empty_plane_fraction=_max_empty_plane_fraction(raw.get("max_empty_plane_fraction", 0.20)),
             num_workers=int(raw.get("num_workers", 0)),
+            batch_prefetch=_auto_or_bool(raw.get("batch_prefetch", AUTO), "batch_prefetch"),
             data_cache_mb=_auto_or_float(raw.get("data_cache_mb", AUTO), "data_cache_mb"),
             mixed_precision=raw.get("mixed_precision", AUTO),
             deep_supervision=_auto_or_bool(raw.get("deep_supervision", AUTO), "deep_supervision"),

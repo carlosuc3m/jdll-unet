@@ -109,12 +109,15 @@ class DomainReader:
 
         self.max_bytes = max_bytes
         self.session = session or current_read_session()
-        self.cache: OrderedDict[tuple[str, int, int, int, str], np.ndarray] = OrderedDict()
+        self.cache: OrderedDict[tuple[str, int, int, int, int, int, str], np.ndarray] = OrderedDict()
         self.bytes = 0
 
     def read(self, path: Path, *, role: str = "image", selection: tuple[slice, ...] | None = None) -> np.ndarray:
         stat = path.stat()
-        key = (str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, role)
+        # stat follows symlinks already. Resolving every path component on each
+        # crop is unnecessary; inode identity also detects atomic replacements.
+        key = (os.path.abspath(path), stat.st_dev, stat.st_ino,
+               stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, role)
         if key in self.cache:
             self.cache.move_to_end(key)
             return self.cache[key] if selection is None else self.cache[key][selection]

@@ -54,6 +54,8 @@ def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
 
     Per-plane summaries also supply the representative cross section for 2.5D.
     Temporary arrays are tile-sized, including for transposed arrays and memmaps.
+    Native integer tiles fuse validation, foreground collection, counts and bounds;
+    uncommon dtypes and large IDs retain the NumPy/SciPy path.
     """
     if mask.ndim not in (2, 3) or any(size < 1 for size in mask.shape):
         raise ValueError("Mask analysis requires a nonempty Y,X or Z,Y,X array")
@@ -66,16 +68,28 @@ def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
     height, width = mask.shape[-2:]
     columns = min(width, STATISTICS_CHUNK_PIXELS)
     rows = max(1, STATISTICS_CHUNK_PIXELS // columns)
+    scan = None
+    if mask.dtype.kind in "biu" and mask.dtype.isnative:
+        from ._label_scan import scan_integer_tile
+
+        scan = scan_integer_tile
+        capacity = min(_DENSE_LABEL_LIMIT, 1 if mask.dtype.kind == "b" else np.iinfo(mask.dtype).max) + 1
+        scan_counts = np.empty(capacity, dtype=np.int64)
+        scan_bounds = np.empty((capacity, 4), dtype=np.int64)
+        scan_positions = np.empty(min(height, rows) * columns, dtype=np.intp)
     for z, plane in enumerate(mask[None] if mask.ndim == 2 else mask):
         regions: dict[int, LabelRegion] = {}
         for y in range(0, height, rows):
             for x in range(0, width, columns):
                 tile = plane[y : y + rows, x : x + columns]
-                validate_mask_labels(tile, path or Path("<array>"))
-                maximum = int(tile.max())
+                count, maximum = scan(tile, scan_positions, scan_counts, scan_bounds) if scan else (-1, -1)
+                fused = count >= 0
+                if not fused:
+                    validate_mask_labels(tile, path or Path("<array>"))
+                    maximum = int(tile.max())
                 if maximum == 0:
                     continue
-                positions = np.flatnonzero(tile)
+                positions = scan_positions[:count] if fused else np.flatnonzero(tile)
                 count = len(positions)
                 keep = min(limit, seen + count)
                 take_old = int(rng.hypergeometric(seen, count, keep)) if seen else 0
@@ -84,7 +98,12 @@ def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
                 flat = (z * height + y + selected // tile.shape[1]) * width + x + selected % tile.shape[1]
                 reservoir = np.concatenate((old, flat.astype(reservoir.dtype)))
                 seen += count
-                if maximum <= _DENSE_LABEL_LIMIT:
+                if fused:
+                    for label in np.flatnonzero(scan_counts[1 : maximum + 1]) + 1:
+                        ymin, ymax, xmin, xmax = scan_bounds[label]
+                        bounds = ((y + int(ymin), y + int(ymax)), (x + int(xmin), x + int(xmax)))
+                        _merge(regions, int(label), int(scan_counts[label]), bounds)
+                elif maximum <= _DENSE_LABEL_LIMIT:
                     labels = tile.astype(np.intp, copy=False)
                     counts = np.bincount(labels.reshape(-1), minlength=maximum + 1)
                     boxes = ndi.find_objects(labels, max_label=maximum)

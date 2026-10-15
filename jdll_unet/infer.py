@@ -6,7 +6,7 @@ import os
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from itertools import product
+from itertools import islice, product
 from pathlib import Path
 from typing import Any, cast
 
@@ -203,9 +203,15 @@ def tiled_predict(
     layout: _TileLayout | None = None,
     progress: _InferenceProgress | None = None,
     blend_mode: str = "constant",
+    batch_size: int = 1,
 ) -> np.ndarray:
     if blend_mode not in {"constant", "gaussian"}:
         raise InferenceError("tile_blending must be constant or gaussian")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise InferenceError("Tile batch_size must be a positive integer")
+    # Preserve per-patch callbacks and their cancellation boundaries.
+    if progress is not None:
+        batch_size = 1
     image, original_shape = _pad_image(image, tile_size)
     spatial_shape = tuple(int(item) for item in image.shape[1:])
     layout = layout or _tile_layout(original_shape, tile_size, overlap)
@@ -222,22 +228,44 @@ def tiled_predict(
             axis_shape[axis] = length
             importance *= torch.exp(-0.5 * coordinate.square()).reshape(axis_shape)
         importance = (importance / importance.max()).clamp_min(1e-6)
+    def predict_batch(slices: list[tuple[slice, ...]]) -> torch.Tensor:
+        patches = (image[(slice(None), *slices[0])][None] if len(slices) == 1
+                   else np.stack([image[(slice(None), *region)] for region in slices]))
+        patches = patches.astype(np.float32, copy=False)
+        patch_t = torch.from_numpy(patches).to(device)
+        logits = primary_logits(model(patch_t))
+        if logits.shape[2:] != tuple(tile_size):
+            mode = "trilinear" if len(tile_size) == 3 else "bilinear"
+            logits = interpolate(logits, size=tile_size, mode=mode, align_corners=False)
+        return logits
+
+    starts_iterator = iter(product(*layout.starts_by_axis))
     with torch.inference_mode():
-        for starts in product(*layout.starts_by_axis):
-            starts = tuple(int(value) for value in starts)
-            if progress is not None:
-                progress.patch_start(starts)
-            spatial_slices = tuple(slice(start, start + tile) for start, tile in zip(starts, tile_size, strict=True))
-            patch = image[(slice(None), *spatial_slices)]
-            patch_t = torch.from_numpy(patch[None].astype(np.float32, copy=False)).to(device)
-            patch_logits = primary_logits(model(patch_t))[0]
-            if patch_logits.shape[1:] != tuple(tile_size):
-                mode = "trilinear" if len(tile_size) == 3 else "bilinear"
-                patch_logits = interpolate(patch_logits[None], size=tile_size, mode=mode, align_corners=False)[0]
-            accum[(slice(None), *spatial_slices)] += patch_logits * importance
-            counts[(slice(None), *spatial_slices)] += importance
-            if progress is not None:
-                progress.patch_end()
+        while starts_batch := list(islice(starts_iterator, batch_size)):
+            regions = [tuple(slice(start, start + tile) for start, tile in zip(starts, tile_size, strict=True))
+                       for starts in starts_batch]
+            offset = 0
+            while offset < len(regions):
+                current = regions[offset:offset + batch_size]
+                if progress is not None:
+                    progress.patch_start(tuple(int(value) for value in starts_batch[offset]))
+                try:
+                    batch_logits = predict_batch(current)
+                except torch.cuda.OutOfMemoryError:
+                    if device.type != "cuda" or len(current) == 1:
+                        raise
+                    batch_size = max(1, len(current) // 2)
+                else:
+                    for region, patch_logits in zip(current, batch_logits, strict=True):
+                        accum[(slice(None), *region)] += patch_logits * importance
+                        counts[(slice(None), *region)] += importance
+                    del batch_logits, patch_logits
+                    offset += len(current)
+                    if progress is not None:
+                        progress.patch_end()
+                    continue
+                # The failed call's traceback and tensors are released here.
+                torch.cuda.empty_cache()
     logits_array = (accum / counts.clamp_min(torch.finfo(counts.dtype).tiny)).detach().cpu().numpy()
     crop = tuple(slice(0, size) for size in original_shape)
     return logits_array[(slice(None), *crop)]

@@ -8,6 +8,7 @@ import math
 import os
 import random
 import shutil
+from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -60,6 +61,7 @@ from .planning import (
     restore_continuous_maps,
 )
 from .postprocess import postprocess_instance
+from .prefetch import BatchPrefetcher
 from .scale import (
     InstanceSizeEstimate,
     aggregate_instance_statistics,
@@ -159,6 +161,7 @@ def _full_volume_validation(
     min_scale: float = 0.25,
     max_scale: float = 4.0,
     check_cancel: Any = None,
+    tile_batch_size: int = 1,
 ) -> dict[str, Any]:
     from .infer import _context_stack, tiled_predict
     from .targets import prepare_target
@@ -218,7 +221,8 @@ def _full_volume_validation(
                     mode="trilinear" if dimensions == "3d" else "bilinear",
                     align_corners=False,
                 )[0].numpy()
-            logits = tiled_predict(model, current_image, device, patch_size, overlap=0.5)
+            logits = tiled_predict(model, current_image, device, patch_size, overlap=0.5,
+                                   batch_size=tile_batch_size)
             if logits.shape[1:] != current_mask.shape:
                 logits = restore_continuous_maps(logits, current_mask.shape)
             target = prepare_target(
@@ -452,8 +456,8 @@ def _restore_completed_epoch(
     for key in ("task", "architecture_config", "label_values", "normalization"):
         if saved.get(key) != current.get(key):
             raise TrainingError(f"Cannot resume: {key} differs from the checkpoint")
-    # Decoded-source caching can adapt to available RAM without changing training.
-    ignored = {"model_name", "output_dir", "dataset_plan_path", "data_cache_mb"}
+    # Caching and bounded prefetch change execution, not samples or optimization.
+    ignored = {"model_name", "output_dir", "dataset_plan_path", "data_cache_mb", "batch_prefetch"}
     old_training = {key: value for key, value in saved["training"].items() if key not in ignored}
     new_training = {key: value for key, value in current["training"].items() if key not in ignored}
     if old_training != new_training:
@@ -698,9 +702,17 @@ def train(config: dict[str, Any] | TrainingConfig, task: Any = None, *, control:
         if CallbackDispatcher(task).cancel_requested():
             raise PlanningCancelled()
         with image_reading_session(CallbackDispatcher(task).emit):
-            result = _train(config, task, control=control, _runtime=runtime)
-            runtime["cancelled"] = result.get("cancelled", False)
-            return result
+            completed = False
+            try:
+                result = _train(config, task, control=control, _runtime=runtime)
+                runtime["cancelled"] = result.get("cancelled", False)
+                completed = True
+                return result
+            finally:
+                prefetcher = runtime.get("batch_prefetcher")
+                if prefetcher is not None:
+                    # A queued warning callback must not replace a training error.
+                    prefetcher.close(flush_events=completed)
     except TrainingStopped as exc:
         return exc.result
     except PlanningCancelled:
@@ -1193,6 +1205,15 @@ def _train(
         pin_memory=device.type == "cuda",
         collate_fn=collate_spatial_samples if train_dataset.defer_spatial else None,
     )
+    prefetch_enabled = train_config.batch_prefetch is True or (
+        train_config.batch_prefetch == AUTO and device.type == "cuda" and dimensions == "2d"
+    )
+    train_config.batch_prefetch = prefetch_enabled and train_config.num_workers == 0
+    train_batches: Iterable[Any] = train_loader
+    if train_config.batch_prefetch:
+        prefetcher = BatchPrefetcher(train_loader, read_session=current_read_session())
+        runtime["batch_prefetcher"] = prefetcher
+        train_batches = prefetcher
     val_loader = DataLoader(
         validation_data if validation_data is not None else val_dataset,
         batch_size=microbatch_size,
@@ -1435,7 +1456,7 @@ def _train(
         log_loss_count = 0
         update_losses: list[torch.Tensor] = []
         optimizer.zero_grad(set_to_none=True)
-        for microstep, (images, target_batch) in enumerate(train_loader, start=1):
+        for microstep, (images, target_batch) in enumerate(train_batches, start=1):
             if full_schedule is not None:
                 check_cancel()
             if callbacks.cancel_requested():
@@ -1623,6 +1644,7 @@ def _train(
                 min_scale=scale_cfg.min_effective_scale,
                 max_scale=scale_cfg.max_effective_scale,
                 check_cancel=check_cancel,
+                tile_batch_size=min(8, microbatch_size) if device.type == "cuda" and dimensions == "2d" else 1,
             )
             epoch_record["full_validation"] = full_metrics
             score = float(full_metrics["mean_dice"])

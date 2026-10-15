@@ -126,17 +126,32 @@ def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshol
     for start in range(0, target.size, 1_048_576):
         pred = prediction.flat[start:start + 1_048_576]
         truth = target.flat[start:start + 1_048_576]
-        for values, destination in ((pred, pred_areas), (truth, true_areas)):
-            ids, counts = np.unique(values, return_counts=True)
+        pred_labels, pred_counts = np.unique(pred, return_counts=True)
+        true_labels, true_counts = np.unique(truth, return_counts=True)
+        for ids, counts, destination in ((pred_labels, pred_counts, pred_areas),
+                                         (true_labels, true_counts, true_areas)):
             for label, count in zip(ids, counts, strict=True):
                 if label:
                     destination[int(label)] = destination.get(int(label), 0) + int(count)
         support = (pred != 0) & (truth != 0)
-        pairs = np.empty(np.count_nonzero(support), dtype=[("true", target.dtype), ("pred", prediction.dtype)])
-        pairs["true"], pairs["pred"] = truth[support], pred[support]
-        values, counts = np.unique(pairs, return_counts=True)
-        for pair, count in zip(values, counts, strict=True):
-            key = (int(pair["true"]), int(pair["pred"]))
+        # Integer keys avoid structured-array sorting for ordinary label IDs.
+        # Preserve arbitrary uint64 IDs without overflow via the reference path.
+        radix = int(pred_labels[-1]) + 1
+        encoded = (
+            pred.dtype.kind in "biu" and truth.dtype.kind in "biu"
+            and pred_labels[0] >= 0 and true_labels[0] >= 0
+            and int(true_labels[-1]) * radix + int(pred_labels[-1]) <= np.iinfo(np.int64).max
+        )
+        if encoded:
+            pairs = truth[support].astype(np.int64, copy=False) * radix + pred[support].astype(np.int64, copy=False)
+            values, counts = np.unique(pairs, return_counts=True)
+            keys = (divmod(int(pair), radix) for pair in values)
+        else:
+            pairs = np.empty(np.count_nonzero(support), dtype=[("true", target.dtype), ("pred", prediction.dtype)])
+            pairs["true"], pairs["pred"] = truth[support], pred[support]
+            values, counts = np.unique(pairs, return_counts=True)
+            keys = ((int(pair["true"]), int(pair["pred"])) for pair in values)
+        for key, count in zip(keys, counts, strict=True):
             intersections[key] = intersections.get(key, 0) + int(count)
     pred_ids, true_ids = sorted(pred_areas), sorted(true_areas)
     candidates: list[tuple[float, int, int, int, int]] = []

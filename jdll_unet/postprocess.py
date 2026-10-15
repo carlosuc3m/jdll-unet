@@ -51,6 +51,29 @@ def _label(binary: np.ndarray) -> np.ndarray:
     return labels.astype(np.uint32, copy=False)
 
 
+def _foreground_h_maxima(image: np.ndarray, h: float) -> np.ndarray:
+    """Use independent positive components for 2D nonnegative distance maps."""
+    if image.ndim != 2 or image.size < 4096 or h <= 0 or not np.isfinite(h):
+        return h_maxima(image, h=h)
+    if not np.isfinite(image).all():
+        return h_maxima(image, h=h)
+    # h_maxima uses full connectivity, independently of watershed connectivity.
+    components, count = ndi.label(image > 0, structure=np.ones((3, 3), dtype=bool))
+    regions = [tuple(slice(max(0, axis.start - 1), min(size, axis.stop + 1))
+                     for axis, size in zip(bbox, image.shape, strict=True))
+               for bbox in ndi.find_objects(components, max_label=count)]
+    # Interleaved components can have heavily overlapping bounding boxes.
+    if sum((region[0].stop - region[0].start) * (region[1].stop - region[1].start)
+           for region in regions) > 2 * image.size:
+        return h_maxima(image, h=h)
+    output = np.zeros(image.shape, dtype=np.uint8)
+    for label, region in enumerate(regions, start=1):
+        current = components[region] == label
+        local = np.where(current, image[region], 0)
+        output[region] |= h_maxima(local, h=h) & current
+    return output
+
+
 def postprocess_binary(
     probability: np.ndarray,
     threshold: float = 0.5,
@@ -124,7 +147,7 @@ def postprocess_instance(
             raise InferenceError("distance_boundary_watershed requires scipy and scikit-image")
         clean = np.clip(distance_probability, 0, 1) * np.clip(foreground_probability, 0, 1) * (1 - np.clip(boundary_probability, 0, 1))
         clean[~foreground] = 0
-        seeds = h_maxima(clean, h=seed_h)
+        seeds = _foreground_h_maxima(clean, seed_h)
         seeds &= clean >= seed_distance_threshold
         seeds &= boundary_probability < seed_boundary_threshold
         seeds &= foreground

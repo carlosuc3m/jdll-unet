@@ -83,6 +83,37 @@ def test_reader_evicts_least_recent_and_can_disable_cache(tmp_path):
     assert disabled.bytes == 0 and not disabled.cache
 
 
+def test_cached_crops_do_not_resolve_paths_and_detect_symlink_retarget(tmp_path, monkeypatch):
+    paths = [tmp_path / f"source_{index}.tif" for index in range(2)]
+    for index, path in enumerate(paths):
+        tifffile.imwrite(path, np.full((8, 8), index, np.uint8))
+    link = tmp_path / "linked.tif"
+    link.symlink_to(paths[0])
+    reader = DomainReader(max_bytes=256)
+    reader.read(link)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "resolve", Mock(side_effect=AssertionError("unexpected path resolution")))
+        np.testing.assert_array_equal(reader.read(link, selection=(slice(2, 5), slice(1, 4))), 0)
+    link.unlink()
+    link.symlink_to(paths[1])
+    np.testing.assert_array_equal(reader.read(link), 1)
+
+
+def test_cache_detects_atomic_replacement_with_preserved_mtime(tmp_path):
+    import os
+
+    path = tmp_path / "image.tif"
+    replacement = tmp_path / "replacement.tif"
+    tifffile.imwrite(path, np.zeros((8, 8), np.uint8))
+    reader = DomainReader(max_bytes=256)
+    reader.read(path)
+    before = path.stat()
+    tifffile.imwrite(replacement, np.ones((8, 8), np.uint8))
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(path)
+    np.testing.assert_array_equal(reader.read(path), 1)
+
+
 def test_exported_augmentation_cannot_override_new_patch_plan():
     exported = asdict(AugmentationConfig(patch_size=(32, 32)))
     exported.update(patch_size=[32, 32], training_scale_jitter=[0.5, 2.0])
