@@ -491,12 +491,10 @@ def _infer_impl(
     inference_scale = 1.0
     scale_cfg = train_cfg.get("instance_scale_normalization", {})
     instance_scale_enabled = task_name == "instance_friendly" and bool(scale_cfg.get("enabled", False))
-    if instance_scale_enabled:
-        object_size = config.get("object_size", config.get("object_diameter"))
-        if object_size is None and isinstance(inputs, dict):
-            object_size = inputs.get("object_size", inputs.get("object_diameter"))
-        if object_size is None:
-            raise InferenceError("Scale-normalized instance inference requires approximate object_size in pixels")
+    object_size = config.get("object_size", config.get("object_diameter"))
+    if object_size is None and isinstance(inputs, dict):
+        object_size = inputs.get("object_size", inputs.get("object_diameter"))
+    if instance_scale_enabled and object_size is not None:
         try:
             object_size = float(object_size)
         except (TypeError, ValueError) as exc:

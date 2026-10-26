@@ -236,8 +236,20 @@ def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
     assert inference["outputs"]["labels"].shape == (32, 32)
     assert np.isclose(inference["metadata"]["instance_scale_factor"], 2 / 3)
 
-    with pytest.raises(InferenceError, match="object_size"):
-        infer({"model_path": result["model_path"], "device": "cpu"}, {"image_path": dataset / "images/sample_0.tif"})
+    native = infer(
+        {"model_path": result["model_path"], "device": "cpu"},
+        {"image_path": dataset / "images/sample_0.tif"},
+    )
+    assert native["metadata"]["instance_scale_factor"] == 1.0
+    assert native["metadata"]["prepared_input_shape"] == native["metadata"]["original_input_shape"]
+    assert native["outputs"]["labels"].shape == (32, 32)
+
+    for invalid_size in (0, -1, float("nan"), float("inf"), "invalid"):
+        with pytest.raises(InferenceError, match="object_size"):
+            infer(
+                {"model_path": result["model_path"], "device": "cpu", "object_size": invalid_size},
+                {"image_path": dataset / "images/sample_0.tif"},
+            )
 
 
 def test_instance_scale_normalization_supports_3d(tmp_path: Path):
