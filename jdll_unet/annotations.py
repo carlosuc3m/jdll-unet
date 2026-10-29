@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import IO, Any
 
 import numpy as np
+from numba import njit
 from skimage.measure import label as label_components
 
 from .config import AnnotationPreparationConfig
@@ -41,16 +42,46 @@ def _write_compact_labels(stream: IO[bytes], labels: np.ndarray, dtype: np.dtype
         labels.flat[start : start + _STORAGE_CHUNK_VOXELS].astype(dtype, copy=False).tofile(stream)
 
 
+@njit(cache=True)
+def _fill_source_ids(components, mask, source_ids):
+    for i in range(components.size):
+        source_ids[components[i]] = mask[i]
+
+
+@njit(cache=True)
+def _fill_source_ids_spatial(components, mask, source_ids):
+    for z in range(mask.shape[0]):
+        for y in range(mask.shape[1]):
+            for x in range(mask.shape[2]):
+                source_ids[components[z, y, x]] = mask[z, y, x]
+
+
 def component_labels_and_sources(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Label equal-valued regions once and map components to original IDs."""
-    components, count = label_components(mask, background=0, connectivity=1, return_num=True)
+    """Label equal-valued regions and map components to original IDs."""
+    components, count = label_components(
+        mask, background=0, connectivity=1, return_num=True
+    )
+
     source_ids = np.zeros(count + 1, dtype=np.int64)
-    flat = components.reshape(-1)
-    # Every voxel of a component has the same source ID. Bounded scatter avoids
-    # scanning a full volume (or overlapping bounding boxes) for each component.
-    for start in range(0, flat.size, 1024**2):
-        stop = start + 1024**2
-        source_ids[flat[start:stop]] = mask.flat[start:stop]
+
+    if mask.dtype.isnative and mask.flags.c_contiguous:
+        _fill_source_ids(components.ravel(), mask.ravel(), source_ids)
+    else:
+        spatial = mask[None] if mask.ndim == 2 else mask
+        labelled = components[None] if mask.ndim == 2 else components
+        if mask.dtype.isnative:
+            _fill_source_ids_spatial(labelled, spatial, source_ids)
+        else:
+            # Convert slices, not flat iterators or a full mapped volume.
+            columns = min(spatial.shape[2], _STORAGE_CHUNK_VOXELS)
+            rows = max(1, _STORAGE_CHUNK_VOXELS // columns)
+            for z in range(spatial.shape[0]):
+                for y in range(0, spatial.shape[1], rows):
+                    for x in range(0, spatial.shape[2], columns):
+                        region = (slice(z, z + 1), slice(y, y + rows), slice(x, x + columns))
+                        native = np.ascontiguousarray(spatial[region], dtype=mask.dtype.newbyteorder("="))
+                        _fill_source_ids_spatial(labelled[region], native, source_ids)
+
     return components, source_ids
 
 

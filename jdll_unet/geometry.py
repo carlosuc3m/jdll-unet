@@ -31,6 +31,13 @@ def stable_seed(seed: int, epoch: int, identity: str) -> int:
 
 def _reader_array_info(reader: Any, file_format: str, role: str) -> tuple[tuple[int, ...], list[str], str]:
     """Inspect axes without decoding pixels; reader selection is shared with I/O."""
+    if file_format == "NPY":
+        from .numpy_images import candidates
+
+        axes = reader.axes(mask=role == "mask")
+        choices = candidates(reader.shape, mask=True) if role == "mask" else [axes]
+        choices = [candidate for candidate in choices if "T" not in candidate or reader.shape[candidate.index("T")] == 1]
+        return tuple(reader.shape), choices, "numpy_convention"
     if file_format != "TIFF":
         channels = 3 if reader.mode == "P" and role == "image" else len(reader.getbands())
         shape = (reader.height, reader.width) + ((channels,) if channels > 1 else ())
@@ -89,10 +96,11 @@ def _normalized_shape(shape: tuple[int, ...], axes: str) -> tuple[int, tuple[int
 def _normalize_array(array: np.ndarray, axes: str, *, mask: bool) -> np.ndarray:
     for index in reversed(range(len(axes))):
         if axes[index] not in "CZYX" or (axes[index] == "Z" and array.shape[index] == 1):
-            array = np.take(array, 0, axis=index)
+            array = array[tuple(0 if i == index else slice(None) for i in range(array.ndim))]
             axes = axes[:index] + axes[index + 1 :]
     if mask and "C" in axes:
-        array = np.take(array, 0, axis=axes.index("C"))
+        channel = axes.index("C")
+        array = array[tuple(0 if i == channel else slice(None) for i in range(array.ndim))]
         axes = axes.replace("C", "")
     if not mask and "C" not in axes:
         array = array[None]
@@ -232,6 +240,9 @@ def inspect_pair(pair: ImageMaskPair, *, reader: DomainReader | None = None) -> 
             mask_channels, mask_spatial, mask_singleton = _normalized_shape(mask_shape, mask_axes)
             if spatial == mask_spatial:
                 matches.append((image_axes, mask_axes, channels, spatial, singleton or mask_singleton, mask_channels))
+    if matches and "numpy_convention" in {image_provenance, mask_provenance}:
+        # The agreed NumPy convention orders candidates; paired geometry guides masks.
+        matches = [matches[0]]
     # Scalar stacks with identical full spatial geometry are volumes. A generic
     # page axis alone cannot turn an unmatched stack into channels or broadcast labels.
     if len(image_shape) == len(mask_shape) == 3 and image_shape == mask_shape:

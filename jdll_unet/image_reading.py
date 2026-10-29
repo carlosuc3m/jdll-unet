@@ -16,12 +16,13 @@ import tifffile
 from PIL import Image
 
 from .errors import DataFormatError
+from .numpy_images import NumpyImage
 
 if TYPE_CHECKING:
     from .annotations import AnnotationPreparation
 
 T = TypeVar("T")
-FORMATS = {".tif": "TIFF", ".tiff": "TIFF", ".png": "PNG", ".bmp": "BMP", ".jpg": "JPEG", ".jpeg": "JPEG"}
+FORMATS = {".tif": "TIFF", ".tiff": "TIFF", ".png": "PNG", ".bmp": "BMP", ".jpg": "JPEG", ".jpeg": "JPEG", ".npy": "NPY"}
 DECODER_ERRORS = (
     OSError,
     ValueError,
@@ -37,6 +38,8 @@ DECODER_ERRORS = (
 def _signature_format(path: Path) -> str | None:
     with path.open("rb") as stream:
         header = stream.read(8)
+    if header.startswith(b"\x93NUMPY"):
+        return "NPY"
     if header[:4] in (b"II\x2a\x00", b"MM\x00\x2a", b"II\x2b\x00", b"MM\x00\x2b"):
         return "TIFF"
     if header == b"\x89PNG\r\n\x1a\n":
@@ -47,10 +50,14 @@ def _signature_format(path: Path) -> str | None:
 
 
 def _open_format(path: Path, file_format: str) -> Any:
+    if file_format == "NPY":
+        return NumpyImage(path)
     return tifffile.TiffFile(path) if file_format == "TIFF" else Image.open(path, formats=[file_format])
 
 
 def decode_pixels(reader: Any, file_format: str, role: str, *, memmap: bool = False) -> np.ndarray:
+    if file_format == "NPY":
+        return reader.array
     if file_format == "TIFF":
         series = reader.series[0]
         mapped = memmap and series.dataoffset is not None and series[0].is_memmappable
@@ -64,6 +71,8 @@ def decode_pixels(reader: Any, file_format: str, role: str, *, memmap: bool = Fa
 
 def decode_region(reader: Any, file_format: str, role: str, selection: tuple[slice, ...]) -> np.ndarray:
     """Decode intersecting TIFF strips/tiles when Zarr is available; otherwise use the regular reader."""
+    if file_format == "NPY":
+        return np.array(reader.array[selection], copy=True)
     if file_format == "TIFF":
         series = reader.series[0]
         if series.dataoffset is not None and series[0].is_memmappable:

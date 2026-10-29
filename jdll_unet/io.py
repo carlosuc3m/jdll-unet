@@ -16,8 +16,8 @@ from .image_reading import ImageReadSession, current_read_session, decode_pixels
 
 IMAGE_ALIASES = ("images", "image", "imgs", "img", "data")
 MASK_ALIASES = ("masks", "mask", "labels", "label", "gt")
-IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg"}
-MASK_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp"}
+IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg", ".npy"}
+MASK_EXTENSIONS = {".tif", ".tiff", ".png", ".bmp", ".npy"}
 IMAGE_SUFFIXES = ("_image", "-image", "_img", "-img", "_raw", "-raw")
 MASK_SUFFIXES = ("_mask", "-mask", "_label", "-label", "_labels", "-labels", "_gt", "-gt")
 
@@ -82,6 +82,8 @@ def pair_images_and_masks(image_dir: Path, mask_dir: Path) -> list[ImageMaskPair
     """Pair images and masks by stem, accepting common suffix variants."""
 
     images = _iter_files(image_dir, IMAGE_EXTENSIONS)
+    raster_stems = {path.stem.casefold() for path in images if path.suffix.lower() != ".npy"}
+    images = [path for path in images if path.suffix.lower() != ".npy" or path.stem.casefold() not in raster_stems]
     masks = _iter_files(mask_dir, MASK_EXTENSIONS)
     mask_lookup: dict[str, list[Path]] = {}
     for mask in masks:
@@ -148,12 +150,15 @@ def load_array(path: Path | str, *, role: str = "image", session: ImageReadSessi
     return (session or current_read_session()).pixels(path, role=role)
 
 
-def _load_with_axes(path: Path, role: str, session: ImageReadSession | None) -> tuple[np.ndarray, str | None, str]:
+def _load_with_axes(path: Path, role: str, session: ImageReadSession | None, dimensions: str | None = None) -> tuple[np.ndarray, str | None, str]:
     from .geometry import _normalized_shape, _reader_array_info
 
     def read(reader: Any, fmt: str) -> tuple[np.ndarray, str | None, str]:
         _shape, candidates, provenance = _reader_array_info(reader, fmt, role)
-        axes = candidates[0] if provenance in {"explicit_tiff_axes", "raster_format"} else None
+        axes = candidates[0] if provenance in {"explicit_tiff_axes", "raster_format", "numpy_convention"} else None
+        if fmt == "NPY":
+            count = 3 if dimensions in {"3d", "2.5d"} else 2 if dimensions == "2d" else None
+            axes = reader.axes(mask=role == "mask", dimensions=count)
         if axes is not None:
             _normalized_shape(_shape, axes)
         return decode_pixels(reader, fmt, role), axes, fmt
@@ -169,7 +174,7 @@ def load_image(path: Path | str, dimensions: str = "2d", *, session: ImageReadSe
     """Load an image as float32 channels-first C,Y,X or C,Z,Y,X without normalizing."""
 
     path = Path(path)
-    arr, axes, file_format = _load_with_axes(path, "image", session)
+    arr, axes, file_format = _load_with_axes(path, "image", session, dimensions.lower())
     if file_format == "BMP" and dimensions.lower() in {"3d", "2.5d"}:
         raise DataFormatError("BMP is supported only for 2D images; use a TIFF stack for volumetric data")
     dimensions = dimensions.lower()
@@ -281,7 +286,7 @@ def load_mask(
     """Load a 2D or 3D integer mask while preserving label values."""
 
     path = Path(path)
-    arr, axes, file_format = _load_with_axes(path, "mask", session)
+    arr, axes, file_format = _load_with_axes(path, "mask", session, dimensions)
     if file_format == "BMP" and dimensions in {"3d", "2.5d"}:
         raise DataFormatError("BMP is supported only for 2D masks; use a TIFF stack for volumetric labels")
     if axes is not None:
