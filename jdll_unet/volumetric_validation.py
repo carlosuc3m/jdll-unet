@@ -23,7 +23,7 @@ from .losses import primary_logits
 from .metrics import compute_metrics, primary_metric
 from .planning import restore_continuous_maps
 from .targets import binary_target, boundary_target, normalized_instance_distance
-from .validation_metrics import ValidationAccumulator
+from .validation_metrics import InstancePQAccumulator, ValidationAccumulator
 from .validation_previews import PreviewAnchor, available_ram, importance_map, predict_tile, source_crop_workspace
 from .validation_sampling import PlannedValidationDataset
 
@@ -32,9 +32,12 @@ def regular_validation(model: torch.nn.Module, loader: DataLoader, data: Planned
                        device: torch.device, epoch: int, *, weights: dict[str, float], focal_gamma: float,
                        focal_alpha: float | None, preview_count: int, progress_interval: int,
                        emit: Callable[..., Any], check_cancel: Callable[[], None],
-                       dtype: torch.dtype = torch.float32) -> tuple[dict, dict, list[PreviewAnchor]]:
+                       dtype: torch.dtype = torch.float32, postprocessing: PostprocessingConfig | None = None,
+                       target_cache: dict | None = None) -> tuple[dict, dict, list[PreviewAnchor]]:
     model.eval()
-    accumulator = ValidationAccumulator(data.base.task, weights, focal_gamma, focal_alpha)
+    instance = (InstancePQAccumulator(postprocessing or PostprocessingConfig(), data.options.reconstruction_candidates,
+                                     target_cache, check_cancel) if data.base.task == "instance_friendly" else None)
+    accumulator = ValidationAccumulator(data.base.task, weights, focal_gamma, focal_alpha, instance)
     indices = set(np.linspace(0, len(data) - 1, min(preview_count, len(data)), dtype=int).tolist())
     anchors: list[PreviewAnchor] = []
     retained = 0
@@ -48,7 +51,21 @@ def regular_validation(model: torch.nn.Module, loader: DataLoader, data: Planned
             with autocast_context(device, dtype):
                 logits = model(images)
             first = accumulator.samples
-            accumulator.update(logits, targets, cpu_validity=targets_cpu.get("valid"))
+            sources = ([data.base.pairs[data.domains[data.samples[first + offset][0]].pair]
+                       for offset in range(images.shape[0])] if instance is not None else [])
+            spacings = None
+            if instance is not None and any(config.get("min_object_size_physical") is not None
+                                           or config.get("min_seed_size_physical") is not None for config in instance.configs):
+                spacings = []
+                for offset in range(images.shape[0]):
+                    domain, cell = data.samples[first + offset]
+                    origin = data.domains[domain].origin(cell, data.patch)
+                    spacings.append(tuple(data.provenance(domain, origin, data.patch)["spacing"]))
+            accumulator.update(logits, targets, cpu_validity=targets_cpu.get("valid"),
+                               cpu_instances=targets_cpu.get("instances"),
+                               cases=[source.stem for source in sources] if sources else None,
+                               keys=[("patch", first + offset) for offset in range(images.shape[0])],
+                               spacings=spacings)
             main = primary_logits(logits)
             for offset in range(images.shape[0]):
                 sample = first + offset
@@ -71,6 +88,7 @@ def regular_validation(model: torch.nn.Module, loader: DataLoader, data: Planned
                      unit="patches", batches=step, message=f"Validated {accumulator.samples}/{len(data)} patches.")
                 check_cancel()
     losses, metrics = accumulator.result()
+    data.validation_reconstruction = instance.result() if instance is not None else None
     emit("validation", status="completed", epoch=epoch, current=accumulator.samples, maximum=len(data), unit="patches",
          batches=accumulator.batches, losses=losses, metrics=metrics, aggregation=accumulator.aggregation(),
          message=f"Regular validation completed for epoch {epoch}.")
@@ -115,12 +133,15 @@ def _full_target(data: PlannedValidationDataset, domain_index: int, mask: np.nda
 
 def full_validation(model: torch.nn.Module, data: PlannedValidationDataset, device: torch.device, epoch: int,
                     postprocessing: PostprocessingConfig, *, emit: Callable[..., Any],
-                    check_cancel: Callable[[], None], dtype: torch.dtype = torch.float32) -> dict[str, Any]:
+                    check_cancel: Callable[[], None], dtype: torch.dtype = torch.float32,
+                    target_cache: dict | None = None) -> dict[str, Any]:
     """One held-out domain at a time; only tiles and accumulators, no full image."""
     model.eval()
     importance = importance_map(data.patch, data.options.tile_blending)
     per_case: dict[str, list[dict[str, float]]] = {}
     evaluated: dict[str, list[int] | None] = {}
+    instance = (InstancePQAccumulator(postprocessing, data.options.reconstruction_candidates, target_cache, check_cancel)
+                if data.base.task == "instance_friendly" else None)
     for index, domain in enumerate(data.domains):
         check_cancel()
         pair = data.base.pairs[domain.pair]
@@ -166,9 +187,16 @@ def full_validation(model: torch.nn.Module, data: PlannedValidationDataset, devi
         check_cancel()
         mask = _native_mask(data, index)
         spacing = data.base.case_spacings.get(pair.stem, (1.0, 1.0, 1.0))[-mask.ndim:]
-        target = _full_target(data, index, mask, spacing)
-        metrics = compute_metrics(data.base.task, torch.from_numpy(logits[None]), target,
-                                  postprocessing={**asdict(postprocessing), "spacing": spacing})
+        if instance is not None:
+            from scipy.special import expit
+
+            instance.update(expit(logits), mask, pair.stem, ("full", index), spacing=spacing)
+            metrics = {}
+        else:
+            target = _full_target(data, index, mask, spacing)
+            metrics = compute_metrics(data.base.task, torch.from_numpy(logits[None]), target,
+                                      postprocessing={**asdict(postprocessing), "spacing": spacing})
+            del target
         if not all(math.isfinite(value) for value in metrics.values()):
             raise TrainingError(f"Non-finite full-validation metrics for {pair.stem}")
         per_case.setdefault(pair.stem, []).append(metrics)
@@ -179,7 +207,7 @@ def full_validation(model: torch.nn.Module, data: PlannedValidationDataset, devi
             centers = evaluated.setdefault(pair.stem, [])
             assert centers is not None
             centers.append(z)
-        del accum, logits, mask, target
+        del accum, logits, mask
         emit("full_validation", status="progress", epoch=epoch, current=index + 1, maximum=len(data.domains),
              case=pair.stem, metrics=metrics, unit="domains", message=f"Full validation completed domain {index + 1}/{len(data.domains)}.")
     means = {name: {key: float(np.mean([item[key] for item in values])) for key in values[0]}
@@ -191,8 +219,18 @@ def full_validation(model: torch.nn.Module, data: PlannedValidationDataset, devi
             offset = pair.region[0][0] if pair.region else 0
             completed = set(evaluated.get(pair.stem) or [])
             skipped_centers[pair.stem] = [z + offset for z in range(pair.domain_shape[0]) if z + offset not in completed]
-    return {"mean_dice": float(np.mean(list(scores.values()))), "per_case_dice": scores,
+    result = {"mean_dice": float(np.mean(list(scores.values()))), "per_case_dice": scores,
             "per_case_metrics": means, "evaluated_centers": evaluated, "evaluated_domains": len(data.domains),
             "skipped_domains": 0, "scope": "full_heldout_domains", "aggregation": "mean_per_case; mean_eligible_centers_within_case",
             "skipped_centers": skipped_centers, "skipped_center_reason": "not_eligible_in_resolved_validation_geometry",
             "postprocessing": asdict(postprocessing)}
+    if instance is not None:
+        reconstruction = instance.result()
+        result.pop("mean_dice")
+        result.pop("per_case_dice")
+        result.update(panoptic_quality=reconstruction["panoptic_quality"], reconstruction=reconstruction,
+                      aggregation=reconstruction["aggregation"],
+                      per_case_metrics={case: {"panoptic_quality": score}
+                                        for case, score in reconstruction["per_case"].items()},
+                      postprocessing=reconstruction["postprocessing"])
+    return result

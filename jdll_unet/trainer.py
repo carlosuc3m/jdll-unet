@@ -23,6 +23,7 @@ from .callbacks import CallbackDispatcher
 from .config import (
     AUTO,
     ArchitectureConfig,
+    PostprocessingConfig,
     TrainingConfig,
     architecture_defaults,
     default_augmentation_profile,
@@ -75,6 +76,7 @@ from .spatial_augment import SpatialImageBatch, collate_spatial_samples
 from .targets import boundary_target, complete_device_targets
 from .training_geometry import resolve_training_geometry
 from .validation_control import FullValidationSchedule, ValidationControl
+from .validation_metrics import InstancePQAccumulator, reconstruction_candidates
 from .validation_previews import PreviewAnchor, save_enlarged_previews
 from .validation_sampling import PlannedValidationDataset
 from .volumetric_validation import full_validation, regular_validation
@@ -166,6 +168,9 @@ def _full_volume_validation(
     scale_mode: str = "canonical",
     check_cancel: Any = None,
     tile_batch_size: int = 1,
+    postprocessing: PostprocessingConfig | None = None,
+    candidate_count: int = 3,
+    target_cache: dict | None = None,
 ) -> dict[str, Any]:
     from .infer import _context_stack, tiled_predict
     from .targets import prepare_target
@@ -173,6 +178,8 @@ def _full_volume_validation(
     per_case: dict[str, float] = {}
     per_case_metrics: dict[str, dict[str, float]] = {}
     evaluated_centers: dict[str, list[int] | None] = {}
+    instance = (InstancePQAccumulator(postprocessing or PostprocessingConfig(), candidate_count, target_cache, check_cancel)
+                if task == "instance_friendly" else None)
     for pair in pairs:
         if check_cancel is not None:
             check_cancel()
@@ -228,8 +235,16 @@ def _full_volume_validation(
                 )[0].numpy()
             logits = tiled_predict(model, current_image, device, patch_size, overlap=0.5,
                                    batch_size=tile_batch_size)
+            if not np.isfinite(logits).all():
+                raise TrainingError(f"Non-finite full-validation prediction for {pair.stem}")
             if logits.shape[1:] != current_mask.shape:
                 logits = restore_continuous_maps(logits, current_mask.shape)
+            if instance is not None:
+                from scipy.special import expit
+
+                instance.update(expit(logits), current_mask, pair.stem,
+                                ("full", pair.stem, z), spacing=spacing if dimensions == "3d" else None)
+                continue
             target = prepare_target(
                 task,
                 current_mask,
@@ -243,6 +258,12 @@ def _full_volume_validation(
             metrics.append(compute_metrics(task, torch.from_numpy(logits[None]), tensors))
         per_case_metrics[pair.stem] = _mean_dict(metrics)
         per_case[pair.stem] = primary_metric(task, per_case_metrics[pair.stem])
+    if instance is not None:
+        reconstruction = instance.result()
+        return {"panoptic_quality": reconstruction["panoptic_quality"], "reconstruction": reconstruction,
+                "per_case_metrics": {case: {"panoptic_quality": score}
+                                     for case, score in reconstruction["per_case"].items()},
+                "evaluated_centers": evaluated_centers}
     if not per_case:
         raise DatasetError("Full validation has no eligible real targets")
     return {
@@ -419,6 +440,9 @@ def _save_checkpoint(
     metrics: dict[str, Any],
     model_config: dict[str, Any],
 ) -> None:
+    reconstruction = metrics.get("full_validation", {}).get("reconstruction") or metrics.get("validation_reconstruction")
+    if task == "instance_friendly" and reconstruction is not None:
+        model_config = {**model_config, "postprocessing": reconstruction["postprocessing"]}
     payload = {
             "state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -435,6 +459,10 @@ def _save_checkpoint(
     _atomic_torch_save(payload, path)
 
 
+def _better_checkpoint(task: str, score: float, loss: float, best_score: float, best_loss: float) -> bool:
+    return score > best_score or score == best_score and (loss < best_loss if task == "instance_friendly" else True)
+
+
 def _restore_completed_epoch(
     checkpoint_path: Path,
     model: torch.nn.Module,
@@ -448,8 +476,8 @@ def _restore_completed_epoch(
     saved = json.loads(json.dumps(checkpoint["model_config"]))
     current = json.loads(json.dumps(model_config))
     volumetric = current["architecture_config"].get("dimensions") in {"2.5d", "3d"}
-    if volumetric and saved.get("validation_selection") != current.get("validation_selection"):
-        raise TrainingError("Cannot resume legacy volumetric checkpoint selection as regular patch selection; start a new run or fine-tune")
+    if (volumetric or current["task"] == "instance_friendly") and saved.get("validation_selection") != current.get("validation_selection"):
+        raise TrainingError("Cannot resume with changed validation checkpoint selection; start a new run or fine-tune")
     if volumetric:
         state_path = checkpoint_path.parent / "validation_state.json"
         if not state_path.is_file():
@@ -503,16 +531,25 @@ def _restore_completed_epoch(
     full_best = -float("inf")
     full_bad = 0
     scores = []
+    best_score = -float("inf")
+    best_loss = float("inf")
+    best_epoch = None
     for row in history:
         if "full_validation" in row:
-            score = float(row["full_validation"]["mean_dice"])
+            score = float(row["full_validation"]["panoptic_quality"] if current["task"] == "instance_friendly"
+                          else row["full_validation"]["mean_dice"])
             full_bad = 0 if score > full_best else full_bad + 1
             full_best = max(full_best, score)
         if volumetric or new_training["validation"]["mode"] == "light" or not new_training["validation"]["full_every"]:
             scores.append(primary_metric(current["task"], row["val_metrics"]))
         elif "full_validation" in row:
-            scores.append(float(row["full_validation"]["mean_dice"]))
-    best_score = max(scores, default=-float("inf"))
+            scores.append(float(row["full_validation"]["panoptic_quality"] if current["task"] == "instance_friendly"
+                                else row["full_validation"]["mean_dice"]))
+        else:
+            continue
+        loss = float(row["val_losses"]["total_loss"])
+        if _better_checkpoint(current["task"], scores[-1], loss, best_score, best_loss):
+            best_score, best_loss, best_epoch = scores[-1], loss, row["epoch"]
     if saved_metrics["best_score"] != (best_score if math.isfinite(best_score) else None):
         raise TrainingError("Cannot resume: best score does not match the metric history")
     best_path = checkpoint_path.parent / "weights_best.pt"
@@ -520,8 +557,10 @@ def _restore_completed_epoch(
         if not best_path.is_file():
             raise TrainingError("Cannot resume: best checkpoint is missing")
         best = torch.load(best_path, map_location="cpu", weights_only=False)
-        if not 1 <= best["epoch"] <= epoch or best["metrics"] != history[best["epoch"] - 1]:
+        if best["epoch"] != best_epoch or best["metrics"] != history[best["epoch"] - 1]:
             raise TrainingError("Cannot resume: best checkpoint does not match the metric history")
+        if current["task"] == "instance_friendly":
+            model_config["postprocessing"] = best["model_config"]["postprocessing"]
         del best
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -544,8 +583,10 @@ def _restore_completed_epoch(
                 source = checkpoint_path.parent / name
                 if source.exists():
                     _atomic_copy(source, output_dir / name)
+    write_json(output_dir / "config.json", model_config)
     return {"epoch": epoch, "step": state["step_count"], "history": history,
             "best_score": best_score, "full_validation_best": full_best, "full_validation_bad": full_bad,
+            "best_loss": best_loss,
             "rng_restored": rng is not None}
 
 
@@ -557,6 +598,7 @@ def _save_previews(
     loader: DataLoader,
     device: torch.device,
     preview_count: int,
+    postprocessing: dict[str, Any] | None = None,
 ) -> dict[str, str] | None:
     if preview_count <= 0:
         return None
@@ -571,7 +613,7 @@ def _save_previews(
             images_cpu = images.detach().cpu().numpy()
             target_cpu = _target_to_numpy(target_batch)
             support = target_batch.get("valid") if isinstance(target_batch, dict) else None
-            predictions = _predictions_to_visual_targets(task, logits, support)
+            predictions = _predictions_to_visual_targets(task, logits, support, postprocessing)
             for idx in range(images_cpu.shape[0]):
                 if len(saved) >= preview_count:
                     break
@@ -670,18 +712,25 @@ def _label_to_rgb(labels: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def _predictions_to_visual_targets(task: str, logits: torch.Tensor, validity: torch.Tensor | None = None) -> np.ndarray:
+def _predictions_to_visual_targets(task: str, logits: torch.Tensor, validity: torch.Tensor | None = None,
+                                   postprocessing: dict[str, Any] | None = None) -> np.ndarray:
     if task == "multiclass_semantic":
         return torch.argmax(logits, dim=1).numpy()
     probabilities = torch.sigmoid(logits).numpy()
+    support = None
     if validity is not None:
-        probabilities = np.where(validity.detach().cpu().numpy(), probabilities, 0)
+        support = validity.detach().cpu().numpy()
+        probabilities = np.where(support, probabilities, 0)
     if task == "instance_friendly":
+        if support is not None:
+            probabilities[:, 0][~support[:, 0]] = -1
         predictions = []
-        for item in probabilities:
+        for index, item in enumerate(probabilities):
             processed = postprocess_instance(
-                item[0], item[1], item[2] if item.shape[0] >= 3 else None, threshold=0.5, min_object_size=0
+                item[0], item[1], item[2] if item.shape[0] >= 3 else None, **(postprocessing or {})
             )
+            if support is not None:
+                processed["labels"][~support[index, 0]] = 0
             predictions.append(processed["labels"])
         return np.stack(predictions, axis=0)
     return (probabilities[:, 0] >= 0.5).astype(np.uint8)
@@ -1391,12 +1440,19 @@ def _train(
             "dataset_plan_path": str(output_dir / "dataset_plan.json"),
         }
     )
-    if volumetric:
+    if volumetric or detected_task == "instance_friendly":
         model_config["validation_selection"] = {
-            "version": 1, "scope": "regular_patches", "direction": "maximize",
+            "version": 1,
+            "scope": "full_images" if not volumetric and train_config.validation.mode == "full"
+                     and train_config.validation.full_every else "regular_patches", "direction": "maximize",
             "metric": {"binary_semantic": "dice", "multiclass_semantic": "mean_dice",
-                       "instance_friendly": "foreground_dice"}[detected_task],
+                       "instance_friendly": "panoptic_quality"}[detected_task],
         }
+        if detected_task == "instance_friendly":
+            model_config["validation_selection"].update(
+                matching_iou_threshold=0.5, tie_breaker="minimum_regular_validation_loss",
+                reconstruction_candidates=reconstruction_candidates(train_config.postprocessing,
+                                                   train_config.validation.reconstruction_candidates))
     write_json(output_dir / "config.json", model_config)
     model_metadata = {
         "format_version": 1,
@@ -1503,6 +1559,8 @@ def _train(
 
     history: list[dict[str, Any]] = resumed["history"] if resumed else []
     best_score = resumed["best_score"] if resumed else -float("inf")
+    best_loss = resumed["best_loss"] if resumed else float("inf")
+    instance_target_cache: dict = {}
     full_validation_best = resumed["full_validation_best"] if resumed else -float("inf")
     full_validation_bad = resumed["full_validation_bad"] if resumed else 0
     global_step = resumed["step"] if resumed else 0
@@ -1645,6 +1703,7 @@ def _train(
 
         full_request = None
         anchors: list[PreviewAnchor] = []
+        patch_reconstruction = None
         if validation_data is not None:
             check_cancel()
             assert full_schedule is not None
@@ -1654,17 +1713,24 @@ def _train(
                 focal_gamma=train_config.focal_gamma, focal_alpha=train_config.focal_alpha,
                 preview_count=train_config.preview_count, progress_interval=progress_update_interval,
                 emit=emit_plan, check_cancel=check_cancel, dtype=training_dtype,
+                postprocessing=train_config.postprocessing, target_cache=instance_target_cache,
             )
+            patch_reconstruction = validation_data.validation_reconstruction
         else:
             model.eval()
             val_losses: list[dict[str, float]] = []
             val_metrics: list[dict[str, float]] = []
+            instance = (InstancePQAccumulator(train_config.postprocessing,
+                        train_config.validation.reconstruction_candidates, instance_target_cache, check_cancel)
+                        if detected_task == "instance_friendly" else None)
+            validated_samples = 0
             with torch.inference_mode():
                 for val_step, (images, target_batch) in enumerate(val_loader):
                     if val_step >= train_config.validation.light_steps:
                         break
                     images = images.to(device, non_blocking=True)
                     cpu_validity = target_batch.get("valid") if isinstance(target_batch, dict) else None
+                    cpu_instances = target_batch.get("instances") if isinstance(target_batch, dict) else None
                     target_batch = _move_target(target_batch, device)
                     logits = model(images)
                     loss, components = compute_loss(
@@ -1680,8 +1746,21 @@ def _train(
                         {**components, "total_loss": loss}, context=f"validation loss at epoch {epoch}, batch {val_step + 1}"
                     )
                     val_losses.append(losses)
-                    val_metrics.append(compute_metrics(detected_task, logits, target_batch))
-            losses_mean, metrics_mean = _mean_dict(val_losses), _mean_dict(val_metrics)
+                    if instance is not None:
+                        assert cpu_instances is not None
+                        samples = list(range(validated_samples, validated_samples + images.shape[0]))
+                        sources = [val_dataset.pairs[val_dataset.items[index][0]] for index in samples]
+                        instance.update_batch(logits, cpu_instances, [source.stem for source in sources],
+                                              [("patch", index) for index in samples], cpu_validity)
+                        validated_samples += images.shape[0]
+                    else:
+                        val_metrics.append(compute_metrics(detected_task, logits, target_batch))
+            losses_mean = _mean_dict(val_losses)
+            if instance is not None:
+                patch_reconstruction = instance.result()
+                metrics_mean = {"panoptic_quality": patch_reconstruction["panoptic_quality"]}
+            else:
+                metrics_mean = _mean_dict(val_metrics)
 
         epoch_record: dict[str, Any] = {
             "epoch": epoch,
@@ -1690,8 +1769,9 @@ def _train(
             "val_metrics": metrics_mean,
         }
         light_score = primary_metric(detected_task, epoch_record["val_metrics"])
+        if patch_reconstruction is not None:
+            epoch_record["validation_reconstruction"] = patch_reconstruction
         if volumetric:
-            epoch_record["validation_selection"] = {**model_config["validation_selection"], "value": light_score}
             assert full_schedule is not None
             epoch_record["validation_schedule"] = full_schedule.state_dict()
         run_full_validation = not volumetric and train_config.validation.mode == "full" and bool(train_config.validation.full_every) and (
@@ -1720,9 +1800,13 @@ def _train(
                 scale_mode=scale_cfg.mode,
                 check_cancel=check_cancel,
                 tile_batch_size=min(8, microbatch_size) if device.type == "cuda" and dimensions == "2d" else 1,
+                postprocessing=train_config.postprocessing,
+                candidate_count=train_config.validation.reconstruction_candidates, target_cache=instance_target_cache,
             )
             epoch_record["full_validation"] = full_metrics
-            score = float(full_metrics["mean_dice"])
+            score = float(full_metrics["panoptic_quality"] if detected_task == "instance_friendly" else full_metrics["mean_dice"])
+            logger.info("epoch=%s full_validation=%s reconstruction=%s", epoch, score,
+                        full_metrics.get("reconstruction", {}).get("postprocessing"))
             if score > full_validation_best:
                 full_validation_best = score
                 full_validation_bad = 0
@@ -1731,7 +1815,11 @@ def _train(
         else:
             score = light_score
         selector_update = volumetric or train_config.validation.mode == "light" or run_full_validation or not train_config.validation.full_every
-        lr_scheduler.step_epoch(score)
+        if detected_task == "instance_friendly" or volumetric:
+            epoch_record["validation_selection"] = {**model_config["validation_selection"],
+                "evaluated": selector_update, "value": score if selector_update else None,
+                "regular_validation_loss": float(losses_mean["total_loss"])}
+        lr_scheduler.step_epoch(score if selector_update else None)
         epoch_record["learning_rate"] = lr_scheduler.current_lr
         history.append(epoch_record)
         logger.info(
@@ -1747,15 +1835,22 @@ def _train(
             detected_task, arch, epoch_record, model_config,
         )
         improved = selector_update and score > best_score
-        best_written = selector_update and score >= best_score
+        best_written = selector_update and _better_checkpoint(detected_task, score, float(losses_mean["total_loss"]),
+                                                               best_score, best_loss)
         best_existed = (output_dir / "weights_best.pt").exists()
         if best_written:
             best_score = score
+            best_loss = float(losses_mean["total_loss"])
             _save_checkpoint(
                 output_dir / "weights_best.pt", model, optimizer, lr_scheduler, epoch,
                 detected_task, arch, epoch_record, model_config,
             )
             _atomic_copy(output_dir / "weights_best.pt", output_dir / "model.pt")
+            if detected_task == "instance_friendly":
+                reconstruction = epoch_record.get("full_validation", {}).get("reconstruction") or patch_reconstruction
+                assert reconstruction is not None
+                model_config["postprocessing"] = reconstruction["postprocessing"]
+                write_json(output_dir / "config.json", model_config)
         write_json(
             output_dir / "metrics.json",
             {"history": history, "best_score": best_score if math.isfinite(best_score) else None},
@@ -1781,9 +1876,12 @@ def _train(
             step=global_step,
             total_epochs=train_config.epochs,
             total_steps=total_steps,
+            validation_reconstruction=patch_reconstruction,
+            full_validation=epoch_record.get("full_validation"),
             learning_rate=lr_scheduler.current_lr,
             losses={f"val/{key}": value for key, value in epoch_record["val_losses"].items()},
-            metrics={f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
+            metrics={**{f"val/{key}": value for key, value in epoch_record["val_metrics"].items()},
+                     **({"full_val/panoptic_quality": score} if run_full_validation and detected_task == "instance_friendly" else {})},
             last_checkpoint_path=str(output_dir / "weights_last.pt"),
             best_checkpoint_path=str(output_dir / "weights_best.pt")
             if (output_dir / "weights_best.pt").exists()
@@ -1806,7 +1904,9 @@ def _train(
             check_cancel()
             try:
                 preview_event = save_enlarged_previews(validation_data, anchors, model, device, output_dir, epoch,
-                                                      train_config.postprocessing, emit=emit_plan, check_cancel=check_cancel,
+                                                      PostprocessingConfig(**patch_reconstruction["postprocessing"])
+                                                      if patch_reconstruction is not None else train_config.postprocessing,
+                                                      emit=emit_plan, check_cancel=check_cancel,
                                                       dtype=training_dtype)
             except TrainingStopped:
                 raise
@@ -1818,7 +1918,8 @@ def _train(
                 preview_event = None
         else:
             preview_event = _save_previews(
-                output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count
+                output_dir, epoch, detected_task, model, val_loader, device, train_config.preview_count,
+                patch_reconstruction["postprocessing"] if patch_reconstruction is not None else None,
             )
         if preview_event is not None:
             latest_preview_path = preview_event["latest_preview_path"]
@@ -1839,7 +1940,8 @@ def _train(
             write_json(output_dir / "validation_state.json", {"epoch": epoch, **full_schedule.state_dict()})
             try:
                 full_metrics = full_validation(model, validation_data, device, epoch, train_config.postprocessing,
-                                               emit=emit_full_progress, check_cancel=check_cancel, dtype=training_dtype)
+                                               emit=emit_full_progress, check_cancel=check_cancel, dtype=training_dtype,
+                                               target_cache=instance_target_cache)
             except TrainingStopped:
                 full_history.append({**full_request, "status": "cancelled"})
                 write_json(output_dir / "full_validation_metrics.json", {"history": full_history})

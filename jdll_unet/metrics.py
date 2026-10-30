@@ -116,31 +116,39 @@ def instance_metrics(logits: torch.Tensor, target: dict[str, torch.Tensor],
     return metrics
 
 
-def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
+def instance_label_counts(target: np.ndarray) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for start in range(0, target.size, 1_048_576):
+        values, sizes = np.unique(target.flat[start:start + 1_048_576], return_counts=True)
+        for value, size in zip(values, sizes, strict=True):
+            if value:
+                counts[int(value)] = counts.get(int(value), 0) + int(size)
+    return counts
+
+
+def _instance_overlap(prediction: np.ndarray, target: np.ndarray, target_counts: dict[int, int] | None = None
+                      ) -> tuple[dict[int, int], dict[int, int], dict[tuple[int, int], int]]:
     if prediction.shape != target.shape:
         raise ValueError("Instance predictions and targets must have the same shape")
     pred_areas: dict[int, int] = {}
-    true_areas: dict[int, int] = {}
+    true_areas = instance_label_counts(target) if target_counts is None else target_counts
     intersections: dict[tuple[int, int], int] = {}
     # One bounded contingency scan, not one whole-volume scan per object pair.
     for start in range(0, target.size, 1_048_576):
         pred = prediction.flat[start:start + 1_048_576]
         truth = target.flat[start:start + 1_048_576]
         pred_labels, pred_counts = np.unique(pred, return_counts=True)
-        true_labels, true_counts = np.unique(truth, return_counts=True)
-        for ids, counts, destination in ((pred_labels, pred_counts, pred_areas),
-                                         (true_labels, true_counts, true_areas)):
-            for label, count in zip(ids, counts, strict=True):
-                if label:
-                    destination[int(label)] = destination.get(int(label), 0) + int(count)
+        for label, count in zip(pred_labels, pred_counts, strict=True):
+            if label:
+                pred_areas[int(label)] = pred_areas.get(int(label), 0) + int(count)
         support = (pred != 0) & (truth != 0)
         # Integer keys avoid structured-array sorting for ordinary label IDs.
         # Preserve arbitrary uint64 IDs without overflow via the reference path.
         radix = int(pred_labels[-1]) + 1
         encoded = (
             pred.dtype.kind in "biu" and truth.dtype.kind in "biu"
-            and pred_labels[0] >= 0 and true_labels[0] >= 0
-            and int(true_labels[-1]) * radix + int(pred_labels[-1]) <= np.iinfo(np.int64).max
+            and pred_labels[0] >= 0 and truth.min() >= 0
+            and int(truth.max()) * radix + int(pred_labels[-1]) <= np.iinfo(np.int64).max
         )
         if encoded:
             pairs = truth[support].astype(np.int64, copy=False) * radix + pred[support].astype(np.int64, copy=False)
@@ -153,24 +161,44 @@ def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshol
             keys = ((int(pair["true"]), int(pair["pred"])) for pair in values)
         for key, count in zip(keys, counts, strict=True):
             intersections[key] = intersections.get(key, 0) + int(count)
-    pred_ids, true_ids = sorted(pred_areas), sorted(true_areas)
-    candidates: list[tuple[float, int, int, int, int]] = []
-    overlaps_by_true = dict.fromkeys(true_ids, 0)
-    overlaps_by_pred = dict.fromkeys(pred_ids, 0)
-    for (true_id, pred_id), intersection in intersections.items():
-        union = true_areas[true_id] + pred_areas[pred_id] - intersection
-        candidates.append((intersection / union, true_id, pred_id, intersection, union))
-        overlaps_by_true[true_id] += 1
-        overlaps_by_pred[pred_id] += 1
+    return pred_areas, true_areas, intersections
+
+
+def _instance_matches(pred_areas: dict[int, int], true_areas: dict[int, int],
+                      intersections: dict[tuple[int, int], int], threshold: float
+                      ) -> list[tuple[float, int, int, int, int]]:
+    candidates = [(intersection / (true_areas[t] + pred_areas[p] - intersection), t, p, intersection,
+                   true_areas[t] + pred_areas[p] - intersection) for (t, p), intersection in intersections.items()]
     matched_true: set[int] = set()
     matched_pred: set[int] = set()
-    matches: list[tuple[float, int, int, int, int]] = []
+    matches = []
     for candidate in sorted(candidates, reverse=True):
         iou, true_id, pred_id, _intersection, _union = candidate
         if iou >= threshold and true_id not in matched_true and pred_id not in matched_pred:
             matches.append(candidate)
             matched_true.add(true_id)
             matched_pred.add(pred_id)
+    return matches
+
+
+def instance_pq_statistics(prediction: np.ndarray, target: np.ndarray,
+                           target_counts: dict[int, int] | None = None) -> np.ndarray:
+    pred, truth, intersections = _instance_overlap(prediction, target, target_counts)
+    matches = _instance_matches(pred, truth, intersections, 0.5)
+    return np.array([sum(item[0] for item in matches), len(truth), len(pred)], dtype=np.float64)
+
+
+def _instance_label_metrics(prediction: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
+    pred_areas, true_areas, intersections = _instance_overlap(prediction, target)
+    pred_ids, true_ids = sorted(pred_areas), sorted(true_areas)
+    overlaps_by_true = dict.fromkeys(true_ids, 0)
+    overlaps_by_pred = dict.fromkeys(pred_ids, 0)
+    for true_id, pred_id in intersections:
+        overlaps_by_true[true_id] += 1
+        overlaps_by_pred[pred_id] += 1
+    matches = _instance_matches(pred_areas, true_areas, intersections, threshold)
+    matched_true = {item[1] for item in matches}
+    matched_pred = {item[2] for item in matches}
     tp = len(matches)
     fp = len(pred_ids) - tp
     fn = len(true_ids) - tp
@@ -242,5 +270,5 @@ def primary_metric(task: str, metrics: dict[str, float]) -> float:
     if task == "multiclass_semantic":
         return metrics.get("mean_dice", 0.0)
     if task == "instance_friendly":
-        return metrics.get("foreground_dice", 0.0)
+        return metrics.get("panoptic_quality", 0.0)
     return 0.0

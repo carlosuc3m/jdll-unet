@@ -63,6 +63,7 @@ class PlannedValidationDataset(Dataset):
         self.samples: list[tuple[int, int]] = []
         self.forced_indices: list[int] = []
         self.summary: dict[str, Any] = {}
+        self.validation_reconstruction: dict[str, Any] | None = None
         requested = max(options.minimum_batches, math.ceil(options.minimum_samples / batch_size)) * batch_size
         for item, (pair, _z) in enumerate(base.items):
             check_cancel()

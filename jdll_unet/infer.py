@@ -108,6 +108,9 @@ def _config_from_checkpoint(checkpoint: Path, state: dict[str, Any]) -> dict[str
     folder_config = checkpoint.parent / "config.json"
     if folder_config.exists():
         config = read_json(folder_config)
+        embedded = state.get("model_config", {})
+        if embedded.get("validation_selection", {}).get("metric") == "panoptic_quality":
+            config["postprocessing"] = embedded["postprocessing"]
         metadata_path = checkpoint.parent / "model_metadata.json"
         if metadata_path.exists():
             config["_model_metadata"] = read_json(metadata_path)

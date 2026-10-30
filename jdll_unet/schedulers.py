@@ -116,7 +116,8 @@ class LearningRateScheduler:
         if self.type == "cosine":
             self._set_lrs(self._scheduled_lrs(self._cosine_decay()))
 
-    def step_epoch(self, score: float) -> bool:
+    def step_epoch(self, score: float | None) -> bool:
+        """Advance epoch time; None leaves Plateau's validation state unchanged."""
         self.epoch_count += 1
         if self.type == "poly":
             if self.warmup_steps and self.step_count < self.warmup_steps:
@@ -127,7 +128,7 @@ class LearningRateScheduler:
             )
             self._set_lrs(self._scheduled_lrs((1.0 - progress) ** float(self.config.poly_power)))
             return False
-        if self.type != "plateau":
+        if self.type != "plateau" or score is None:
             return False
         if self.best_score is None or score > self.best_score + float(self.config.plateau_threshold):
             self.best_score = score

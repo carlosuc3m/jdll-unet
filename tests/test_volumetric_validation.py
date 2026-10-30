@@ -31,7 +31,7 @@ from jdll_unet.losses import compute_loss
 from jdll_unet.metrics import _instance_label_metrics, compute_metrics
 from jdll_unet.targets import prepare_target
 from jdll_unet.validation_control import FullValidationSchedule
-from jdll_unet.validation_metrics import ValidationAccumulator
+from jdll_unet.validation_metrics import InstancePQAccumulator, ValidationAccumulator, reconstruction_candidates
 from jdll_unet.validation_previews import save_enlarged_previews
 from jdll_unet.validation_sampling import PlannedValidationDataset
 from jdll_unet.volumetric_validation import full_validation, regular_validation
@@ -225,6 +225,35 @@ def test_sparse_instance_matching_preserves_greedy_definition():
     assert result["split_error_rate"] == result["merge_error_rate"] == 0
 
 
+def test_instance_candidates_use_one_global_choice_and_reuse_original_id_counts(monkeypatch):
+    import jdll_unet.validation_metrics as module
+
+    truth = np.array([[7, 0, 7]], dtype=np.uint64)
+    cache = {}
+    counts = Mock(wraps=module.instance_label_counts)
+    monkeypatch.setattr(module, "instance_label_counts", counts)
+
+    def reconstruct(foreground, *_maps, threshold, **_options):
+        correct = (foreground[0, 0] > 0.5) == (threshold == 0.5)
+        return {"labels": truth.copy() if correct else np.zeros_like(truth)}
+
+    monkeypatch.setattr(module, "postprocess_instance", reconstruct)
+    for _epoch in range(2):
+        accumulator = InstancePQAccumulator(PostprocessingConfig(), target_cache=cache)
+        for index, value in enumerate((0.8, 0.2)):
+            accumulator.update(np.full((3, 1, 3), value, np.float32), truth, str(index), index)
+        result = accumulator.result()
+        assert result["panoptic_quality"] == 0.5  # Per-patch oracle choice would incorrectly score 1.
+        assert result["candidate_index"] == 0
+        assert len(result["candidates"]) == 3
+    assert counts.call_count == 2
+    assert all(value == {7: 2} for value in cache.values())
+    empty = InstancePQAccumulator(PostprocessingConfig(), count=1)
+    empty.update(np.full((3, 1, 3), 0.8, np.float32), truth, "same-source", "foreground")
+    empty.update(np.full((3, 1, 3), 0.8, np.float32), np.zeros_like(truth), "same-source", "background")
+    assert empty.result()["panoptic_quality"] == pytest.approx(2 / 3)
+
+
 def test_control_tokens_boundary_phase_and_arrival_during_full_pass():
     control = FullValidationController()
     events = []
@@ -362,7 +391,8 @@ def test_configuration_roundtrip_and_dimensional_defaults(tmp_path, dimensions, 
 
 @pytest.mark.parametrize("field,value", [("full_every", -1), ("full_every", True), ("minimum_batches", 0),
                                         ("max_sampling_overlap", 0.2), ("minimum_foreground", 0),
-                                        ("preview_max_bytes", False), ("tile_overlap", float("nan"))])
+                                        ("preview_max_bytes", False), ("tile_overlap", float("nan")),
+                                        ("reconstruction_candidates", 0), ("reconstruction_candidates", 1.0)])
 def test_invalid_validation_config(tmp_path, field, value):
     with pytest.raises(ConfigError):
         parse_training_config({"model_name": "x", "output_dir": tmp_path, "dataset_path": tmp_path,
@@ -382,6 +412,107 @@ def training_config(tmp_path, epochs=2):
             "architecture": "resenc-tiny-3d", "patch_size": [8, 16, 16], "batch_size": 1,
             "effective_batch_size": 1, "steps_per_epoch": 1, "epochs": epochs, "task": "binary_semantic",
             "preview_count": 0}
+
+
+def test_instance_2d_selects_full_pq_breaks_ties_by_loss_and_loads_own_settings(tmp_path, monkeypatch):
+    from jdll_unet.infer import load_model
+
+    for split in ("train", "val"):
+        images = tmp_path / "data" / split / "images"
+        masks = tmp_path / "data" / split / "masks"
+        images.mkdir(parents=True)
+        masks.mkdir()
+        mask = np.zeros((32, 32), np.uint8)
+        mask[4:12, 4:12] = 1
+        mask[18:26, 18:26] = 2
+        for index in range(3 if split == "val" else 1):
+            tifffile.imwrite(images / f"case_{index}.tif", mask.astype(np.float32))
+            tifffile.imwrite(masks / f"case_{index}.tif", mask)
+    config = {"model_name": "pq", "dataset_path": tmp_path / "data", "output_dir": tmp_path / "model",
+              "task": "instance_friendly", "architecture": "resenc-tiny-2d", "epochs": 3,
+              "steps_per_epoch": 1, "patch_size": [32, 32], "batch_size": 2,
+              "effective_batch_size": 2, "preview_count": 0, "validation": {"full_every": 2},
+              "lr_scheduler": {"type": "plateau"}}
+    original = trainer._tensor_losses_to_float
+
+    def result(values, **kwargs):
+        losses = original(values, **kwargs)
+        context = kwargs.get("context", "")
+        if context.startswith("validation loss at epoch "):
+            epoch = int(context.split("epoch ")[1].split(",")[0])
+            losses["total_loss"] = (0.05, 0.1, 0.2)[epoch - 1] + (0.1 if context.endswith("batch 2") else 0)
+        return losses
+
+    monkeypatch.setattr(trainer, "_tensor_losses_to_float", result)
+    configurations = iter((2, 0))
+
+    def full(*_args, **kwargs):
+        options = reconstruction_candidates(kwargs["postprocessing"], kwargs["candidate_count"])
+        index = next(configurations)
+        return {"panoptic_quality": 0.8, "reconstruction": {
+            "panoptic_quality": 0.8, "postprocessing": options[index], "candidate_index": index}}
+
+    full_mock = Mock(side_effect=full)
+    monkeypatch.setattr(trainer, "_full_volume_validation", full_mock)
+
+    def callback(event):
+        if event.get("message") == "UNet validation epoch 1":
+            assert not (config["output_dir"] / "weights_best.pt").exists()
+            last = torch.load(config["output_dir"] / "weights_last.pt", weights_only=False)
+            assert last["scheduler_state_dict"]["best_score"] is None
+            assert last["scheduler_state_dict"]["bad_epochs"] == 0
+
+    trained = trainer.train(config, task=callback)
+    assert full_mock.call_count == 2
+    best = torch.load(config["output_dir"] / "weights_best.pt", weights_only=False)
+    assert best["epoch"] == 2
+    assert trained["best_score"] == 0.8
+    history = json.loads((config["output_dir"] / "metrics.json").read_text())["history"]
+    assert all(set(row["val_metrics"]) == {"panoptic_quality"} for row in history)
+    assert not history[0]["validation_selection"]["evaluated"]
+    assert history[1]["validation_selection"]["scope"] == "full_images"
+    assert history[1]["val_losses"]["total_loss"] == pytest.approx(0.15)
+    assert trained["lr_scheduler"]["best_score"] == 0.8
+    assert trained["lr_scheduler"]["epoch_count"] == 3
+    assert trained["lr_scheduler"]["bad_epochs"] == 1
+    _, best_config = load_model(config["output_dir"])
+    _, last_config = load_model(config["output_dir"] / "weights_last.pt")
+    assert best_config["postprocessing"]["threshold"] == 0.4
+    assert last_config["postprocessing"]["threshold"] == 0.5
+    assert json.loads((config["output_dir"] / "config.json").read_text())["postprocessing"]["threshold"] == 0.4
+
+
+@pytest.mark.parametrize("dimensions", ["2.5d", "3d"])
+def test_instance_volumetric_pq_selection_resumes(tmp_path, monkeypatch, dimensions):
+    config = training_config(tmp_path)
+    mask = np.zeros((8, 16, 16), np.uint8)
+    mask[1:4, 2:6, 2:6] = 7
+    mask[4:7, 10:14, 10:14] = 29
+    for split in ("train", "val"):
+        tifffile.imwrite(tmp_path / "data" / split / "masks/case.tif", mask, metadata={"axes": "ZYX"})
+    config.update(task="instance_friendly", architecture=f"resenc-tiny-{dimensions}")
+    if dimensions == "2.5d":
+        config["patch_size"] = [16, 16]
+    monkeypatch.setattr(trainer, "full_validation", Mock(side_effect=AssertionError("Unexpected full volume")))
+
+    def stop(event):
+        if event.get("message") == "UNet validation epoch 1":
+            raise RuntimeError("pause PQ run")
+
+    with pytest.raises(RuntimeError, match="pause PQ run"):
+        trainer.train(config, task=stop)
+    checkpoint = config["output_dir"] / "weights_last.pt"
+    monkeypatch.setattr(trainer, "_train", functools.partial(trainer._train, resume_from=checkpoint))
+    output = tmp_path / "resumed"
+    result = trainer.train({**config, "output_dir": output})
+    history = json.loads((output / "metrics.json").read_text())["history"]
+    winner = max(history, key=lambda row: (row["val_metrics"]["panoptic_quality"], -row["val_losses"]["total_loss"]))
+    best = torch.load(output / "weights_best.pt", weights_only=False)
+    assert best["epoch"] == winner["epoch"]
+    assert result["best_score"] == winner["val_metrics"]["panoptic_quality"]
+    assert best["model_config"]["validation_selection"]["scope"] == "regular_patches"
+    assert best["model_config"]["postprocessing"] == winner["validation_reconstruction"]["postprocessing"]
+    assert all(set(row["val_metrics"]) == {"panoptic_quality"} for row in history)
 
 
 def test_training_default_disables_full_and_selects_every_epoch(tmp_path, monkeypatch):
@@ -556,7 +687,7 @@ def test_full_sparse_labels_do_not_relabel_or_reanalyse_sources(tmp_path, monkey
         monkeypatch.setattr("jdll_unet.targets.compact_instance_labels", Mock(side_effect=AssertionError("Full relabel")))
         result = full_validation(CountingModel(3), data, torch.device("cpu"), 1, PostprocessingConfig(),
                                  emit=emit, check_cancel=lambda: None)
-        assert math.isfinite(result["mean_dice"])
+        assert math.isfinite(result["panoptic_quality" if task == "instance_friendly" else "mean_dice"])
         assert result["evaluated_domains"] == 1
 
 

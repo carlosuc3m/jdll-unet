@@ -19,7 +19,7 @@ def test_poly_scheduler_decays_to_min_lr():
         total_epochs=4,
     )
 
-    scheduler.step_epoch(0.0)
+    scheduler.step_epoch(None)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.00775)
     scheduler.step_epoch(0.0)
     scheduler.step_epoch(0.0)
@@ -49,11 +49,20 @@ def test_plateau_scheduler_reduces_after_patience():
         total_steps=10,
     )
 
+    assert scheduler.step_epoch(None) is False
+    assert scheduler.best_score is None
+    assert scheduler.bad_epochs == 0
+    assert scheduler.current_lr == 0.01
     assert scheduler.step_epoch(0.5) is False
+    assert scheduler.step_epoch(None) is False
+    assert scheduler.best_score == 0.5
+    assert scheduler.bad_epochs == 0
+    assert scheduler.current_lr == 0.01
     assert scheduler.step_epoch(0.5) is True
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.005)
     assert scheduler.step_epoch(0.6) is False
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.005)
+    assert scheduler.epoch_count == 5
 
 
 def test_scheduler_config_defaults_aliases_and_validation(tmp_path):
@@ -95,7 +104,7 @@ def test_scheduler_resume_preserves_future_learning_rates(kind):
     restored = LearningRateScheduler(_optimizer(), config, total_steps=12, total_epochs=6)
     restored.load_state_dict(original.state_dict())
     assert restored.state_dict() == original.state_dict()
-    for score in (0.4, 0.6, 0.5):
+    for score in (None, 0.6, 0.5):
         for scheduler in (original, restored):
             scheduler.step_batch()
             scheduler.step_batch()

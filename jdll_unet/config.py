@@ -144,6 +144,7 @@ class ValidationConfig:
     preview_max_bytes: int | str = AUTO
     tile_overlap: float = 0.25
     tile_blending: str = "constant"
+    reconstruction_candidates: int = 3
 
     def __post_init__(self) -> None:
         if self.light_steps != self.minimum_batches:
@@ -761,6 +762,10 @@ def parse_training_config(
     validation = parsed.validation
     if validation.mode not in {"light", "full"}:
         raise ConfigError("validation.mode must be 'light' or 'full'")
+    if (isinstance(validation.reconstruction_candidates, bool)
+            or not isinstance(validation.reconstruction_candidates, int)
+            or validation.reconstruction_candidates not in (1, 2, 3)):
+        raise ConfigError("validation.reconstruction_candidates must be 1, 2 or 3")
     for name in ("light_every", "light_steps", "minimum_batches", "minimum_samples", "candidate_attempts"):
         value = getattr(validation, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
