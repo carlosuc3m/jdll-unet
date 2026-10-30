@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import torch
 
-from .config import LRSchedulerConfig
+from .config import AUTO, LRSchedulerConfig, _validate_lr_scheduler
 from .errors import ConfigError
 
 
@@ -23,10 +23,15 @@ class LearningRateScheduler:
         total_epochs: int | None = None,
     ) -> None:
         self.optimizer = optimizer
+        config = replace(config, warmup_fraction=0.0 if config.warmup_fraction == AUTO else config.warmup_fraction)
+        _validate_lr_scheduler(config)
         self.config = config
         self.type = config.type
         self.total_steps = max(1, int(total_steps))
         self.total_epochs = max(1, int(total_epochs or total_steps))
+        requested_warmup = math.ceil(self.total_steps * float(config.warmup_fraction))
+        # Short smoke runs still need an update outside warmup.
+        self.warmup_steps = min(self.total_steps - 1, max(2, requested_warmup)) if requested_warmup and self.total_steps >= 3 else 0
         self.step_count = 0
         self.epoch_count = 0
         self.best_score: float | None = None
@@ -42,6 +47,8 @@ class LearningRateScheduler:
             minimum > base_lr for minimum, base_lr in zip(self.min_lrs, self.base_lrs, strict=True)
         ):
             raise ConfigError("lr_scheduler.min_lr cannot exceed the optimizer learning rate")
+        if self.warmup_steps:
+            self._set_lrs([lr * config.warmup_start_factor for lr in self.base_lrs])
 
     @property
     def current_lrs(self) -> list[float]:
@@ -70,10 +77,15 @@ class LearningRateScheduler:
             "best_score": self.best_score,
             "bad_epochs": self.bad_epochs,
             "config": self.config_dict(),
+            "warmup_steps": self.warmup_steps,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Restore progress without restarting or changing the schedule."""
+        state = dict(state)
+        state["config"] = {"warmup_fraction": 0.0, "warmup_start_factor": 0.01, **state.get("config", {})}
+        if state.get("warmup_steps", 0) != self.warmup_steps:
+            raise ConfigError("Cannot resume: scheduler warmup differs from the checkpoint")
         for key, expected in (
             ("type", self.type), ("config", self.config_dict()),
             ("total_steps", self.total_steps), ("total_epochs", self.total_epochs),
@@ -97,13 +109,22 @@ class LearningRateScheduler:
 
     def step_batch(self) -> None:
         self.step_count += 1
+        if self.warmup_steps and self.step_count <= self.warmup_steps:
+            fraction = min(self.step_count / (self.warmup_steps - 1), 1.0)
+            factor = self.config.warmup_start_factor + (1 - self.config.warmup_start_factor) * fraction
+            self._set_lrs([lr * factor for lr in self.base_lrs])
         if self.type == "cosine":
             self._set_lrs(self._scheduled_lrs(self._cosine_decay()))
 
     def step_epoch(self, score: float) -> bool:
         self.epoch_count += 1
         if self.type == "poly":
-            progress = min(self.epoch_count, self.total_epochs) / self.total_epochs
+            if self.warmup_steps and self.step_count < self.warmup_steps:
+                return False
+            progress = (
+                min(1.0, (self.step_count - self.warmup_steps) / (self.total_steps - self.warmup_steps))
+                if self.warmup_steps else min(self.epoch_count, self.total_epochs) / self.total_epochs
+            )
             self._set_lrs(self._scheduled_lrs((1.0 - progress) ** float(self.config.poly_power)))
             return False
         if self.type != "plateau":

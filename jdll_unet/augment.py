@@ -62,6 +62,10 @@ class AugmentationConfig:
     jitter_distribution: str = "log_uniform"
     aggressive_scale_jitter: tuple[float, float] = (0.35, 2.0)
     aggressive_jitter_probability: float = 0.30
+    cutout_probability: float = 0.5
+    cutout_max_fraction: float = 0.0
+    cutout_diameter_fraction: float = 0.5
+    cutout_max_attempts: int = 2048
 
 
 def make_augmentation_config(
@@ -100,6 +104,18 @@ def make_augmentation_config(
             setattr(cfg, key, value)
     # A saved resolved augmentation must not override the new run's geometry plan.
     cfg.patch_size = tuple(patch_size)
+    for name in ("cutout_probability", "cutout_max_fraction"):
+        value = float(getattr(cfg, name))
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be finite and in [0, 1]")
+        setattr(cfg, name, value)
+    cfg.cutout_diameter_fraction = float(cfg.cutout_diameter_fraction)
+    if not math.isfinite(cfg.cutout_diameter_fraction) or cfg.cutout_diameter_fraction <= 0:
+        raise ValueError("cutout_diameter_fraction must be finite and positive")
+    if isinstance(cfg.cutout_max_attempts, bool) or not isinstance(cfg.cutout_max_attempts, int) or cfg.cutout_max_attempts < 1:
+        raise ValueError("cutout_max_attempts must be a positive integer")
+    if cfg.cutout_max_fraction and cfg.cutout_probability and len(patch_size) != 2:
+        raise ValueError("Object-relative cutout currently supports 2D patches only")
     return cfg
 
 
@@ -232,6 +248,7 @@ def _spatial_affine(
     validity: np.ndarray | None = None,
     max_padding_ratio: float = 1.0,
     image_plan: SpatialImagePlan | None = None,
+    metadata: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, ...]:
     angle = math.radians(float(rng.uniform(*degrees)))
     scale = float(rng.uniform(*scale_range))
@@ -255,6 +272,8 @@ def _spatial_affine(
         )
         if not _transform_allowed(coords, validity, max_padding_ratio):
             return image, mask, validity
+    if metadata is not None:
+        metadata["object_diameter_px"] /= scale
     if image_plan is None:
         image_t = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32, copy=False)))
         image_out = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0].numpy()
@@ -378,10 +397,13 @@ def apply_augmentation(
     sampler: Any = None,
     empty: bool | None = None,
     require_background: bool = False,
+    metadata: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, ...]:
     if image_plan is not None and (not training or not defer_photometric):
         raise ValueError("Deferred spatial images require training with deferred photometric augmentation")
     rng = rng or np.random.default_rng()
+    if metadata is not None:
+        metadata["object_diameter_px"] = object_diameter_px or 0.25 * min(cfg.patch_size)
     volume_jitter = training and mask.ndim == 3 and cfg.jitter_distribution == "log_uniform_mixture"
     if cfg.instance_scale_enabled or volume_jitter:
         if cfg.instance_scale_enabled and (object_diameter_px is None or object_diameter_px <= 0):
@@ -407,6 +429,10 @@ def apply_augmentation(
             max_padding_ratio=cfg.max_padding_ratio,
             sampler=sampler, empty=empty, require_background=require_background,
         )
+        if metadata is not None:
+            metadata["object_diameter_px"] *= math.sqrt(
+                math.prod(cfg.patch_size[-2:]) / math.prod(source_patch_size[-2:])
+            )
         if normalization_statistics is not None:
             image = normalize_image(image, statistics=normalization_statistics)
             image[:, ~validity] = 0.0
@@ -475,7 +501,7 @@ def apply_augmentation(
     if cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
         image, mask, validity = _spatial_affine(
             image, mask, rng, cfg.rotation_degrees, (1.0, 1.0) if volume_jitter else cfg.scale_range,
-            validity, cfg.max_padding_ratio, image_plan,
+            validity, cfg.max_padding_ratio, image_plan, metadata,
         )
     if cfg.lowres_probability > 0 and rng.random() < cfg.lowres_probability:
         image = _low_resolution(image, rng, spacing, image_plan, tuple(mask.shape))

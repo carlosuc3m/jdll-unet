@@ -17,6 +17,7 @@ from .errors import DatasetError
 from .geometry import domain_reader, eligible_centers, load_domain_image, load_domain_mask, split_sources, stable_seed
 from .io import ImageMaskPair, fit_normalization, load_mask, normalize_image
 from .label_statistics import MaskAnalysis, analyze_mask
+from .occlusion import plan_cutout
 from .planning import resample_image_mask, resample_mask, resolve_context_stride
 from .spatial_augment import SpatialImagePlan, SpatialImageSample
 from .targets import prepare_target
@@ -387,6 +388,9 @@ class JdllSegmentationDataset(Dataset):
         self, index: int
     ) -> tuple[torch.Tensor | SpatialImageSample, torch.Tensor | dict[str, torch.Tensor]]:
         rng = np.random.default_rng(stable_seed(self.seed, self.epoch if self.training else 0, str(index)))
+        cutout_enabled = self.training and self.augmentation.cutout_max_fraction > 0 and self.augmentation.cutout_probability > 0
+        metadata: dict[str, float] | None = {} if cutout_enabled else None
+        cutout_seed = stable_seed(self.seed, self.epoch, f"{index}:cutout") if cutout_enabled else 0
         empty = None
         if self.training:
             if self.epoch_indices is None:
@@ -440,6 +444,7 @@ class JdllSegmentationDataset(Dataset):
                     image_plan=image_plan,
                     return_validity=True,
                     sampler=sampler, empty=empty, require_background=require_background,
+                    metadata=metadata,
                 )
                 break
             except EmptyPatchError:
@@ -468,6 +473,7 @@ class JdllSegmentationDataset(Dataset):
                     return_validity=True,
                     sampler=self._sampler(index, mask) if self.training else None,
                     empty=empty, require_background=require_background,
+                    metadata=metadata,
                 )
             except EmptyPatchError as exc:
                 category = "empty" if empty else "foreground"
@@ -482,6 +488,17 @@ class JdllSegmentationDataset(Dataset):
             canonicalize_instances=not source_has_instance_ids,
             defer_dense=self.defer_spatial,
         )
+        if metadata is not None:
+            erase = plan_cutout(
+                validity, metadata["object_diameter_px"], np.random.default_rng(cutout_seed),
+                probability=cfg.cutout_probability, max_fraction=cfg.cutout_max_fraction,
+                diameter_fraction=cfg.cutout_diameter_fraction, max_attempts=cfg.cutout_max_attempts,
+            )
+            if self.defer_photometric:
+                assert isinstance(target, dict)
+                target["cutout_mask"] = erase[None]
+            else:
+                image[:, erase] = 0.0
         tensor_image = torch.from_numpy(image)
         image_t: torch.Tensor | SpatialImageSample = tensor_image
         if image_plan is not None:

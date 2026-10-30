@@ -71,9 +71,13 @@ class LRSchedulerConfig:
     plateau_factor: float = 0.5
     plateau_patience: int = 5
     plateau_threshold: float = 1e-4
+    warmup_fraction: float | str = AUTO
+    warmup_start_factor: float = 0.01
 
     @property
     def step_scope(self) -> str:
+        if self.type == "poly" and self.warmup_fraction != AUTO and float(self.warmup_fraction) > 0:
+            return "warmup_per_update_then_decay_per_epoch"
         return "epoch" if self.type in {"poly", "plateau"} else "batch"
 
 
@@ -207,10 +211,18 @@ class ArchitectureConfig:
     strides: tuple[tuple[int, ...], ...] = ()
     reference_memory_gb: int = 4
     normalize_projection: bool = True
+    convolution: str = "dense"
+    head_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.normalize_projection, bool):
             raise ConfigError("normalize_projection must be a boolean")
+        if self.convolution not in {"dense", "depthwise_separable"}:
+            raise ConfigError("convolution must be dense or depthwise_separable")
+        if self.convolution == "depthwise_separable" and self.dimensions != "2d":
+            raise ConfigError("Depthwise-separable UNet currently supports 2D only")
+        if not math.isfinite(self.head_dropout) or not 0 <= self.head_dropout < 1:
+            raise ConfigError("head_dropout must be finite and in [0, 1)")
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ArchitectureConfig:
@@ -524,6 +536,9 @@ def _validate_lr_scheduler(config: LRSchedulerConfig) -> None:
         config.plateau_factor = float(config.plateau_factor)
         config.plateau_patience = int(config.plateau_patience)
         config.plateau_threshold = float(config.plateau_threshold)
+        if config.warmup_fraction != AUTO:
+            config.warmup_fraction = float(config.warmup_fraction)
+        config.warmup_start_factor = float(config.warmup_start_factor)
     except (TypeError, ValueError) as exc:
         raise ConfigError("lr_scheduler numeric options must be valid numbers") from exc
     if config.min_lr < 0:
@@ -536,6 +551,14 @@ def _validate_lr_scheduler(config: LRSchedulerConfig) -> None:
         raise ConfigError("lr_scheduler.plateau_patience cannot be negative")
     if config.plateau_threshold < 0:
         raise ConfigError("lr_scheduler.plateau_threshold cannot be negative")
+    if config.warmup_fraction != AUTO:
+        warmup = float(config.warmup_fraction)
+        if not math.isfinite(warmup) or not 0 <= warmup < 1:
+            raise ConfigError("lr_scheduler.warmup_fraction must be finite and in [0, 1)")
+        if warmup and config.type != "poly":
+            raise ConfigError("Warmup currently requires the poly scheduler")
+    if not math.isfinite(config.warmup_start_factor) or not 0 < config.warmup_start_factor <= 1:
+        raise ConfigError("lr_scheduler.warmup_start_factor must be finite and in (0, 1]")
 
 
 def _validate_auto_positive_int(value: int | str, name: str) -> None:
@@ -909,6 +932,9 @@ def architecture_defaults(
         channels, blocks, memory = legacy_3d[name]
     # Legacy non-resenc names remain loadable, while all new preset names default to ResEnc.
     block_type = "conv" if name in {"tiny-2d", "medium-2d", "tiny-3d", "medium-3d", "tiny-2.5d", "medium-2.5d"} else "residual"
+    r02 = name in {"resenc-tiny-2d", "residual-tiny-2d"}
+    if r02:
+        channels, blocks = (16, 32, 64, 128, 256), (1, 2, 2, 2, 2)
     return ArchitectureConfig(
         name=architecture,
         input_channels=input_channels,
@@ -923,6 +949,9 @@ def architecture_defaults(
         channels=channels,
         encoder_blocks=blocks,
         reference_memory_gb=memory,
+        activation="prelu" if r02 else "relu",
+        convolution="depthwise_separable" if r02 else "dense",
+        head_dropout=0.05 if r02 else 0.0,
     )
 
 
@@ -1014,7 +1043,25 @@ def default_deep_supervision(architecture: str) -> bool:
     )
 
 
-def default_learning_rate(optimizer: str) -> float:
+def uses_tiny_2d_recipe(architecture: ArchitectureConfig) -> bool:
+    return _is_tiny_2d(architecture.name) and architecture.dimensions == "2d" and architecture.convolution == "depthwise_separable"
+
+
+def resolve_architecture_training_defaults(config: TrainingConfig, architecture: ArchitectureConfig, task: str) -> None:
+    """Resolve the R02 recipe only for the new Tiny 2D, preserving explicit overrides."""
+    r02 = uses_tiny_2d_recipe(architecture)
+    if config.lr_scheduler.warmup_fraction == AUTO:
+        config.lr_scheduler.warmup_fraction = 0.04 if r02 and config.lr_scheduler.type == "poly" else 0.0
+    if r02:
+        defaults: dict[str, Any] = {"channel_dropout_probability": 0.0}
+        if task == "instance_friendly":
+            defaults.update(cutout_probability=0.5, cutout_max_fraction=0.2, cutout_diameter_fraction=0.5)
+        config.augmentation = {**defaults, **{k: v for k, v in config.augmentation.items() if v != AUTO}}
+
+
+def default_learning_rate(optimizer: str, architecture: ArchitectureConfig | None = None) -> float:
+    if architecture is not None and uses_tiny_2d_recipe(architecture) and optimizer == "adamw":
+        return math.sqrt(1e-3 * 1e-2)
     return 1e-3 if optimizer in {"adam", "adamw"} else 1e-3
 
 

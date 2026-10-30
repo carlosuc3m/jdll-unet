@@ -33,6 +33,7 @@ from .config import (
     default_progress_update_interval,
     model_folder_config,
     parse_training_config,
+    resolve_architecture_training_defaults,
     resolve_device,
     resolve_steps_per_epoch,
     resolve_validation_config,
@@ -909,6 +910,7 @@ def _train(
     volumetric = dimensions in {"2.5d", "3d"}
     resolve_validation_config(train_config, dimensions, geometry.architecture.name)
     detected_task = geometry.task
+    resolve_architecture_training_defaults(train_config, geometry.architecture, detected_task)
     info = geometry.info
     dataset_plan = geometry.spacing
     case_spacings = {case.case: case.spacing for case in dataset_plan.cases}
@@ -1043,7 +1045,7 @@ def _train(
         learning_rate = backbone_learning_rate
     else:
         learning_rate = (
-            default_learning_rate(train_config.optimizer)
+            default_learning_rate(train_config.optimizer, geometry.architecture)
             if train_config.learning_rate == AUTO
             else float(train_config.learning_rate)
         )
@@ -1541,6 +1543,7 @@ def _train(
                     arch,
                     model_config,
                 )
+            cutout_mask = target_batch.pop("cutout_mask", None) if isinstance(target_batch, dict) else None
             images = (
                 images.materialize(device)
                 if isinstance(images, SpatialImageBatch)
@@ -1554,6 +1557,8 @@ def _train(
             if train_dataset.defer_photometric:
                 valid = target_batch.get("valid") if isinstance(target_batch, dict) else None
                 images = apply_tensor_photometric_augmentation(images, valid, train_dataset.augmentation)
+            if cutout_mask is not None:
+                images = images.masked_fill(cutout_mask.to(device, non_blocking=True), 0.0)
             with autocast_context(device, training_dtype):
                 logits = model(images)
                 loss, components = compute_loss(

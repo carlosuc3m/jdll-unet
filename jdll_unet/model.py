@@ -9,7 +9,7 @@ from .config import ArchitectureConfig, architecture_defaults
 from .device_ops import CompatibleConvTranspose3d, CompatibleMaxPool3d, interpolate
 
 
-def _activation(name: str) -> nn.Module:
+def _activation(name: str, channels: int = 1) -> nn.Module:
     name = name.lower()
     if name == "relu":
         return nn.ReLU(inplace=True)
@@ -17,6 +17,8 @@ def _activation(name: str) -> nn.Module:
         return nn.LeakyReLU(0.1, inplace=True)
     if name == "silu":
         return nn.SiLU(inplace=True)
+    if name == "prelu":
+        return nn.PReLU(channels)
     raise ValueError(f"Unsupported activation: {name}")
 
 
@@ -40,6 +42,18 @@ def _normalization(name: str, channels: int, dimensions: str = "2d") -> nn.Modul
     raise ValueError(f"Unsupported normalization: {name}")
 
 
+def _convolution(in_channels: int, out_channels: int, kernel_size: int | tuple[int, ...],
+                 dimensions: str, separable: bool) -> nn.Module:
+    conv = nn.Conv3d if _is_3d(dimensions) else nn.Conv2d
+    padding = tuple(value // 2 for value in kernel_size) if isinstance(kernel_size, (list, tuple)) else kernel_size // 2
+    if separable:
+        return nn.Sequential(
+            conv(in_channels, in_channels, kernel_size, padding=padding, groups=in_channels, bias=False),  # type: ignore[arg-type]
+            conv(in_channels, out_channels, 1, bias=False),
+        )
+    return conv(in_channels, out_channels, kernel_size, padding=padding, bias=False)  # type: ignore[arg-type]
+
+
 class ConvBlock(nn.Module):
     def __init__(
         self,
@@ -51,17 +65,16 @@ class ConvBlock(nn.Module):
         dropout: float = 0.0,
         dimensions: str = "2d",
         kernel_size: int | tuple[int, ...] = 3,
+        separable: bool = False,
     ) -> None:
         super().__init__()
-        conv = nn.Conv3d if _is_3d(dimensions) else nn.Conv2d
         dropout_layer = nn.Dropout3d if _is_3d(dimensions) else nn.Dropout2d
         layers: list[nn.Module] = []
         current = in_channels
         for _ in range(convs_per_level):
-            padding = tuple(value // 2 for value in kernel_size) if isinstance(kernel_size, (list, tuple)) else kernel_size // 2
-            layers.append(conv(current, out_channels, kernel_size=kernel_size, padding=padding, bias=False))  # type: ignore[arg-type]
+            layers.append(_convolution(current, out_channels, kernel_size, dimensions, separable))
             layers.append(_normalization(normalization, out_channels, dimensions))
-            layers.append(_activation(activation))
+            layers.append(_activation(activation, out_channels))
             if dropout > 0:
                 layers.append(dropout_layer(dropout))
             current = out_channels
@@ -85,6 +98,7 @@ class ResidualEncoderBlock(nn.Module):
         dimensions: str = "2d",
         kernel_size: int | tuple[int, ...] = 3,
         normalize_projection: bool = True,
+        separable: bool = False,
     ) -> None:
         super().__init__()
         if convs_per_level < 1:
@@ -94,11 +108,10 @@ class ResidualEncoderBlock(nn.Module):
         layers: list[nn.Module] = []
         current = in_channels
         for index in range(convs_per_level):
-            padding = tuple(value // 2 for value in kernel_size) if isinstance(kernel_size, (list, tuple)) else kernel_size // 2
-            layers.append(conv(current, out_channels, kernel_size=kernel_size, padding=padding, bias=False))  # type: ignore[arg-type]
+            layers.append(_convolution(current, out_channels, kernel_size, dimensions, separable))
             layers.append(_normalization(normalization, out_channels, dimensions))
             if index != convs_per_level - 1:
-                layers.append(_activation(activation))
+                layers.append(_activation(activation, out_channels))
                 if dropout > 0:
                     layers.append(dropout_layer(dropout))
             current = out_channels
@@ -113,7 +126,7 @@ class ResidualEncoderBlock(nn.Module):
             if normalize_projection and in_channels != out_channels
             else nn.Identity()
         )
-        self.activation = _activation(activation)
+        self.activation = _activation(activation, out_channels)
         self.dropout = dropout_layer(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -147,6 +160,7 @@ class UNet2D(nn.Module):
                     dropout=config.dropout,
                     dimensions=config.dimensions,
                     kernel_size=kernels[level],
+                    separable=config.convolution == "depthwise_separable" and level > 0,
                     **({"normalize_projection": config.normalize_projection} if config.block_type == "residual" else {}),
                 )
             )
@@ -171,10 +185,13 @@ class UNet2D(nn.Module):
                     dropout=config.dropout,
                     dimensions=config.dimensions,
                     kernel_size=kernels[level - 1],
+                    separable=config.convolution == "depthwise_separable" and level > 1,
                 )
             )
             if config.deep_supervision and level > 1:
                 self.deep_supervision_heads.append(conv(channels[level - 1], config.output_channels, kernel_size=1))
+        dropout_layer = nn.Dropout3d if is_3d else nn.Dropout2d
+        self.head_dropout = dropout_layer(config.head_dropout) if config.head_dropout else nn.Identity()
         self.out = conv(channels[0], config.output_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
@@ -198,7 +215,7 @@ class UNet2D(nn.Module):
             if self.config.deep_supervision and decoder_index < len(self.decoders) - 1:
                 auxiliary_outputs.append(self.deep_supervision_heads[head_index](x))
                 head_index += 1
-        primary = self.out(x)
+        primary = self.out(self.head_dropout(x))
         if not self.config.deep_supervision:
             return primary
         return [primary, *reversed(auxiliary_outputs)]
