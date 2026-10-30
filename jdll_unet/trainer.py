@@ -1255,6 +1255,8 @@ def _train(
     resolved_dataset_plan["data_cache"] = {
         "max_bytes": train_dataset.reader.max_bytes,
         "scope": "shared_run_decoded_sources",
+        "training_priority": "epoch_source_requests_per_byte",
+        "ties_and_nontraining_reads": "least_recently_used",
     }
     resolved_dataset_plan.update(
         padding_policy={

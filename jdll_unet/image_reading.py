@@ -69,7 +69,10 @@ def decode_pixels(reader: Any, file_format: str, role: str, *, memmap: bool = Fa
     return np.asarray(reader)
 
 
-def decode_region(reader: Any, file_format: str, role: str, selection: tuple[slice, ...]) -> np.ndarray:
+def decode_region(
+    reader: Any, file_format: str, role: str, selection: tuple[slice, ...], *,
+    on_full_decode: Callable[[np.ndarray], None] | None = None,
+) -> np.ndarray:
     """Decode intersecting TIFF strips/tiles when Zarr is available; otherwise use the regular reader."""
     if file_format == "NPY":
         return np.array(reader.array[selection], copy=True)
@@ -83,7 +86,7 @@ def decode_region(reader: Any, file_format: str, role: str, selection: tuple[sli
             pass
         else:
             try:
-                store = series.aszarr()
+                store = series.aszarr(level=0)
                 try:
                     array = zarr.open(store, mode="r")
                 except BaseException:
@@ -97,7 +100,10 @@ def decode_region(reader: Any, file_format: str, role: str, selection: tuple[sli
                     return np.asarray(array[selection])
                 finally:
                     store.close()
-    return decode_pixels(reader, file_format, role)[selection]
+    array = decode_pixels(reader, file_format, role)
+    if on_full_decode is not None:
+        on_full_decode(array)
+    return array[selection]
 
 
 class ImageReadSession:
@@ -181,8 +187,12 @@ class ImageReadSession:
     def pixels(self, path: Path | str, *, role: str = "image", memmap: bool = False) -> np.ndarray:
         return self.read(path, lambda reader, fmt: decode_pixels(reader, fmt, role, memmap=memmap), role=role)
 
-    def region(self, path: Path | str, selection: tuple[slice, ...], *, role: str = "image") -> np.ndarray:
-        return self.read(path, lambda reader, fmt: decode_region(reader, fmt, role, selection), role=role)
+    def region(
+        self, path: Path | str, selection: tuple[slice, ...], *, role: str = "image",
+        on_full_decode: Callable[[np.ndarray], None] | None = None,
+    ) -> np.ndarray:
+        return self.read(path, lambda reader, fmt: decode_region(
+            reader, fmt, role, selection, on_full_decode=on_full_decode), role=role)
 
 
 _active_session: ContextVar[ImageReadSession | None] = ContextVar("image_read_session", default=None)

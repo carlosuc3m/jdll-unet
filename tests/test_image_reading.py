@@ -224,6 +224,24 @@ def test_missing_codec_and_unrelated_exceptions_do_not_trigger_alternate_decoder
         probe.reset_mock()
 
 
+@pytest.mark.parametrize("shape", [(64, 80), (4, 64, 80)])
+@pytest.mark.parametrize("role", ["image", "mask"])
+def test_uncached_pyramidal_tiff_regions_use_full_resolution(tmp_path, monkeypatch, shape, role):
+    pytest.importorskip("zarr")
+    image = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    path = tmp_path / "pyramid.tif"
+    with tifffile.TiffWriter(path) as writer:
+        writer.write(image, subifds=1, tile=(16, 16), compression="deflate", photometric="minisblack")
+        writer.write(image[..., ::2, ::2], subfiletype=1, tile=(16, 16), compression="deflate", photometric="minisblack")
+    with tifffile.TiffFile(path) as source:
+        assert len(source.series[0].levels) == 2
+    reader = DomainReader(max_bytes=0, session=ImageReadSession())
+    region = ((slice(1, 3),) if len(shape) == 3 else ()) + (slice(17, 31), slice(19, 37))
+    monkeypatch.setattr(tifffile.TiffPageSeries, "asarray", Mock(side_effect=AssertionError("Full-image decode")))
+    np.testing.assert_array_equal(reader.read(path, role=role, selection=region), image[region])
+    assert reader.bytes == 0 and not reader.cache
+
+
 @pytest.mark.parametrize("bigtiff", [False, True])
 @pytest.mark.parametrize("byteorder", ["<", ">"])
 @pytest.mark.parametrize("compression", [None, "deflate"])

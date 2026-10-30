@@ -7,8 +7,11 @@ import math
 import os
 import warnings
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -17,6 +20,10 @@ from .errors import ConfigError, DataFormatError, DatasetError
 from .image_reading import ImageReadSession, current_read_session
 from .io import ImageMaskPair, load_image, load_mask, validate_mask_labels
 from .label_statistics import analyze_mask
+
+_active_cache_plan: ContextVar[tuple[Any, dict[tuple[str, str], int] | None] | None] = ContextVar(
+    "decoded_source_cache_plan", default=None
+)
 
 
 def source_identity(path: Path) -> str:
@@ -110,7 +117,7 @@ def _normalize_array(array: np.ndarray, axes: str, *, mask: bool) -> np.ndarray:
 
 
 class DomainReader:
-    """Per-consumer LRU of raw arrays, with a strict byte bound (large arrays bypass it)."""
+    """Bounded raw arrays: planned requests/byte during training, otherwise LRU."""
 
     def __init__(self, max_bytes: int = 64 * 1024**2, *, session: ImageReadSession | None = None):
         from collections import OrderedDict
@@ -119,6 +126,54 @@ class DomainReader:
         self.session = session or current_read_session()
         self.cache: OrderedDict[tuple[str, int, int, int, int, int, str], np.ndarray] = OrderedDict()
         self.bytes = 0
+        self._cache_lock = RLock()
+
+    def __getstate__(self):
+        return {key: value for key, value in vars(self).items() if key != "_cache_lock"}
+
+    def __setstate__(self, state):
+        vars(self).update(state)
+        self._cache_lock = RLock()
+        for array in self.cache.values():
+            array.flags.writeable = False
+
+    @contextmanager
+    def cache_plan(self, requests: dict[tuple[str, str], int] | None):
+        token = _active_cache_plan.set((self, requests))
+        try:
+            yield
+        finally:
+            _active_cache_plan.reset(token)
+
+    def _admit(self, key: tuple, array: np.ndarray) -> None:
+        with self._cache_lock:
+            if key in self.cache or array.nbytes > self.max_bytes or self.max_bytes == 0:
+                return
+            required = self.bytes + array.nbytes - self.max_bytes
+            evict = []
+            if required > 0:
+                active = _active_cache_plan.get()
+                plan = active[1] if active is not None and active[0] is self else None
+                victims = list(self.cache)
+                if plan is not None:
+                    def priority(candidate, size):
+                        return plan.get((candidate[0], candidate[-1]), 0) / max(1, size)
+                    # Sorting is stable: equally valuable entries retain their LRU order.
+                    victims.sort(key=lambda candidate: priority(candidate, self.cache[candidate].nbytes))
+                    incoming = priority(key, array.nbytes)
+                for candidate in victims:
+                    if required <= 0:
+                        break
+                    if plan is not None and priority(candidate, self.cache[candidate].nbytes) > incoming:
+                        return
+                    evict.append(candidate)
+                    required -= self.cache[candidate].nbytes
+            # Do not partially evict useful sources when the incoming source is rejected.
+            for candidate in evict:
+                self.bytes -= self.cache.pop(candidate).nbytes
+            array.flags.writeable = False
+            self.cache[key] = array
+            self.bytes += array.nbytes
 
     def read(self, path: Path, *, role: str = "image", selection: tuple[slice, ...] | None = None) -> np.ndarray:
         stat = path.stat()
@@ -126,19 +181,15 @@ class DomainReader:
         # crop is unnecessary; inode identity also detects atomic replacements.
         key = (os.path.abspath(path), stat.st_dev, stat.st_ino,
                stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, role)
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key] if selection is None else self.cache[key][selection]
+        with self._cache_lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key] if selection is None else self.cache[key][selection]
         if selection is not None:
-            return self.session.region(path, selection, role=role)
+            return self.session.region(path, selection, role=role,
+                                       on_full_decode=lambda array: self._admit(key, array))
         array = self.session.pixels(path, role=role, memmap=True)
-        if array.nbytes <= self.max_bytes:
-            while self.cache and self.bytes + array.nbytes > self.max_bytes:
-                _, old = self.cache.popitem(last=False)
-                self.bytes -= old.nbytes
-            array.flags.writeable = False
-            self.cache[key] = array
-            self.bytes += array.nbytes
+        self._admit(key, array)
         return array
 
 
@@ -176,7 +227,7 @@ def resolve_data_cache_bytes(requested_mb: float | str) -> int:
     if requested_mb != "auto":
         return int(float(requested_mb) * 1024**2)
     available = available_host_memory()
-    return min(512 * 1024**2, available // 10) if available is not None else 64 * 1024**2
+    return min(2 * 1024**3, available // 10) if available is not None else 64 * 1024**2
 
 
 def domain_reader() -> DomainReader:

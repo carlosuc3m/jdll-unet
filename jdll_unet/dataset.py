@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -152,6 +153,7 @@ class JdllSegmentationDataset(Dataset):
         self._normalization_statistics: dict[tuple[int, int | None], dict] = {}
         self.epoch = 0
         self.epoch_indices: np.ndarray | None = None
+        self._cache_requests: dict[tuple[str, str], int] = {}
         self.sampling_summary: list[dict] = []
         self._source_items: dict[int, list[int]] = {}
         self.items: list[tuple[int, int | None]] = []
@@ -230,6 +232,7 @@ class JdllSegmentationDataset(Dataset):
         source_positions: dict[int, list[int]] = {}
         for position, item in enumerate(self.epoch_indices):
             source_positions.setdefault(self.items[int(item)][0], []).append(position)
+        self._cache_requests.clear()
         for pair_index, (positive, selected, plane_volume) in groups.items():
             positions = source_positions.get(pair_index, [])
             negatives = [n for n in positions if int(self.epoch_indices[n]) in selected]
@@ -240,6 +243,10 @@ class JdllSegmentationDataset(Dataset):
             self.sampling_summary[pair_index].update(
                 epoch_draws=len(positions), empty_plane_draws=min(len(negatives), allowed)
             )
+            pair = self.pairs[pair_index]
+            for path, role in ((pair.image, "image"), (pair.mask, "mask")):
+                key = (os.path.abspath(path), role)
+                self._cache_requests[key] = self._cache_requests.get(key, 0) + len(positions)
 
     def __len__(self) -> int:
         return self.sample_count if self.sample_count is not None else len(self.items)
@@ -385,6 +392,12 @@ class JdllSegmentationDataset(Dataset):
         return self._samplers[item_index]
 
     def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor | SpatialImageSample, torch.Tensor | dict[str, torch.Tensor]]:
+        with self.reader.cache_plan(self._cache_requests if self.training else None):
+            return self._read_sample(index)
+
+    def _read_sample(
         self, index: int
     ) -> tuple[torch.Tensor | SpatialImageSample, torch.Tensor | dict[str, torch.Tensor]]:
         rng = np.random.default_rng(stable_seed(self.seed, self.epoch if self.training else 0, str(index)))
