@@ -143,8 +143,11 @@ class PlannedValidationDataset(Dataset):
                  "context": [self.base.context_slices, self.base.context_stride_policy,
                              self.base.context_stride, self.base.context_target_spacing],
                  "spacing": self.base.target_spacing, "case_spacings": self.base.case_spacings}
-        value["scale_policy"] = {key: getattr(self.base.augmentation, key) for key in (
+        scale_policy = {key: getattr(self.base.augmentation, key) for key in (
             "instance_scale_enabled", "target_object_diameter_px", "min_effective_scale", "max_effective_scale", "max_padding_ratio")}
+        if self.base.augmentation.instance_scale_enabled and self.base.augmentation.instance_scale_mode != "canonical":
+            scale_policy["instance_scale_mode"] = self.base.augmentation.instance_scale_mode
+        value["scale_policy"] = scale_policy
         preparation = self.base.reader.session.annotations
         value["repair_disconnected_instances"] = preparation.config.repair_disconnected_instances if preparation else None
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()

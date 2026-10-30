@@ -100,6 +100,9 @@ class InstanceScaleNormalizationConfig:
     jitter_distribution: str = "log_uniform"
     min_effective_scale: float = 0.25
     max_effective_scale: float = 4.0
+    mode: str = AUTO
+    aggressive_scale_jitter: tuple[float, float] = (0.35, 2.0)
+    aggressive_jitter_probability: float = 0.30
 
 
 @dataclass(slots=True)
@@ -418,6 +421,22 @@ def _nested_dataclass(cls: type[T], value: Any) -> T:
     raise ConfigError(f"Expected mapping for {cls.__name__}")
 
 
+def _instance_scale_config(value: Any, dimensions: str) -> InstanceScaleNormalizationConfig:
+    if dimensions != "3d" or isinstance(value, InstanceScaleNormalizationConfig):
+        return _nested_dataclass(InstanceScaleNormalizationConfig, value)
+    supplied = {} if value is None or value == AUTO else value
+    if not isinstance(supplied, Mapping):
+        raise ConfigError("Expected mapping for InstanceScaleNormalizationConfig")
+    defaults = {
+        "target_object_fraction": 0.625,
+        "training_scale_jitter": (0.8, 1.25),
+        # An explicit single range keeps its historical interpretation.
+        "jitter_distribution": "log_uniform" if supplied.get("training_scale_jitter", AUTO) != AUTO else "log_uniform_mixture",
+    }
+    return _nested_dataclass(InstanceScaleNormalizationConfig,
+                             {**defaults, **{key: val for key, val in supplied.items() if val != AUTO}})
+
+
 def _lr_scheduler_config(value: Any) -> LRSchedulerConfig:
     if value is None or value == AUTO:
         return LRSchedulerConfig()
@@ -578,8 +597,10 @@ def parse_training_config(
             lr_scheduler=_lr_scheduler_config(
                 raw.get("lr_scheduler", raw.get("learning_rate_scheduler", raw.get("scheduler")))
             ),
-            instance_scale_normalization=_nested_dataclass(
-                InstanceScaleNormalizationConfig, raw.get("instance_scale_normalization")
+            instance_scale_normalization=_instance_scale_config(
+                raw.get("instance_scale_normalization"),
+                source_architecture.dimensions if source_architecture else
+                "3d" if str(raw.get("architecture", AUTO)).lower().endswith("-3d") else "2d",
             ),
             annotation_preparation=_nested_dataclass(
                 AnnotationPreparationConfig, raw.get("annotation_preparation")
@@ -769,6 +790,9 @@ def parse_training_config(
         preparation.cache_dir = str(preparation.cache_dir)
 
     scale_cfg = parsed.instance_scale_normalization
+    scale_cfg.mode = str(scale_cfg.mode).lower()
+    if scale_cfg.mode not in {AUTO, "canonical", "downsample_only"}:
+        raise ConfigError("instance_scale_normalization.mode must be auto, canonical or downsample_only")
     scale_cfg.enabled = _coerce_bool(scale_cfg.enabled, "instance_scale_normalization.enabled")
     scale_cfg.exclude_border_instances = _coerce_bool(
         scale_cfg.exclude_border_instances, "instance_scale_normalization.exclude_border_instances"
@@ -797,13 +821,26 @@ def parse_training_config(
         raise ConfigError(
             "instance_scale_normalization.training_scale_jitter must contain two positive ordered values"
         ) from exc
-    if len(parsed_jitter) != 2 or not 0 < parsed_jitter[0] <= parsed_jitter[1]:
+    if len(parsed_jitter) != 2 or not all(math.isfinite(v) for v in parsed_jitter) or not 0 < parsed_jitter[0] <= parsed_jitter[1]:
         raise ConfigError("instance_scale_normalization.training_scale_jitter must contain two positive ordered values")
     scale_cfg.training_scale_jitter = parsed_jitter
-    if scale_cfg.jitter_distribution != "log_uniform":
-        raise ConfigError("instance_scale_normalization.jitter_distribution must be 'log_uniform'")
+    if scale_cfg.jitter_distribution not in {"log_uniform", "log_uniform_mixture"}:
+        raise ConfigError("instance_scale_normalization.jitter_distribution must be log_uniform or log_uniform_mixture")
+    try:
+        aggressive = tuple(float(v) for v in scale_cfg.aggressive_scale_jitter)
+        probability = float(scale_cfg.aggressive_jitter_probability)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Invalid aggressive scale jitter settings") from exc
+    if len(aggressive) != 2 or not all(math.isfinite(v) for v in aggressive) or not 0 < aggressive[0] <= aggressive[1]:
+        raise ConfigError("aggressive_scale_jitter must contain two finite positive ordered values")
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise ConfigError("aggressive_jitter_probability must be finite and in [0, 1]")
+    scale_cfg.aggressive_scale_jitter = aggressive
+    scale_cfg.aggressive_jitter_probability = probability
     if not 0 < float(scale_cfg.min_effective_scale) <= float(scale_cfg.max_effective_scale):
         raise ConfigError("instance_scale_normalization effective scale bounds must be positive and ordered")
+    if scale_cfg.mode == "downsample_only" and not scale_cfg.min_effective_scale <= 1 <= scale_cfg.max_effective_scale:
+        raise ConfigError("downsample_only effective scale bounds must include 1")
     _validate_normalization(parsed.normalization)
     _validate_postprocessing(parsed.postprocessing)
     if parsed.architecture == AUTO and parsed.starting_point not in {"fine_tune", "finetune"}:
@@ -893,13 +930,13 @@ def default_patch_size(architecture: str, image_shape: tuple[int, ...] | None = 
     name = architecture.lower()
     preferred: tuple[int, ...]
     if name.endswith("-3d") and "large" in name:
-        preferred = (48, 160, 160)
+        preferred = (160, 160, 160)
     elif name.endswith("-3d") and "big" in name:
-        preferred = (32, 128, 128)
+        preferred = (128, 128, 128)
     elif name.endswith("-3d") and "medium" in name:
-        preferred = (24, 96, 96)
+        preferred = (96, 96, 96)
     elif name.endswith("-3d"):
-        preferred = (16, 64, 64)
+        preferred = (64, 64, 64)
     else:
         preferred = (
             (512, 512)

@@ -20,7 +20,7 @@ from .config import (
     default_patch_size,
 )
 from .dataset import DatasetInfo, inspect_dataset
-from .errors import DatasetError
+from .errors import ConfigError, DatasetError
 from .geometry import (
     DomainReader,
     assert_disjoint,
@@ -42,6 +42,7 @@ from .planning import (
     RuntimeMemoryPlan,
     build_dataset_plan,
     derive_stage_geometry,
+    physical_patch_shape,
     plan_patch_and_microbatch,
     resample_mask,
     resolve_context_stride,
@@ -50,6 +51,9 @@ from .planning import (
 from .scale import (
     InstanceSizeEstimate,
     estimate_from_analysis,
+    instance_scale_factor,
+    resolve_instance_scale_mode,
+    target_instance_diameter,
 )
 from .targets import target_output_channels
 from .task_detect import detect_task_from_pairs
@@ -71,6 +75,7 @@ class TrainingGeometry:
     instance_estimates: dict[tuple[str, tuple], tuple[InstanceSizeEstimate | None, int]]
     case_sampling: list[dict[str, Any]]
     annotation_diagnostics: dict[str, Any]
+    reference_patch: tuple[int, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +89,12 @@ class TrainingGeometry:
             "training_domains": [case_record(pair) for pair in self.train],
             "validation_domains": [case_record(pair) for pair in self.val],
             "annotation_preparation": self.annotation_diagnostics,
+            "patch_planning": {
+                "isotropic_reference_patch": self.reference_patch,
+                "reference_voxel_budget": int(np.prod(self.reference_patch)),
+                "spacing_adapted_patch": self.memory.preferred_patch,
+                "resolved_patch": self.memory.resolved_patch,
+            },
         }
 
 
@@ -130,6 +141,10 @@ def resolve_training_geometry(
     session.annotations = preparation
     discovered = discover_dataset(cfg.dataset_path)
     dimensions = source_arch.dimensions
+    scale_options = cfg.instance_scale_normalization
+    scale_options.mode = resolve_instance_scale_mode(scale_options.mode, dimensions)
+    if scale_options.mode == "downsample_only" and not scale_options.min_effective_scale <= 1 <= scale_options.max_effective_scale:
+        raise ConfigError("downsample_only effective scale bounds must include 1")
     train, train_records = inspect_sources(discovered.train, dimensions, emit, check_cancel)
     val, val_records = inspect_sources(discovered.val, dimensions, emit, check_cancel)
     records = [dict(record, requested_split="train") for record in train_records] + [
@@ -173,7 +188,8 @@ def resolve_training_geometry(
     if not train or not any(any(pair.plane_positive_counts) for pair in train):
         raise DatasetError("All training masks are empty or no usable training sources remain")
     runtime_name = cfg.architecture if cfg.architecture.endswith(dimensions) else f"resenc-tiny-{dimensions}"
-    preferred = default_patch_size(runtime_name)
+    reference_patch = default_patch_size(runtime_name)
+    preferred = reference_patch
     requested_patch = cfg.patch_size
     # Resolve against the actual device without replacing explicit saved settings.
     if "effective_batch_size" not in cfg._provided_fields:
@@ -296,6 +312,9 @@ def resolve_training_geometry(
                 ).astype(int)
             planning_shapes.append(shape)
         planning_shape = tuple(int(v) for v in np.median(planning_shapes, axis=0))
+        if dimensions == "3d":
+            preferred = physical_patch_shape(cast(tuple[int, int, int], reference_patch),
+                                             cast(tuple[float, float, float], spacing_plan.target_spacing))
         modalities = info.input_channels if cfg.input_channels == AUTO else int(cfg.input_channels)
         if modalities != info.input_channels:
             raise DatasetError(f"Requested {modalities} input modalities but sources have {info.input_channels}")
@@ -332,6 +351,11 @@ def resolve_training_geometry(
                 memory_fraction=cfg.memory_fraction,
                 input_channels=input_channels,
                 deep_supervision=arch.deep_supervision,
+                spacing=spacing_plan.target_spacing if dimensions == "3d" else None,
+                stage_strides=arch.strides if inherited else None,
+                stage_kernels=arch.kernels if inherited else None,
+                anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
+                minimum_feature_map=spacing_cfg.minimum_feature_map_size,
             )
         else:
             assert isinstance(requested_patch, tuple)
@@ -348,6 +372,11 @@ def resolve_training_geometry(
                 input_channels=input_channels,
                 deep_supervision=arch.deep_supervision,
                 allow_patch_reduction=False,
+                spacing=spacing_plan.target_spacing if dimensions == "3d" else None,
+                stage_strides=arch.strides if inherited else None,
+                stage_kernels=arch.kernels if inherited else None,
+                anisotropy_threshold=spacing_cfg.kernel_anisotropy_threshold,
+                minimum_feature_map=spacing_cfg.minimum_feature_map_size,
             )
             memory = replace(
                 fixed_plan,
@@ -371,10 +400,10 @@ def resolve_training_geometry(
         nominal_scales = {}
         estimates = {}
         if task == "instance_friendly" and cfg.instance_scale_normalization.enabled:
-            extent = (
-                min(p * s for p, s in zip(patch, cast(tuple[float, ...], spacing_plan.target_spacing), strict=True))
-                if dimensions == "3d"
-                else min(patch)
+            target = target_instance_diameter(
+                cfg.instance_scale_normalization.target_object_fraction, patch,
+                spacing=spacing_plan.target_spacing if dimensions == "3d" else None,
+                reference_patch=reference_patch if cfg.instance_scale_normalization.mode == "downsample_only" else None,
             )
             for pair in train + val:
                 check_cancel()
@@ -395,14 +424,11 @@ def resolve_training_geometry(
             fallback = float(np.median(np.asarray(known, dtype=float)))
             options = cfg.instance_scale_normalization
             nominal_scales = {
-                key: float(
-                    np.clip(
-                        options.target_object_fraction
-                        * extent
-                        / (value[0].median_diameter_px if value[0] else fallback),
-                        options.min_effective_scale,
-                        options.max_effective_scale,
-                    )
+                key: instance_scale_factor(
+                    target,
+                    value[0].median_diameter_px if value[0] else fallback,
+                    mode=options.mode, min_scale=options.min_effective_scale,
+                    max_scale=options.max_effective_scale,
                 )
                 for key, value in estimates.items()
             }
@@ -578,4 +604,5 @@ def resolve_training_geometry(
             estimates,
             case_sampling,
             preparation.diagnostics(),
+            reference_patch,
         )

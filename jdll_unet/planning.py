@@ -6,6 +6,7 @@ import json
 import math
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any, cast
 
@@ -321,6 +322,8 @@ def estimate_training_memory_bytes(
     effective_microbatch: int = 1,
     input_channels: int = 1,
     deep_supervision: bool = False,
+    strides: tuple[tuple[int, ...], ...] | None = None,
+    kernels: tuple[tuple[int, ...], ...] | None = None,
 ) -> int:
     """Conservative architecture-relative memory estimate for patch planning."""
 
@@ -330,12 +333,45 @@ def estimate_training_memory_bytes(
     previous = input_channels
     for level, (width, count) in enumerate(zip(channels, blocks, strict=True)):
         activation_elements += int(np.prod(shape)) * width * max(2, count)
-        parameter_elements += previous * width * (3 ** len(shape)) * count
+        parameter_elements += previous * width * (math.prod(kernels[level]) if kernels else 3 ** len(shape)) * count
         previous = width
         if level < len(channels) - 1:
-            shape = np.maximum(1, shape // 2)
+            shape = np.maximum(1, shape // np.asarray(strides[level] if strides else (2,) * len(shape)))
     supervision_factor = 1.12 if deep_supervision else 1.0
     return int(effective_microbatch * activation_elements * 16 * supervision_factor + parameter_elements * 20)
+
+
+def physical_patch_shape(
+    reference_patch: tuple[int, int, int],
+    spacing: tuple[float, float, float],
+    *,
+    alignment: int = 8,
+) -> tuple[int, int, int]:
+    """Balance physical coverage within the reference voxel budget, without pixel data."""
+    if len(reference_patch) != 3 or any(n < alignment for n in reference_patch) or alignment < 1:
+        raise ConfigError("Reference patch must have three axes at least as large as its positive alignment")
+    if len(spacing) != 3 or any(not math.isfinite(s) or s <= 0 for s in spacing):
+        raise ConfigError("Patch spacing must contain three finite positive values")
+    budget = math.prod(reference_patch)
+    logs = np.log(np.asarray(spacing, dtype=np.float64))
+    logs -= logs.min()
+    lower = math.log(alignment)
+    upper = math.log(budget) / 3 + float(logs.max())
+    # Clamping very coarse axes to the minimum redistributes their voxel budget.
+    for _ in range(64):
+        middle = (lower + upper) / 2
+        if float(np.maximum(math.log(alignment), middle - logs).sum()) > math.log(budget):
+            upper = middle
+        else:
+            lower = middle
+    ideal = np.exp(np.maximum(math.log(alignment), lower - logs))
+    choices = [sorted({max(alignment, int(fn(n / alignment)) * alignment) for fn in (math.floor, math.ceil)})
+               for n in ideal]
+    candidates = [shape for shape in product(*choices) if math.prod(shape) <= budget]
+    chosen = min(candidates, key=lambda shape: (
+        -math.prod(shape), float(np.ptp(np.log(np.asarray(shape)) + logs)), shape,
+    ))
+    return cast(tuple[int, int, int], chosen)
 
 
 def plan_patch_and_microbatch(
@@ -353,6 +389,11 @@ def plan_patch_and_microbatch(
     input_channels: int = 1,
     deep_supervision: bool = False,
     allow_patch_reduction: bool = True,
+    spacing: tuple[float, ...] | None = None,
+    stage_strides: tuple[tuple[int, ...], ...] | None = None,
+    stage_kernels: tuple[tuple[int, ...], ...] | None = None,
+    anisotropy_threshold: float = 2.0,
+    minimum_feature_map: int = 4,
 ) -> RuntimeMemoryPlan:
     """Resolve microbatch first, then shrink a preferred patch to the usable budget."""
 
@@ -371,6 +412,12 @@ def plan_patch_and_microbatch(
     reductions: list[str] = []
 
     def estimate() -> int:
+        kernels, strides = stage_kernels, stage_strides
+        if spacing is not None and strides is None:
+            kernels, strides = derive_stage_geometry(
+                tuple(int(n) for n in patch), spacing, len(channels),
+                anisotropy_threshold=anisotropy_threshold, minimum_feature_map=minimum_feature_map,
+            )
         return estimate_training_memory_bytes(
             tuple(int(value) for value in patch),
             channels,
@@ -378,6 +425,7 @@ def plan_patch_and_microbatch(
             effective_microbatch=microbatch,
             input_channels=input_channels,
             deep_supervision=deep_supervision,
+            strides=strides, kernels=kernels,
         )
 
     while microbatch > 1 and estimate() > budget:
@@ -389,7 +437,7 @@ def plan_patch_and_microbatch(
         candidates = [axis for axis, value in enumerate(patch) if value > minimum_size]
         if not candidates:
             raise ConfigError("Preset cannot fit its minimum patch with microbatch one in the planning budget")
-        axis = max(candidates, key=lambda item: patch[item])
+        axis = max(candidates, key=lambda item: patch[item] * (spacing[item] if spacing is not None else 1))
         reduced = max(minimum_size, int(math.floor(patch[axis] * 0.9 / minimum_size) * minimum_size))
         patch[axis] = reduced if reduced < patch[axis] else patch[axis] - 1
         reductions.append("patch_reduced_for_memory")

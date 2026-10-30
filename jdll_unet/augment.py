@@ -14,7 +14,7 @@ from .crop_reading import CropArray
 from .errors import DatasetError
 from .geometry import padding_extents
 from .io import normalize_image
-from .scale import resize_2d_pair_to_shape, resize_3d_pair_to_shape
+from .scale import instance_scale_factor, resize_2d_pair_to_shape, resize_3d_pair_to_shape
 from .spatial_augment import SpatialImagePlan
 
 try:  # pragma: no cover
@@ -58,6 +58,10 @@ class AugmentationConfig:
     lowres_probability: float = 0.0
     elastic_probability: float = 0.0
     max_padding_ratio: float = 1.0
+    instance_scale_mode: str = "canonical"
+    jitter_distribution: str = "log_uniform"
+    aggressive_scale_jitter: tuple[float, float] = (0.35, 2.0)
+    aggressive_jitter_probability: float = 0.30
 
 
 def make_augmentation_config(
@@ -190,8 +194,15 @@ def instance_crop_shape(cfg: AugmentationConfig, shape: tuple[int, ...], object_
     """Resolve nominal/jittered crop geometry with the shared padding safeguard."""
     if object_size <= 0:
         raise ValueError("A positive object diameter estimate is required for instance scale normalization")
-    scale = float(np.clip(cfg.target_object_diameter_px / object_size * jitter,
-                          cfg.min_effective_scale, cfg.max_effective_scale))
+    scale = instance_scale_factor(
+        cfg.target_object_diameter_px, object_size, mode=cfg.instance_scale_mode,
+        jitter=jitter, min_scale=cfg.min_effective_scale, max_scale=cfg.max_effective_scale,
+    )
+    return _scaled_crop_shape(cfg, shape, scale)
+
+
+def _scaled_crop_shape(cfg: AugmentationConfig, shape: tuple[int, ...], scale: float) -> tuple[int, ...]:
+    padding_scale_limit = max(1.0, scale) if cfg.instance_scale_mode == "downsample_only" else cfg.max_effective_scale
     source = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
     try:
         padding_extents(shape, source, cfg.max_padding_ratio)
@@ -199,10 +210,17 @@ def instance_crop_shape(cfg: AugmentationConfig, shape: tuple[int, ...], object_
         feasible_scale = max(p / max(1, math.floor((1 + 2 * cfg.max_padding_ratio) * n))
                              for p, n in zip(cfg.patch_size, shape, strict=True))
         scale = max(scale, feasible_scale)
-        if scale > cfg.max_effective_scale:
+        if scale > min(cfg.max_effective_scale, padding_scale_limit):
             raise EmptyPatchError("No feasible scale within the padding/scale limits") from None
         source = tuple(max(1, int(round(size / scale))) for size in cfg.patch_size)
     return source
+
+
+def sample_scale_jitter(cfg: AugmentationConfig, rng: np.random.Generator) -> float:
+    bounds = cfg.training_scale_jitter
+    if cfg.jitter_distribution == "log_uniform_mixture" and rng.random() < cfg.aggressive_jitter_probability:
+        bounds = cfg.aggressive_scale_jitter
+    return float(np.exp(rng.uniform(np.log(bounds[0]), np.log(bounds[1]))))
 
 
 def _spatial_affine(
@@ -364,14 +382,16 @@ def apply_augmentation(
     if image_plan is not None and (not training or not defer_photometric):
         raise ValueError("Deferred spatial images require training with deferred photometric augmentation")
     rng = rng or np.random.default_rng()
-    if cfg.instance_scale_enabled:
-        if object_diameter_px is None or object_diameter_px <= 0:
+    volume_jitter = training and mask.ndim == 3 and cfg.jitter_distribution == "log_uniform_mixture"
+    if cfg.instance_scale_enabled or volume_jitter:
+        if cfg.instance_scale_enabled and (object_diameter_px is None or object_diameter_px <= 0):
             raise ValueError("A positive object diameter estimate is required for instance scale normalization")
-        jitter = 1.0
-        if training:
-            low, high = cfg.training_scale_jitter
-            jitter = float(np.exp(rng.uniform(np.log(low), np.log(high))))
-        source_patch_size = instance_crop_shape(cfg, tuple(mask.shape), object_diameter_px, jitter)
+        jitter = sample_scale_jitter(cfg, rng) if training else 1.0
+        if cfg.instance_scale_enabled:
+            source_patch_size = instance_crop_shape(cfg, tuple(mask.shape), cast(float, object_diameter_px), jitter)
+        else:
+            source_patch_size = _scaled_crop_shape(cfg, tuple(mask.shape),
+                                                   float(np.clip(jitter, cfg.min_effective_scale, cfg.max_effective_scale)))
         image, mask, validity = sample_patch(
             image,
             mask,
@@ -454,7 +474,8 @@ def apply_augmentation(
         validity = np.rot90(validity, k, axes=(-2, -1))
     if cfg.affine_probability > 0 and rng.random() < cfg.affine_probability:
         image, mask, validity = _spatial_affine(
-            image, mask, rng, cfg.rotation_degrees, cfg.scale_range, validity, cfg.max_padding_ratio, image_plan
+            image, mask, rng, cfg.rotation_degrees, (1.0, 1.0) if volume_jitter else cfg.scale_range,
+            validity, cfg.max_padding_ratio, image_plan,
         )
     if cfg.lowres_probability > 0 and rng.random() < cfg.lowres_probability:
         image = _low_resolution(image, rng, spacing, image_plan, tuple(mask.shape))

@@ -88,6 +88,22 @@ def test_legacy_checkpoint_can_resume_with_prefetch(interrupted_run, tmp_path, m
     assert not any(thread.name.startswith("jdll-batch") for thread in threading.enumerate())
 
 
+def test_resume_preserves_legacy_scale_policy(interrupted_run, tmp_path, monkeypatch):
+    config = interrupted_run
+    checkpoint = config["output_dir"] / "weights_last.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state["model_config"]["training"]["instance_scale_normalization"].pop("mode")
+    torch.save(state, checkpoint)
+    config_path = checkpoint.parent / "config.json"
+    saved = json.loads(config_path.read_text())
+    saved["training"]["instance_scale_normalization"].pop("mode")
+    config_path.write_text(json.dumps(saved))
+    monkeypatch.setattr(trainer, "_train", functools.partial(trainer._train, resume_from=checkpoint))
+    output = tmp_path / "legacy-scale-resume"
+    result = trainer.train({**config, "output_dir": output})
+    assert result["config"]["training"]["instance_scale_normalization"]["mode"] == "canonical"
+
+
 @pytest.mark.parametrize("invalid", ["settings", "unfinished", "history"])
 def test_resume_rejects_incompatible_or_incomplete_state(interrupted_run, tmp_path, monkeypatch, invalid):
     config = dict(interrupted_run)

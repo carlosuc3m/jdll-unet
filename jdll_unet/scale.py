@@ -30,6 +30,48 @@ class InstanceLabelRepair:
     repaired_components: int
 
 
+def resolve_instance_scale_mode(mode: str, dimensions: str) -> str:
+    if mode == "auto":
+        return "downsample_only"
+    if mode not in {"canonical", "downsample_only"}:
+        raise ValueError(f"Unsupported instance scale mode: {mode}")
+    return mode
+
+
+def instance_scale_factor(
+    target_diameter: float,
+    object_diameter: float,
+    *,
+    mode: str = "canonical",
+    jitter: float = 1.0,
+    min_scale: float = 0.25,
+    max_scale: float = 4.0,
+) -> float:
+    """Cap nominal normalization before augmentation; jitter may still enlarge objects."""
+    scale = target_diameter / object_diameter
+    if mode == "downsample_only":
+        scale = min(1.0, scale)
+    elif mode != "canonical":
+        raise ValueError(f"Unresolved instance scale mode: {mode}")
+    return float(np.clip(scale * jitter, min_scale, max_scale))
+
+
+def target_instance_diameter(
+    fraction: float,
+    patch: tuple[int, ...],
+    *,
+    spacing: tuple[float, ...] | None = None,
+    reference_patch: tuple[int, ...] | None = None,
+) -> float:
+    """Use the isotropic reference, not extra anisotropic context, to set the cap."""
+    if spacing is None:
+        return fraction * min(patch)
+    extent = min(n * s for n, s in zip(patch, spacing, strict=True))
+    if reference_patch is not None:
+        extent = min(extent, min(reference_patch) * min(spacing))
+    return fraction * extent
+
+
 def canonicalize_instance_volume(mask: np.ndarray) -> InstanceLabelRepair:
     """Convert binary/disconnected 3D labels into unique connected instance IDs."""
 
@@ -249,9 +291,10 @@ def resize_3d_pair_to_shape(
     if target == mask.shape:
         return image, mask
     image_t = torch.from_numpy(np.ascontiguousarray(image[None].astype(np.float32, copy=False)))
-    mask_t = torch.from_numpy(np.ascontiguousarray(mask[None, None].astype(np.float32, copy=False)))
     resized_image = F.interpolate(image_t, size=target, mode="trilinear", align_corners=False)[0].numpy()
-    resized_mask = F.interpolate(mask_t, size=target, mode="nearest")[0, 0].numpy().astype(mask.dtype, copy=False)
+    indices = [np.minimum(np.arange(out) * source // out, source - 1)
+               for source, out in zip(mask.shape, target, strict=True)]
+    resized_mask = mask[np.ix_(*indices)]
     return np.ascontiguousarray(resized_image), np.ascontiguousarray(resized_mask)
 
 

@@ -279,7 +279,7 @@ def test_quality_preset_contract():
     expected_patches = {
         "2d": [(128, 128), (256, 256), (384, 384), (512, 512)],
         "2.5d": [(128, 128), (256, 256), (384, 384), (512, 512)],
-        "3d": [(16, 64, 64), (24, 96, 96), (32, 128, 128), (48, 160, 160)],
+        "3d": [(64, 64, 64), (96, 96, 96), (128, 128, 128), (160, 160, 160)],
     }
     presets = ("tiny", "medium", "big", "large")
     for dimensions, patches in expected_patches.items():

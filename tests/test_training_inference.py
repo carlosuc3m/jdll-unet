@@ -107,6 +107,10 @@ def test_exported_training_config_can_start_another_run(tmp_path, dimensions):
     exported.update(model_name="reuse", output_dir=str(tmp_path / "second"))
     parsed = parse_training_config(exported)
     assert parsed.lr_scheduler.type == "poly"
+    expected_mode = "downsample_only"
+    assert parsed.instance_scale_normalization.mode == expected_mode
+    metadata = json.loads((tmp_path / "first" / "model_metadata.json").read_text())
+    assert metadata["instance_scale"]["mode"] == expected_mode
     plan = json.loads((tmp_path / "first" / "dataset_plan.json").read_text())
     assert parsed.data_cache_mb == plan["data_cache"]["max_bytes"] / 1024**2
     second = train(exported)
@@ -226,6 +230,7 @@ def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
     statistics = json.loads(statistics_path.read_text())
     assert statistics["instance_scale_statistics"]["training"]["images_measured"] > 0
     assert result["config"]["training"]["instance_scale_normalization"]["target_object_fraction"] == 0.25
+    assert result["config"]["training"]["instance_scale_normalization"]["mode"] == "downsample_only"
 
     inference = infer(
         {"model_path": result["model_path"], "device": "cpu", "object_size": 12.0},
@@ -235,6 +240,12 @@ def test_2d_instance_scale_normalization_training_and_inference(tmp_path: Path):
     assert inference["outputs"]["boundary_probability"].shape == (32, 32)
     assert inference["outputs"]["labels"].shape == (32, 32)
     assert np.isclose(inference["metadata"]["instance_scale_factor"], 2 / 3)
+    small = infer(
+        {"model_path": result["model_path"], "device": "cpu", "object_size": 4.0},
+        {"image_path": dataset / "images/sample_0.tif"},
+    )
+    assert small["metadata"]["instance_scale_factor"] == 1.0
+    assert small["outputs"]["labels"].shape == (32, 32)
 
     native = infer(
         {"model_path": result["model_path"], "device": "cpu"},

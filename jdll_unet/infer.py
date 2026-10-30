@@ -24,7 +24,7 @@ from .losses import primary_logits
 from .model import build_unet
 from .planning import read_spacing, resample_image_mask, resolve_context_stride, restore_continuous_maps
 from .postprocess import postprocess_binary, postprocess_instance, postprocess_multiclass
-from .scale import resize_2d_channels
+from .scale import instance_scale_factor, resize_2d_channels, resolve_instance_scale_mode
 from .semantic_scale import compare_semantic_region_fraction
 
 
@@ -495,38 +495,43 @@ def _infer_impl(
     if object_size is None and isinstance(inputs, dict):
         object_size = inputs.get("object_size", inputs.get("object_diameter"))
     if instance_scale_enabled and object_size is not None:
+        size_unit = "physical units matching spacing" if dimensions == "3d" else "input pixels"
         try:
             object_size = float(object_size)
         except (TypeError, ValueError) as exc:
-            raise InferenceError("object_size must be a positive number in input pixels") from exc
+            raise InferenceError(f"object_size must be a positive number in {size_unit}") from exc
         if object_size <= 0 or not np.isfinite(object_size):
-            raise InferenceError("object_size must be a positive finite number in input pixels")
+            raise InferenceError(f"object_size must be a positive finite number in {size_unit}")
         training_patch = _parse_tile_size(train_cfg.get("patch_size", tile_size), dimensions)
         scale_metadata = metadata.get("instance_scale") or {}
         target_diameter = float(
             scale_metadata.get(
-                "target_object_size", float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch)
+                "target_object_size", train_cfg.get("target_object_size") or
+                float(scale_cfg.get("target_object_fraction", 0.25)) * min(training_patch)
             )
         )
-        inference_scale = float(
-            np.clip(
-                target_diameter / object_size,
-                float(scale_cfg.get("min_effective_scale", 0.25)),
-                float(scale_cfg.get("max_effective_scale", 4.0)),
-            )
+        # Checkpoints predating the policy field used canonical normalization.
+        scale_mode = resolve_instance_scale_mode(
+            str(scale_metadata.get("mode", scale_cfg.get("mode", "canonical"))), dimensions
         )
-        scale_source_shape = original_spatial_shape[-2:] if dimensions == "2.5d" else tuple(image.shape[1:])
-        scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in scale_source_shape)
-        if dimensions == "2.5d":
-            flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
-            image = resize_2d_channels(flattened, cast(tuple[int, int], scaled_shape)).reshape(
-                image.shape[0], image.shape[1], *scaled_shape
-            )
-        elif dimensions == "2d":
-            image = np.ascontiguousarray(resize_2d_channels(image, cast(tuple[int, int], scaled_shape)))
-        else:
-            image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
-            image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
+        inference_scale = instance_scale_factor(
+            target_diameter, object_size, mode=scale_mode,
+            min_scale=float(scale_cfg.get("min_effective_scale", 0.25)),
+            max_scale=float(scale_cfg.get("max_effective_scale", 4.0)),
+        )
+        if inference_scale != 1.0:
+            scale_source_shape = original_spatial_shape[-2:] if dimensions == "2.5d" else tuple(image.shape[1:])
+            scaled_shape = tuple(max(1, int(round(size * inference_scale))) for size in scale_source_shape)
+            if dimensions == "2.5d":
+                flattened = image.reshape(image.shape[0] * image.shape[1], *image.shape[2:])
+                image = resize_2d_channels(flattened, cast(tuple[int, int], scaled_shape)).reshape(
+                    image.shape[0], image.shape[1], *scaled_shape
+                )
+            elif dimensions == "2d":
+                image = np.ascontiguousarray(resize_2d_channels(image, cast(tuple[int, int], scaled_shape)))
+            else:
+                image_t = torch.from_numpy(np.ascontiguousarray(image[None]))
+                image = F.interpolate(image_t, size=scaled_shape, mode="trilinear", align_corners=False)[0].numpy()
     progress.stage = "planning"
     context_slices = int((model_config.get("architecture_config") or {}).get("context_slices", 3))
     context_cfg = train_cfg.get("context", {})

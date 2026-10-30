@@ -65,6 +65,8 @@ from .prefetch import BatchPrefetcher
 from .scale import (
     InstanceSizeEstimate,
     aggregate_instance_statistics,
+    instance_scale_factor,
+    target_instance_diameter,
 )
 from .schedulers import LearningRateScheduler
 from .semantic_scale import semantic_scale_diagnostics
@@ -160,6 +162,7 @@ def _full_volume_validation(
     label_values: list[int] | None = None,
     min_scale: float = 0.25,
     max_scale: float = 4.0,
+    scale_mode: str = "canonical",
     check_cancel: Any = None,
     tile_batch_size: int = 1,
 ) -> dict[str, Any]:
@@ -177,7 +180,8 @@ def _full_volume_validation(
         spacing = case_spacings.get(pair.stem, (1.0, 1.0, 1.0))
         object_size = (instance_sizes or {}).get(pair.stem)
         scale = (
-            float(np.clip(target_object_size / object_size, min_scale, max_scale))
+            instance_scale_factor(target_object_size, object_size, mode=scale_mode,
+                                  min_scale=min_scale, max_scale=max_scale)
             if object_size and target_object_size
             else 1.0
         )
@@ -424,10 +428,9 @@ def _save_checkpoint(
             "architecture_config": asdict(arch),
             "metrics": metrics,
         }
-    if arch.dimensions in {"2.5d", "3d"}:
-        payload["rng_state"] = {"python": random.getstate(), "numpy": np.random.get_state(),
-                                "torch": torch.get_rng_state(),
-                                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None}
+    payload["rng_state"] = {"python": random.getstate(), "numpy": np.random.get_state(),
+                            "torch": torch.get_rng_state(),
+                            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None}
     _atomic_torch_save(payload, path)
 
 
@@ -454,12 +457,31 @@ def _restore_completed_epoch(
         if validation_state.get("epoch") != checkpoint["epoch"]:
             raise TrainingError("Cannot resume: full-validation scheduling state does not match the completed checkpoint")
     for key in ("task", "architecture_config", "label_values", "normalization"):
+        if key == "architecture_config":
+            saved[key] = asdict(ArchitectureConfig.from_dict(saved[key]))
+            current[key] = asdict(ArchitectureConfig.from_dict(current[key]))
         if saved.get(key) != current.get(key):
             raise TrainingError(f"Cannot resume: {key} differs from the checkpoint")
     # Caching and bounded prefetch change execution, not samples or optimization.
-    ignored = {"model_name", "output_dir", "dataset_plan_path", "data_cache_mb", "batch_prefetch"}
+    ignored = {"model_name", "output_dir", "dataset_plan_path", "data_cache_mb", "batch_prefetch",
+               "preferred_patch_size", "isotropic_reference_patch_size"}
     old_training = {key: value for key, value in saved["training"].items() if key not in ignored}
     new_training = {key: value for key, value in current["training"].items() if key not in ignored}
+    for training in (old_training, new_training):
+        if isinstance(training.get("lr_scheduler"), dict):
+            training["lr_scheduler"].setdefault("warmup_fraction", 0.0)
+            training["lr_scheduler"].setdefault("warmup_start_factor", 0.01)
+        if isinstance(training.get("instance_scale_normalization"), dict):
+            training["instance_scale_normalization"].setdefault("mode", "canonical")
+            training["instance_scale_normalization"].setdefault("aggressive_scale_jitter", [0.35, 2.0])
+            training["instance_scale_normalization"].setdefault("aggressive_jitter_probability", 0.30)
+        if isinstance(training.get("augmentation"), dict):
+            for name, value in (("cutout_probability", 0.5), ("cutout_max_fraction", 0.0),
+                                ("cutout_diameter_fraction", 0.5), ("cutout_max_attempts", 2048)):
+                training["augmentation"].setdefault(name, value)
+            training["augmentation"].setdefault("jitter_distribution", "log_uniform")
+            training["augmentation"].setdefault("aggressive_scale_jitter", [0.35, 2.0])
+            training["augmentation"].setdefault("aggressive_jitter_probability", 0.30)
     if old_training != new_training:
         differences = sorted(key for key in old_training.keys() | new_training.keys()
                              if old_training.get(key) != new_training.get(key))
@@ -744,8 +766,25 @@ def _train(
     runtime = _runtime if _runtime is not None else {}
     full_schedule: FullValidationSchedule | None = None
     source_model: SourceModel | None = None
+    resume_architecture: ArchitectureConfig | None = None
     if isinstance(config, TrainingConfig):
         config = config.request_dict()
+    if resume_from is not None:
+        saved_config_path = resume_from.parent / "config.json"
+        if saved_config_path.is_file():
+            saved_configuration = json.loads(saved_config_path.read_text())
+            saved_training = saved_configuration.get("training", {})
+            if saved_configuration.get("architecture_config"):
+                resume_architecture = ArchitectureConfig.from_dict(saved_configuration["architecture_config"])
+            saved_scale = saved_training.get("instance_scale_normalization", {})
+            raw_scale = config.get("instance_scale_normalization")
+            requested_scale = {} if raw_scale is None or raw_scale == AUTO else dict(raw_scale)
+            config = {**config, "instance_scale_normalization": {
+                "mode": "canonical", **saved_scale, **{k: v for k, v in requested_scale.items() if v != AUTO},
+            }}
+            for key in ("patch_size", "augmentation", "lr_scheduler", "learning_rate"):
+                if config.get(key, AUTO) == AUTO and key in saved_training:
+                    config[key] = saved_training[key]
     resolved_request: dict[str, Any] | TrainingConfig = config
     if isinstance(config, dict) and str(config.get("starting_point", "scratch")) in {"fine_tune", "finetune"}:
         if config.get("base_model") is None:
@@ -770,11 +809,17 @@ def _train(
             resolved[key] = inherited_value
         if resolved.get("normalization", AUTO) == AUTO:
             resolved["normalization"] = source_model.model_config.get("normalization")
+        if source_model.architecture.dimensions == "3d" and resolved.get("patch_size", AUTO) == AUTO:
+            saved_patch = source_model.model_config.get("training", {}).get("patch_size")
+            if saved_patch is not None:
+                resolved["patch_size"] = saved_patch
         for key in ("context", "spacing", "instance_scale_normalization"):
             if source_model.architecture.dimensions == "2d" and key in {"context", "spacing"}:
                 continue
             saved = source_model.model_config.get("training", {}).get(key)
             if isinstance(saved, dict):
+                if key == "instance_scale_normalization":
+                    saved = {"mode": "canonical", **saved}
                 requested = resolved.get(key)
                 if requested is None or requested == AUTO:
                     resolved[key] = saved
@@ -810,7 +855,7 @@ def _train(
     architecture_probe = (
         source_model.architecture
         if source_model is not None
-        else architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
+        else resume_architecture or architecture_defaults(train_config.architecture, normalization=train_config.model_normalization)
     )
     validate_device_dimensions(device, architecture_probe.dimensions)
 
@@ -851,7 +896,7 @@ def _train(
     geometry = resolve_training_geometry(
         train_config,
         architecture_probe,
-        inherited=source_model is not None,
+        inherited=source_model is not None or resume_architecture is not None,
         device=device,
         available_memory=_available_memory_bytes(device),
         emit=emit_plan,
@@ -944,17 +989,21 @@ def _train(
         fallback_instance_size = float(
             np.median([estimate.median_diameter_px for estimate in training_scale_estimates])
         )
-        target_extent = (
-            min(size * spacing for size, spacing in zip(patch_size, dataset_plan.target_spacing, strict=True))
-            if dimensions == "3d" and dataset_plan.target_spacing is not None
-            else min(patch_size)
+        target_diameter = target_instance_diameter(
+            scale_cfg.target_object_fraction, patch_size,
+            spacing=dataset_plan.target_spacing if dimensions == "3d" else None,
+            reference_patch=geometry.reference_patch if scale_cfg.mode == "downsample_only" else None,
         )
-        target_diameter = float(scale_cfg.target_object_fraction * target_extent)
         canonical_scales = np.asarray(
-            [target_diameter / estimate.median_diameter_px for estimate in training_scale_estimates], dtype=np.float64
+            [instance_scale_factor(target_diameter, estimate.median_diameter_px, mode=scale_cfg.mode,
+                                   min_scale=0.0, max_scale=float("inf"))
+             for estimate in training_scale_estimates], dtype=np.float64
         )
         dataset_statistics = {
             "instance_scale_statistics": {
+                "mode": scale_cfg.mode,
+                "size_unit": "physical" if dimensions == "3d" else "pixels",
+                "reference": "pre_cleanup_local_median",
                 "training": aggregate_instance_statistics(training_scale_estimates),
                 "validation": aggregate_instance_statistics(validation_scale_estimates),
                 "training_images_without_valid_instances": len(train_pairs) - len(train_instance_sizes),
@@ -976,9 +1025,10 @@ def _train(
         write_json(output_dir / "dataset_statistics.json", dataset_statistics)
         logger.info(
             "Instance scale normalization enabled: target_diameter_px=%.3f training_median_px=%.3f "
-            "jitter=%s effective_scale=[%.3f, %.3f]",
+            "mode=%s jitter=%s effective_scale=[%.3f, %.3f]",
             target_diameter,
             fallback_instance_size,
+            scale_cfg.mode,
             scale_cfg.training_scale_jitter,
             scale_cfg.min_effective_scale,
             scale_cfg.max_effective_scale,
@@ -1097,12 +1147,20 @@ def _train(
         train_config.include_empty_patches_after_max_retries and not train_config.skip_empty_patches
     )
     train_dataset.augmentation.max_padding_ratio = train_config.max_padding_ratio
+    if instance_scale_enabled or dimensions == "3d":
+        train_dataset.augmentation.training_scale_jitter = scale_cfg.training_scale_jitter
+        train_dataset.augmentation.jitter_distribution = scale_cfg.jitter_distribution
+        train_dataset.augmentation.aggressive_scale_jitter = scale_cfg.aggressive_scale_jitter
+        train_dataset.augmentation.aggressive_jitter_probability = scale_cfg.aggressive_jitter_probability
+        train_dataset.augmentation.instance_scale_mode = scale_cfg.mode
+        train_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
+        train_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
+        logger.info("Scale augmentation: distribution=%s moderate=%s aggressive=%s aggressive_probability=%.3f",
+                    scale_cfg.jitter_distribution, scale_cfg.training_scale_jitter,
+                    scale_cfg.aggressive_scale_jitter, scale_cfg.aggressive_jitter_probability)
     if instance_scale_enabled:
         train_dataset.augmentation.instance_scale_enabled = True
         train_dataset.augmentation.target_object_diameter_px = target_diameter
-        train_dataset.augmentation.training_scale_jitter = scale_cfg.training_scale_jitter
-        train_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
-        train_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
     stratified_validation = False
     val_dataset = make_dataset(
         val_pairs,
@@ -1129,6 +1187,7 @@ def _train(
     )
     if instance_scale_enabled:
         val_dataset.augmentation.instance_scale_enabled = True
+        val_dataset.augmentation.instance_scale_mode = scale_cfg.mode
         val_dataset.augmentation.target_object_diameter_px = target_diameter
         val_dataset.augmentation.min_effective_scale = scale_cfg.min_effective_scale
         val_dataset.augmentation.max_effective_scale = scale_cfg.max_effective_scale
@@ -1269,6 +1328,7 @@ def _train(
             "resolved_device": device.type,
             "patch_size": list(patch_size),
             "preferred_patch_size": list(preferred_patch),
+            "isotropic_reference_patch_size": list(geometry.reference_patch),
             "batch_size": batch_size,
             "data_cache_mb": train_dataset.reader.max_bytes / 1024**2,
             "microbatch_size": microbatch_size,
@@ -1362,7 +1422,10 @@ def _train(
         "fine_tuning_initialization": finetune_report.to_dict() if finetune_report is not None else None,
         "instance_scale": (
             {
+                "mode": scale_cfg.mode,
                 "target_object_size": target_diameter,
+                "reference_spacing": min(dataset_plan.target_spacing) if dimensions == "3d" and dataset_plan.target_spacing else None,
+                "diameter_reference": "isotropic_preset_finest_spacing" if dimensions == "3d" and scale_cfg.mode == "downsample_only" else "patch_extent",
                 "size_unit": "physical" if dimensions == "3d" else "pixels",
                 "measure": scale_cfg.object_size_measure,
                 "training_size_summary": {
@@ -1649,6 +1712,7 @@ def _train(
                 label_values=label_values,
                 min_scale=scale_cfg.min_effective_scale,
                 max_scale=scale_cfg.max_effective_scale,
+                scale_mode=scale_cfg.mode,
                 check_cancel=check_cancel,
                 tile_batch_size=min(8, microbatch_size) if device.type == "cuda" and dimensions == "2d" else 1,
             )
