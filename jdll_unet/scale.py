@@ -95,6 +95,7 @@ def estimate_from_analysis(
     min_size: int = 4,
     seed: int = 0,
     measure: str = "equivalent_sphere_diameter",
+    covariances: dict[int | tuple[int, int], np.ndarray] | None = None,
 ) -> InstanceSizeEstimate | None:
     """Select eligible identities before doing any object-specific coordinate work."""
     if max_instances < 1:
@@ -141,12 +142,22 @@ def estimate_from_analysis(
     axes_values = []
     for label, region, selected_z in selected:
         if measure == "principal_axes":
-            if mask is None:
+            if covariances is not None and selected_z is None:
+                covariance = covariances[label]
+                factors = np.asarray(spacing if volume else (1.0, 1.0))
+                axes = tuple(float(v) for v in 2 * np.sqrt(np.maximum(
+                    np.linalg.eigvalsh(covariance * factors[:, None] * factors[None, :]), 0
+                )))
+            elif covariances is not None and selected_z is not None:
+                covariance = covariances[(label, selected_z)]
+                axes = tuple(float(v) for v in 2 * np.sqrt(np.maximum(np.linalg.eigvalsh(covariance), 0)))
+            elif mask is None:
                 raise ValueError("Principal-axis estimation requires the source mask")
-            axes = _principal_axes(
-                mask if selected_z is None else mask[selected_z], label, region,
-                spacing if volume and not volume_xy else (1.0, 1.0),
-            )
+            else:
+                axes = _principal_axes(
+                    mask if selected_z is None else mask[selected_z], label, region,
+                    spacing if volume and not volume_xy else (1.0, 1.0),
+                )
             axes_values.append(axes)
             values.append(float(np.median(axes)))
         elif volume and not volume_xy:
@@ -284,6 +295,9 @@ def aggregate_instance_statistics(estimates: list[InstanceSizeEstimate]) -> dict
         "median_object_diameter_px": float(np.median(diameters)),
         "object_diameter_p10_px": float(np.percentile(diameters, 10)),
         "object_diameter_p90_px": float(np.percentile(diameters, 90)),
+        "object_diameter_p20_px": float(np.percentile(diameters, 20)),
+        "object_diameter_p80_px": float(np.percentile(diameters, 80)),
+        "distribution": "per_source_median_diameters",
         "median_instances_sampled_per_image": float(np.median(sampled)),
         "minimum_instances_sampled_per_image": int(sampled.min()),
         "maximum_instances_sampled_per_image": int(sampled.max()),

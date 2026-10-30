@@ -71,7 +71,7 @@ def test_shared_source_repair_and_scale_are_consistent(tmp_path, monkeypatch, di
         assert np.unique(prepared).tolist() == [0, 7, 8]
         np.testing.assert_array_equal(load_domain_mask(pair, dimensions, original=True), mask)
         estimate, _ = measure_case_instances(pair, cfg, dimensions, (1, 1, 1))
-        assert estimate.available_instances == 2
+        assert estimate.available_instances == 2  # A dataset-wide shared foreground value denotes binary instances.
         dataset = JdllSegmentationDataset(
             [pair],
             "instance_friendly",
@@ -130,7 +130,7 @@ def test_skip_is_reported_and_never_repaired_later(tmp_path, monkeypatch, failur
             assert np.unique(target["instances"]).tolist() == [0, 1]
         cfg = parse_training_config({"model_name": "x", "dataset_path": tmp_path, "output_dir": tmp_path})
         estimate, _ = measure_case_instances(pair, cfg, "2d", (1, 1, 1))
-        assert estimate.available_instances == 1
+        assert estimate.available_instances == 2  # Binary instances are measured independently of cache success.
         assert labeler.call_count == 1
         report = prep.diagnostics()
         assert report["repaired_components"] == 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import tempfile
 from collections import Counter
@@ -16,10 +17,13 @@ import numpy as np
 from numba import njit
 from skimage.measure import label as label_components
 
-from .config import AnnotationPreparationConfig
+from .annotation_statistics import component_covariances, largest_components, reference_domain, remap_analysis
+from .config import AnnotationPreparationConfig, InstanceScaleNormalizationConfig
 from .errors import TaskDetectionError
+from .geometry import stable_seed
 from .io import ImageMaskPair
 from .label_statistics import MaskAnalysis, analyze_mask
+from .scale import InstanceSizeEstimate, estimate_from_analysis
 
 _STORAGE_CHUNK_VOXELS = 1024**2
 
@@ -96,6 +100,16 @@ class AnnotationRecord:
     domain_counts: dict[tuple, dict[int, int]] = field(default_factory=dict)
     repair_parents: dict[int, int] = field(default_factory=dict)
     owns_disk_file: bool = True
+    reference: MaskAnalysis | None = None
+    covariances: dict = field(default_factory=dict)
+    reference_diameter: float | None = None
+    reference_measure: str = "equivalent_diameter"
+    minimum_component_size: float | None = None
+    removed_components: int = 0
+    removed_voxels: int = 0
+    relabelled_components: int = 0
+    binary_instances: bool = False
+    cleanup_skipped_reason: str | None = None
 
     @cached_property
     def extra_components(self) -> int:
@@ -127,8 +141,13 @@ class AnnotationPreparation:
         *,
         emit: Callable[..., Any] | None = None,
         cache_dir: Path | None = None,
+        scale_config: InstanceScaleNormalizationConfig | None = None,
+        seed: int = 0,
     ) -> None:
         self.config = replace(config) if config is not None else AnnotationPreparationConfig()
+        self.scale_config = replace(scale_config) if scale_config is not None else InstanceScaleNormalizationConfig()
+        self.seed = seed
+        self.binary_instances: bool | None = None
         self.emit = emit
         self.cache_dir = Path(self.config.cache_dir) if self.config.cache_dir else cache_dir
         self.records: dict[tuple, AnnotationRecord] = {}
@@ -177,6 +196,48 @@ class AnnotationPreparation:
             self.config.ram_cache_mb,
             self.config.cache_dir,
             self.config.disk_reserve_mb,
+            self.config.cleanup,
+            self.config.minimum_diameter_ratio,
+            self.scale_config.max_instances_per_image,
+            self.scale_config.exclude_border_instances,
+            self.scale_config.min_instance_area,
+            self.scale_config.object_size_measure,
+            self.seed,
+        )
+
+    def set_label_convention(self, pairs: list[ImageMaskPair], dimensions: str | None) -> None:
+        if self.binary_instances is None:
+            labels: set[int] = set()
+            for pair in pairs:
+                labels.update(self.detection_labels(pair, dimensions))
+                if len(labels) > 1:
+                    break
+            self.binary_instances = len(labels) <= 1
+
+    @property
+    def cleanup_enabled(self) -> bool:
+        # The old switch remains a disabling alias for saved configurations.
+        return self.config.cleanup and self.config.repair_disconnected_instances
+
+    def reference_size(
+        self, pair: ImageMaskPair, dimensions: str, spacing: tuple[float, float, float],
+        options: InstanceScaleNormalizationConfig, seed: int,
+    ) -> InstanceSizeEstimate | None:
+        record = self.analyze(pair, dimensions)
+        assert record.reference is not None
+        reference = reference_domain(record.reference, pair.region)
+        covariances = record.covariances
+        if pair.region and len(reference.shape) == 3 and dimensions != "3d":
+            covariances = {
+                (label, z - pair.region[0][0]): value
+                for (label, z), value in covariances.items()
+                if pair.region[0][0] <= z < pair.region[0][1]
+            }
+        return estimate_from_analysis(
+            reference, volume_xy=len(reference.shape) == 3 and dimensions != "3d", spacing=spacing,
+            max_instances=options.max_instances_per_image, seed=seed, measure=options.object_size_measure,
+            exclude_border=options.exclude_border_instances, min_size=options.min_instance_area,
+            covariances=covariances if options.object_size_measure == "principal_axes" else None,
         )
 
     def _release(self, record: AnnotationRecord) -> None:
@@ -285,7 +346,7 @@ class AnnotationPreparation:
         ]:
             self._release(self.records.pop(stale))
         mask = load_domain_mask(replace(pair, region=()), dimensions, reader, raw=True, original=True)
-        self.statistics(replace(pair, region=()), dimensions, reader, original=True, mask=mask)
+        original = self.statistics(replace(pair, region=()), dimensions, reader, original=True, mask=mask)
         components, source_ids = component_labels_and_sources(mask)
         counts = dict(Counter(int(value) for value in source_ids[1:]))
         record = AnnotationRecord(resolved_path, counts, domain_counts={(): counts})
@@ -294,38 +355,131 @@ class AnnotationPreparation:
             present = np.unique(components[region])
             record.domain_counts[pair.region] = dict(Counter(int(source_ids[int(c)]) for c in present if c))
         if record.extra_components:
-            maximum = max(counts)
-            if not self.config.repair_disconnected_instances:
-                record.skipped_reason = "repair_disabled"
-            elif maximum + record.extra_components > np.iinfo(np.int64).max:
-                record.skipped_reason = "instance_id_overflow"
+            component_stats = analyze_mask(components, pair.mask, foreground_indices=original.foreground_indices)
+        else:
+            component_stats = remap_analysis(original, {int(v): i for i, v in enumerate(source_ids) if i})
+        record.binary_instances = self.binary_instances is not False and len(counts) <= 1
+        record.reference = largest_components(component_stats, source_ids, record.binary_instances)
+        record.reference_measure = "equivalent_sphere_diameter" if dimensions == "3d" else "equivalent_diameter"
+        if self.scale_config.object_size_measure == "principal_axes":
+            if mask.ndim == 3 and dimensions != "3d":
+                for z, plane in enumerate(components):
+                    moments = component_covariances(plane[None], len(source_ids) - 1)
+                    for label in record.reference.planes[z]:
+                        record.covariances[(label, z)] = moments[label, 1:, 1:].copy()
             else:
-                lookup = np.asarray(source_ids, dtype=np.int64)
-                seen = set()
-                for component, value in enumerate(source_ids[1:], start=1):
-                    source_id = int(value)
-                    if source_id in seen:
+                moments = component_covariances(components[None] if components.ndim == 2 else components, len(source_ids) - 1)
+                record.covariances = {
+                    label: moments[label, -components.ndim:, -components.ndim:].copy()
+                    for label in record.reference.objects
+                }
+        options = self.scale_config
+        reference = estimate_from_analysis(
+            record.reference, volume_xy=mask.ndim == 3 and dimensions != "3d",
+            max_instances=options.max_instances_per_image, exclude_border=options.exclude_border_instances,
+            min_size=options.min_instance_area,
+            seed=stable_seed(self.seed, 0, str(pair.image.resolve()) + str(())),
+        )
+        if reference is not None:
+            record.reference_diameter = reference.median_diameter_px
+            minimum_diameter = reference.median_diameter_px * self.config.minimum_diameter_ratio
+            # A per-volume physical-volume ratio equals the native voxel-count ratio:
+            # the constant voxel volume cancels, including for anisotropic sources.
+            record.minimum_component_size = (
+                math.pi / 6 * minimum_diameter**3 if dimensions == "3d"
+                else math.pi / 4 * minimum_diameter**2
+            )
+        else:
+            record.cleanup_skipped_reason = "no_valid_size_reference"
+        rejected: set[int] = set()
+        if self.cleanup_enabled and record.minimum_component_size is not None:
+            for label, item in component_stats.objects.items():
+                size = item.count
+                if mask.ndim == 3 and dimensions != "3d":
+                    lo, hi = item.bounds[0]
+                    sections = [(z, p[label]) for z, p in enumerate(component_stats.planes) if label in p]
+                    if lo == 0 or hi == mask.shape[0]:
+                        size = max(p.count for _, p in sections)
+                    else:
+                        center = (lo + hi - 1) / 2
+                        size = min(sections, key=lambda p: (abs(p[0] - center), -p[1].count))[1].count
+                if size + max(1.0, record.minimum_component_size) * 1e-12 < record.minimum_component_size:
+                    rejected.add(label)
+        record.removed_components = len(rejected)
+        record.removed_voxels = sum(component_stats.objects[label].count for label in rejected)
+        if record.extra_components or rejected:
+            maximum = max(counts, default=0)
+            if not self.cleanup_enabled:
+                record.skipped_reason = "cleanup_disabled" if not self.config.cleanup else "repair_disabled"
+            else:
+                lookup = source_ids.copy()
+                largest: dict[int, int] = {}
+                for component, component_region in component_stats.objects.items():
+                    if component in rejected:
+                        lookup[component] = 0
+                        continue
+                    source = int(source_ids[component])
+                    previous = largest.get(source)
+                    if previous is None or component_region.count > component_stats.objects[previous].count:
+                        largest[source] = component
+                for component in component_stats.objects:
+                    source = int(source_ids[component])
+                    if component not in rejected and largest[source] != component:
                         maximum += 1
+                        if maximum > np.iinfo(np.int64).max:
+                            break
                         lookup[component] = maximum
-                        record.repair_parents[maximum] = source_id
-                    seen.add(source_id)
+                        record.repair_parents[maximum] = source
+                        record.relabelled_components += 1
+            if self.cleanup_enabled and maximum > np.iinfo(np.int64).max:
+                record.skipped_reason = "instance_id_overflow"
+            elif self.cleanup_enabled:
+                foreground = original.foreground_indices
+                if rejected:
+                    foreground = foreground[lookup[components.flat[foreground]] != 0]
+                    if not len(foreground) and largest:
+                        # Rare: every point in the bounded reservoir belonged to deleted artifacts.
+                        # Replenish from the existing component map, without relabeling connectivity.
+                        foreground = self._surviving_foreground(components, lookup, original.foreground_indices.dtype)
                 # Reuse the connectivity workspace, remapping in bounded chunks.
                 flat = components.reshape(-1)
-                for start in range(0, flat.size, 1024**2):
-                    chunk = flat[start : start + 1024**2]
+                for start in range(0, flat.size, _STORAGE_CHUNK_VOXELS):
+                    chunk = flat[start : start + _STORAGE_CHUNK_VOXELS]
                     chunk[:] = lookup[chunk]
                 self._retain(components, record, maximum=maximum)
                 if record.labels is not None:
-                    self.source_analysis(pair, dimensions).prepared[()] = analyze_mask(record.labels, pair.mask)
+                    self.source_analysis(pair, dimensions).prepared[()] = remap_analysis(
+                        component_stats, {i: int(v) for i, v in enumerate(lookup) if i}, foreground
+                    )
         self.records[key] = record
         return record
+
+    @staticmethod
+    def _surviving_foreground(components: np.ndarray, lookup: np.ndarray, dtype: np.dtype) -> np.ndarray:
+        # Reservoir selection stays uniform over surviving voxels, not over objects.
+        rng = np.random.default_rng(0)
+        reservoir = np.empty(0, dtype=dtype)
+        seen = 0
+        for start in range(0, components.size, _STORAGE_CHUNK_VOXELS):
+            positions = np.flatnonzero(lookup[components.flat[start:start + _STORAGE_CHUNK_VOXELS]])
+            count = len(positions)
+            if not count:
+                continue
+            keep = min(100_000, seen + count)
+            old = int(rng.hypergeometric(seen, count, keep)) if seen else 0
+            reservoir = np.concatenate((
+                reservoir[rng.choice(len(reservoir), old, replace=False)],
+                (start + positions[rng.choice(count, keep - old, replace=False)]).astype(dtype),
+            ))
+            seen += count
+        return reservoir
 
     def detection_components(self, pair: ImageMaskPair, dimensions: str | None) -> dict[int, int]:
         from .geometry import load_domain_mask
 
         record = self.analyze(pair, dimensions)
         if pair.region not in record.domain_counts:
-            if record.labels is not None:
+            if record.labels is not None and not record.removed_components:
                 region = tuple(slice(start, end) for start, end in pair.region)
                 present = np.unique(record.labels[region])
                 counts = Counter(record.repair_parents.get(int(label), int(label)) for label in present if label)
@@ -343,7 +497,7 @@ class AnnotationPreparation:
         if not self.instance_mode:
             return None
         record = self.analyze(pair, dimensions, reader)
-        if record.extra_components and record.labels is None:
+        if (record.extra_components or record.removed_components) and record.labels is None and self.config.cleanup:
             key = self._key(pair, dimensions)
             if key not in self._warned:
                 self._warned.add(key)
@@ -352,7 +506,7 @@ class AnnotationPreparation:
                     reason="annotation_repair_skipped",
                     path=str(pair.mask),
                     message=f"Instance repair skipped for {pair.mask.name}: {record.skipped_reason}. "
-                    "Using original IDs without per-patch repair; disconnected regions retain a shared identity.",
+                    "Using original annotations without per-patch repair or size cleanup.",
                 )
         return record.labels
 
@@ -360,9 +514,20 @@ class AnnotationPreparation:
         self, pairs: list[ImageMaskPair], dimensions: str, check_cancel: Callable[[], None], reader: Any = None
     ) -> None:
         self.instance_mode = True
+        self.set_label_convention(pairs, dimensions)
         for pair in pairs:
             check_cancel()
             self.prepared_mask(pair, dimensions, reader)
+            record = self.records[self._key(pair, dimensions)]
+            if self.cleanup_enabled and record.cleanup_skipped_reason:
+                warning_key = ("size_reference", self._key(pair, dimensions))
+                if warning_key not in self._warned:
+                    self._warned.add(warning_key)
+                    self._emit(
+                        "warning", reason="annotation_cleanup_no_reference", path=str(pair.mask),
+                        message=f"Size cleanup skipped for {pair.mask.name}: no valid local diameter reference. "
+                        "Connectivity repair remains enabled.",
+                    )
 
     def diagnostics(self) -> dict[str, Any]:
         records = list(self.records.values())
@@ -372,6 +537,9 @@ class AnnotationPreparation:
         return {
             "connectivity": "face",
             "instance_task": self.instance_mode,
+            "cleanup_enabled": self.cleanup_enabled,
+            "minimum_diameter_ratio": self.config.minimum_diameter_ratio,
+            "size_reference": "pre_cleanup_local_median",
             "sources_analyzed": len(records),
             "affected_sources": affected_sources,
             "affected_source_fraction": affected_sources / len(records) if records else 0.0,
@@ -379,7 +547,13 @@ class AnnotationPreparation:
             "affected_ids": affected_ids,
             "affected_id_fraction": affected_ids / total_ids if total_ids else 0.0,
             "repaired_components": sum(
-                record.extra_components for record in records if self.instance_mode and record.labels is not None
+                record.relabelled_components for record in records if self.instance_mode and record.labels is not None
+            ),
+            "removed_components": sum(
+                record.removed_components for record in records if self.instance_mode and record.labels is not None
+            ),
+            "removed_voxels": sum(
+                record.removed_voxels for record in records if self.instance_mode and record.labels is not None
             ),
             "sources": [
                 {
@@ -387,10 +561,19 @@ class AnnotationPreparation:
                     "original_ids": len(record.components_per_label),
                     "affected_ids": record.affected_ids,
                     "extra_components": record.extra_components,
+                    "reference_diameter_native": record.reference_diameter,
+                    "reference_measure": record.reference_measure,
+                    "binary_instances": record.binary_instances,
+                    "minimum_component_size": record.minimum_component_size,
+                    "removed_components": record.removed_components
+                    if self.instance_mode and record.labels is not None else 0,
+                    "removed_voxels": record.removed_voxels
+                    if self.instance_mode and record.labels is not None else 0,
+                    "cleanup_skipped_reason": record.cleanup_skipped_reason,
                     "status": "semantic_unchanged"
                     if not self.instance_mode
                     else "unchanged"
-                    if not record.extra_components
+                    if not record.extra_components and not record.removed_components
                     else "repaired"
                     if record.labels is not None
                     else "repair_skipped",
@@ -422,7 +605,8 @@ class AnnotationPreparation:
                 reason="annotation_preparation",
                 message=f"Instance annotation preparation: {summary['affected_sources']}/{summary['sources_analyzed']} "
                 f"sources and {summary['affected_ids']}/{summary['original_ids']} IDs are disconnected; "
-                f"{summary['repaired_components']} extra components relabelled."
+                f"{summary['repaired_components']} extra components relabelled; "
+                f"{summary['removed_components']} small components removed."
                 + (
                     " Widespread disconnection: verify that labels represent objects, not classes or intentionally "
                     "fragmented objects. The selected task has not been changed."

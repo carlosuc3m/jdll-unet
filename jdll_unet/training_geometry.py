@@ -94,7 +94,8 @@ def measure_case_instances(
     preparation = current_read_session().annotations
     mask = None
     if preparation is not None:
-        analysis = preparation.statistics(pair, dimensions)
+        seed = stable_seed(cfg.seed, 0, str(pair.image.resolve()) + str(pair.region))
+        return preparation.reference_size(pair, dimensions, spacing, options, seed), 0
     else:
         mask = load_domain_mask(pair, dimensions, raw=True)
         analysis = analyze_mask(mask, pair.mask)
@@ -123,7 +124,8 @@ def resolve_training_geometry(
     if session.annotations is not None:
         session.annotations.close()
     preparation = AnnotationPreparation(
-        cfg.annotation_preparation, emit=emit, cache_dir=cfg.output_dir / ".annotation_cache"
+        cfg.annotation_preparation, emit=emit, cache_dir=cfg.output_dir / ".annotation_cache",
+        scale_config=cfg.instance_scale_normalization, seed=cfg.seed,
     )
     session.annotations = preparation
     discovered = discover_dataset(cfg.dataset_path)
@@ -236,6 +238,7 @@ def resolve_training_geometry(
         if not any(any(pair.plane_positive_counts) for pair in train):
             raise DatasetError("All training masks in the assigned training split are empty")
         info = inspect_dataset(train, dimensions)
+        preparation.set_label_convention(train, dimensions)
         if detection is None:
             detection = detect_task_from_pairs(
                 train, cfg.dataset_path, requested_task=cfg.task, dimensions=dimensions, preparation=preparation
@@ -248,6 +251,12 @@ def resolve_training_geometry(
         preparation.instance_mode = task == "instance_friendly"
         if preparation.instance_mode:
             preparation.prepare(train + val, dimensions, check_cancel)
+            for collection in (train, val):
+                for index, pair in enumerate(collection):
+                    analysis = preparation.statistics(pair, dimensions)
+                    collection[index] = replace(
+                        pair, plane_positive_counts=analysis.plane_positive_counts, label_values=analysis.labels
+                    )
         class_labels = read_class_labels(cfg.dataset_path) if task == "multiclass_semantic" else None
         if class_labels is not None:
             if set(info.label_values) - set(class_labels):

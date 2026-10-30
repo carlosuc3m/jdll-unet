@@ -183,7 +183,7 @@ def test_source_analysis_is_reused_after_inspection_and_preparation(tmp_path, mo
             patch.setattr(geometry, "load_domain_mask", Mock(side_effect=AssertionError("Repeated mask read")))
             patch.setattr(annotations, "analyze_mask", Mock(side_effect=AssertionError("Repeated mask analysis")))
             measured, _ = measure_case_instances(pair, cfg, dimensions, (1, 1, 1))
-        assert measured.available_instances == 36
+        assert measured.available_instances == (35 if repair else 36)
         assert measured.sampled_instances == 21
         # Domain summaries are separate; full-source borders/counts must not leak into a crop.
         bounds = tuple((0, size) for size in mask.shape[:-1]) + ((0, 40),)

@@ -84,6 +84,8 @@ class AnnotationPreparationConfig:
     cache_dir: str | None = None
     disk_reserve_mb: float = 256.0
     warning_fraction: float = 0.1
+    cleanup: bool = True
+    minimum_diameter_ratio: float = 1.0 / 7.0
 
 
 @dataclass(slots=True)
@@ -745,15 +747,20 @@ def parse_training_config(
     parsed.model_normalization = _model_normalization(parsed.model_normalization)
     _validate_lr_scheduler(parsed.lr_scheduler)
     preparation = parsed.annotation_preparation
+    preparation.cleanup = _coerce_bool(preparation.cleanup, "annotation_preparation.cleanup")
     preparation.repair_disconnected_instances = _coerce_bool(
         preparation.repair_disconnected_instances, "annotation_preparation.repair_disconnected_instances"
     )
-    for name in ("ram_cache_mb", "disk_reserve_mb", "warning_fraction"):
+    for name in ("ram_cache_mb", "disk_reserve_mb", "warning_fraction", "minimum_diameter_ratio"):
         try:
             value = float(getattr(preparation, name))
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"annotation_preparation.{name} must be a finite nonnegative number") from exc
-        if not math.isfinite(value) or value < 0 or (name == "warning_fraction" and value > 1):
+        if (
+            not math.isfinite(value) or value < 0
+            or (name in {"warning_fraction", "minimum_diameter_ratio"} and value > 1)
+            or (name == "minimum_diameter_ratio" and value == 0)
+        ):
             raise ConfigError(f"Invalid annotation_preparation.{name}")
         setattr(preparation, name, value)
     if preparation.cache_dir is not None:

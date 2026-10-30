@@ -49,7 +49,9 @@ def _merge(regions: dict[int, LabelRegion], label: int, count: int, bounds: tupl
     regions[label] = LabelRegion(count, bounds)
 
 
-def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
+def analyze_mask(
+    mask: np.ndarray, path: Path | None = None, *, foreground_indices: np.ndarray | None = None
+) -> MaskAnalysis:
     """Accumulate all IDs together, never allocating an array indexed by a large source ID.
 
     Per-plane summaries also supply the representative cross section for 2.5D.
@@ -89,15 +91,16 @@ def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
                     maximum = int(tile.max())
                 if maximum == 0:
                     continue
-                positions = scan_positions[:count] if fused else np.flatnonzero(tile)
-                count = len(positions)
-                keep = min(limit, seen + count)
-                take_old = int(rng.hypergeometric(seen, count, keep)) if seen else 0
-                old = reservoir[rng.choice(len(reservoir), take_old, replace=False)] if take_old else reservoir[:0]
-                selected = positions[rng.choice(count, keep - take_old, replace=False)]
-                flat = (z * height + y + selected // tile.shape[1]) * width + x + selected % tile.shape[1]
-                reservoir = np.concatenate((old, flat.astype(reservoir.dtype)))
-                seen += count
+                if foreground_indices is None:
+                    positions = scan_positions[:count] if fused else np.flatnonzero(tile)
+                    count = len(positions)
+                    keep = min(limit, seen + count)
+                    take_old = int(rng.hypergeometric(seen, count, keep)) if seen else 0
+                    old = reservoir[rng.choice(len(reservoir), take_old, replace=False)] if take_old else reservoir[:0]
+                    selected = positions[rng.choice(count, keep - take_old, replace=False)]
+                    flat = (z * height + y + selected // tile.shape[1]) * width + x + selected % tile.shape[1]
+                    reservoir = np.concatenate((old, flat.astype(reservoir.dtype)))
+                    seen += count
                 if fused:
                     for label in np.flatnonzero(scan_counts[1 : maximum + 1]) + 1:
                         ymin, ymax, xmin, xmax = scan_bounds[label]
@@ -125,4 +128,7 @@ def analyze_mask(mask: np.ndarray, path: Path | None = None) -> MaskAnalysis:
         if mask.ndim == 3:
             for label, region in regions.items():
                 _merge(objects, label, region.count, ((z, z + 1), *region.bounds))
-    return MaskAnalysis(tuple(mask.shape), planes[0] if mask.ndim == 2 else objects, tuple(planes), reservoir)
+    return MaskAnalysis(
+        tuple(mask.shape), planes[0] if mask.ndim == 2 else objects, tuple(planes),
+        reservoir if foreground_indices is None else foreground_indices,
+    )

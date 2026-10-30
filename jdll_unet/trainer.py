@@ -1365,6 +1365,12 @@ def _train(
                 "target_object_size": target_diameter,
                 "size_unit": "physical" if dimensions == "3d" else "pixels",
                 "measure": scale_cfg.object_size_measure,
+                "training_size_summary": {
+                    "distribution": "per_source_median_diameters",
+                    "median": float(np.median([e.median_diameter_px for e in training_scale_estimates])),
+                    "p20": float(np.percentile([e.median_diameter_px for e in training_scale_estimates], 20)),
+                    "p80": float(np.percentile([e.median_diameter_px for e in training_scale_estimates], 80)),
+                },
             }
             if instance_scale_enabled
             else None

@@ -117,6 +117,7 @@ def detect_task_from_pairs(
             for pair in pairs
         ]
     else:
+        preparation.set_label_convention(pairs, dimensions)
         stats = []
         for pair in pairs:
             components = preparation.cached_detection_components(pair, dimensions)
