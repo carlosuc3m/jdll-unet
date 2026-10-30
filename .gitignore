@@ -14,3 +14,13 @@ README_FINE_TUNING_REQUIREMENTS.md
 README_IMAGE_READING_REQUIREMENTS.md
 README_FINE_TUNING_REQUIREMENTS.md
 jdll_unet.zip
+/.vscode/
+/benchmarks/
+/models/
+
+# Local U-Net Observatory (not part of the tracked library)
+/jdll_unet/explorer/
+/tests/test_explorer.py
+/README_EXPLORER.md
+/ref_features/
+/MANIFEST.in
