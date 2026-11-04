@@ -51,7 +51,6 @@ class PostprocessingConfig:
     threshold: float = 0.5
     min_object_size: int = 0
     fill_holes: bool = False
-    connected_components: bool = True
     method: str = "distance_boundary_watershed"
     seed_distance_threshold: float = 0.35
     seed_boundary_threshold: float = 0.5
@@ -427,7 +426,7 @@ def _nested_dataclass(cls: type[T], value: Any) -> T:
     if isinstance(value, Mapping):
         valid = {item.name for item in fields(cast(Any, cls))}
         unknown = sorted(set(value) - valid)
-        if unknown:
+        if unknown and cls is not PostprocessingConfig:
             raise ConfigError(f"Unknown {cls.__name__} field(s): {', '.join(unknown)}")
         defaults = cls()
         return cls(**{k: getattr(defaults, k) if v == AUTO else v for k, v in value.items() if k in valid})

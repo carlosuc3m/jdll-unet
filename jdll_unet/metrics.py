@@ -241,7 +241,7 @@ def compute_metrics(
                 probabilities = np.where(valid.detach().cpu().numpy(), probabilities, -1)
             masks = [postprocess_binary(p[0], threshold=postprocessing.get("threshold", 0.5),
                      min_object_size=postprocessing.get("min_object_size", 0),
-                     fill_holes=postprocessing.get("fill_holes", False), connected_components=False)["mask"]
+                     fill_holes=postprocessing.get("fill_holes", False))["mask"]
                      for p in probabilities]
             prediction = torch.from_numpy(np.stack(masks)[:, None].astype(bool)).to(logits.device)
         return binary_metrics(logits, target, valid=valid, prediction=prediction)

@@ -634,7 +634,6 @@ def _infer_impl(
                 threshold=float(post_cfg.get("threshold", 0.5)),
                 min_object_size=int(post_cfg.get("min_object_size", 0)),
                 fill_holes=bool(post_cfg.get("fill_holes", False)),
-                connected_components=bool(post_cfg.get("connected_components", True)),
             )
         )
     elif task_name == "multiclass_semantic":

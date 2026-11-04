@@ -123,7 +123,7 @@ def reconstruct(task: str, logits: np.ndarray, valid: np.ndarray, config: Postpr
         prediction = postprocess_instance(logits[0], logits[1], logits[2], spacing=spacing, **asdict(config))["labels"]
     else:
         prediction = postprocess_binary(logits[0], threshold=config.threshold, min_object_size=config.min_object_size,
-                                        fill_holes=config.fill_holes, connected_components=False)["mask"]
+                                        fill_holes=config.fill_holes)["mask"]
     prediction[~valid] = 0
     logits[:, ~valid] = 0
     return prediction, logits

@@ -79,7 +79,6 @@ def postprocess_binary(
     threshold: float = 0.5,
     min_object_size: int = 0,
     fill_holes: bool = False,
-    connected_components: bool = True,
 ) -> dict[str, np.ndarray]:
     _validate_threshold(threshold)
     _validate_min_size(min_object_size)
@@ -89,10 +88,7 @@ def postprocess_binary(
     if fill_holes and ndi is not None:
         binary = ndi.binary_fill_holes(binary)
     binary = _remove_small(binary, min_object_size)
-    result = {"mask": binary.astype(np.uint8)}
-    if connected_components:
-        result["labels"] = _label(binary)
-    return result
+    return {"mask": binary.astype(np.uint8)}
 
 
 def postprocess_multiclass(probabilities: np.ndarray, min_object_size: int = 0) -> dict[str, np.ndarray]:
@@ -128,6 +124,8 @@ def postprocess_instance(
 ) -> dict[str, np.ndarray]:
     _validate_threshold(threshold)
     _validate_min_size(min_object_size)
+    if method not in {"distance_boundary_watershed", "connected_components"}:
+        raise InferenceError(f"Unsupported instance reconstruction method: {method}")
     if foreground_probability.shape != boundary_probability.shape or foreground_probability.ndim not in {2, 3}:
         raise InferenceError("Instance foreground and boundary probabilities must be matching 2D or 3D arrays")
     voxel_measure = float(np.prod(spacing)) if spacing is not None else 1.0
@@ -138,9 +136,11 @@ def postprocess_instance(
     foreground = foreground_probability >= threshold
     separators = boundary_probability >= threshold
     foreground = _remove_small(foreground, min_object_size)
-    if method == "connected_components" or distance_probability is None:
+    if method == "connected_components":
         labels = _label(foreground & ~separators)
     else:
+        if distance_probability is None:
+            raise InferenceError("distance_boundary_watershed requires a distance prediction map")
         if distance_probability.shape != foreground_probability.shape:
             raise InferenceError("Instance distance probability must match foreground shape")
         if h_maxima is None or watershed is None or ndi is None:
