@@ -907,7 +907,7 @@ def _train(
     device = resolve_device(train_config.device)
     logger.info("Starting training on device=%s", device)
     logger.info("Training implementation: %s", Path(__file__).resolve())
-    if source_model is not None:
+    if source_model is not None and checkpoint is None:
         message = f"Fine-tuning from base LR {source_model.base_learning_rate:g}: backbone LR {source_model.base_learning_rate * 0.1:g}; adapted layers use {source_model.base_learning_rate:g} when present."
         if source_model.learning_rate_provenance == "fallback_default":
             message = "Original scratch LR could not be recovered; using fallback base LR 0.001. " + message
@@ -1442,7 +1442,7 @@ def _train(
             "learning_rate_provenance": source_model.learning_rate_provenance
             if source_model
             else "scratch_initial_learning_rate",
-            "starting_point": "fine_tune" if source_model is not None else "scratch",
+            "starting_point": "continuation" if checkpoint is not None else "fine_tune" if source_model is not None else "scratch",
             "source_model": str(source_model.requested_path) if source_model is not None else None,
             "source_checkpoint": str(source_model.checkpoint_path) if source_model is not None else None,
             "source_learning_rate": source_model.learning_rate if source_model is not None else None,
@@ -1588,7 +1588,7 @@ def _train(
     callbacks.emit(
         "training_plan",
         message="UNet training plan resolved",
-        starting_point="fine_tune" if source_model is not None else "scratch",
+        starting_point="continuation" if checkpoint is not None else "fine_tune" if source_model is not None else "scratch",
         source_model=str(source_model.requested_path) if source_model is not None else None,
         source_architecture=source_model.architecture.name if source_model is not None else None,
         architecture=arch.name,
@@ -1774,6 +1774,10 @@ def _train(
         else:
             best_score = run.selected["score"]
         best_loss = float(record["val_losses"]["total_loss"])
+        reconstruction = record.get("full_validation", {}).get("reconstruction") or record.get("validation_reconstruction")
+        if reconstruction and detected_task == "instance_friendly":
+            model_config["postprocessing"] = reconstruction["postprocessing"]
+            write_json(output_dir / "config.json", model_config)
         path = output_dir / "weights_best.pt"
         _save_checkpoint(path, model, optimizer, lr_scheduler, run.start, detected_task, arch, record, model_config, scaler)
         _atomic_copy(path, output_dir / "model.pt")

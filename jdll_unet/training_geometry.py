@@ -35,7 +35,7 @@ from .geometry import (
     stable_seed,
 )
 from .image_reading import current_read_session
-from .io import ImageMaskPair, discover_dataset, read_class_labels
+from .io import DatasetSplits, ImageMaskPair, discover_dataset, read_class_labels
 from .label_statistics import analyze_mask
 from .planning import (
     DatasetPlan,
@@ -140,7 +140,8 @@ def resolve_training_geometry(
         scale_config=cfg.instance_scale_normalization, seed=cfg.seed,
     )
     session.annotations = preparation
-    discovered = discover_dataset(cfg.dataset_path)
+    supplied = continuation.pair_lists(cfg.dataset_path, ImageMaskPair) if continuation else None
+    discovered = DatasetSplits(*supplied, bool(supplied[1])) if supplied else discover_dataset(cfg.dataset_path)
     dimensions = source_arch.dimensions
     scale_options = cfg.instance_scale_normalization
     scale_options.mode = resolve_instance_scale_mode(scale_options.mode, dimensions)
