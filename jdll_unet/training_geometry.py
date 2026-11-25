@@ -129,6 +129,7 @@ def resolve_training_geometry(
     available_memory: int | None,
     emit: Callable[..., Any],
     check_cancel: Callable[[], None],
+    continuation=None,
 ) -> TrainingGeometry:
     session = current_read_session()
     session.domain_reader = DomainReader(max_bytes=resolve_data_cache_bytes(cfg.data_cache_mb), session=session)
@@ -147,6 +148,8 @@ def resolve_training_geometry(
         raise ConfigError("downsample_only effective scale bounds must include 1")
     train, train_records = inspect_sources(discovered.train, dimensions, emit, check_cancel)
     val, val_records = inspect_sources(discovered.val, dimensions, emit, check_cancel)
+    if continuation:
+        train, val = continuation.restore_domains(train, val, lambda msg: emit("warning", message=msg))
     records = [dict(record, requested_split="train") for record in train_records] + [
         dict(record, requested_split="val") for record in val_records
     ]
@@ -225,7 +228,7 @@ def resolve_training_geometry(
         except DatasetError:
             return False
 
-    automatic_split = not discovered.explicit_val or not val
+    automatic_split = not val
     if automatic_split:
         if discovered.explicit_val:
             emit(

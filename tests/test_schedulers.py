@@ -117,3 +117,24 @@ def test_scheduler_resume_rejects_changed_schedule():
     changed = LearningRateScheduler(_optimizer(), LRSchedulerConfig(), total_steps=24, total_epochs=12)
     with pytest.raises(ConfigError, match="total_steps"):
         changed.load_state_dict(original.state_dict())
+
+@pytest.mark.parametrize("remaining,steps,exact", [(3, 2, True), (1, 2, False), (3, 4, False)])
+def test_continue_poly_preserves_lr_and_decays_to_floor(remaining, steps, exact):
+    config = LRSchedulerConfig(type="poly", min_lr=.001, poly_power=.9)
+    original = LearningRateScheduler(_optimizer(), config, total_steps=10, total_epochs=5)
+    for _ in range(2):
+        original.step_batch()
+        original.step_batch()
+        original.step_epoch(None)
+    child = LearningRateScheduler(_optimizer(), config, total_steps=steps*remaining, total_epochs=remaining)
+    assert child.continue_from(original.state_dict(), remaining, steps) is exact
+    assert child.current_lr == original.current_lr
+    for _ in range(remaining):
+        for _ in range(steps):
+            child.step_batch()
+            original.step_batch()
+        child.step_epoch(None)
+        original.step_epoch(None)
+        if exact:
+            assert child.current_lr == original.current_lr
+    assert child.current_lr == pytest.approx(.001)

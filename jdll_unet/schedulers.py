@@ -107,6 +107,25 @@ class LearningRateScheduler:
         self.bad_epochs = state["bad_epochs"]
         self._set_lrs(rates)
 
+    def continue_from(self, state, remaining_epochs, steps_per_epoch, validation_changed=False):
+        """Keep each parameter group's current LR; retain the trajectory if its remaining budget matches."""
+        rates = state["current_lrs"]
+        if len(rates) != len(self.optimizer.param_groups):
+            raise ConfigError("Checkpoint optimizer groups do not match the current network")
+        same = (state["total_steps"] - state["step_count"] == remaining_epochs * steps_per_epoch
+                and state["total_epochs"] - state["epoch_count"] == remaining_epochs)
+        self.min_lrs = list(state["min_lrs"])
+        self.base_lrs = list(state["base_lrs"] if same else rates)
+        self.total_epochs = state["total_epochs"] if same else remaining_epochs
+        self.total_steps = state["total_steps"] if same else remaining_epochs * steps_per_epoch
+        self.epoch_count = state["epoch_count"] if same else 0
+        self.step_count = state["step_count"] if same else 0
+        self.warmup_steps = state.get("warmup_steps", 0) if same else 0
+        self.best_score = None if validation_changed else state["best_score"]
+        self.bad_epochs = 0 if validation_changed else state["bad_epochs"]
+        self._set_lrs(rates)
+        return same
+
     def step_batch(self) -> None:
         self.step_count += 1
         if self.warmup_steps and self.step_count <= self.warmup_steps:
