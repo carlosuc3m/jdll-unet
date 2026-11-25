@@ -158,6 +158,17 @@ def test_aliases_do_not_leak_across_splits(tmp_path):
     assert_disjoint(train_pairs, val_pairs)
 
 
+def test_spatial_holdout_keeps_annotations_on_both_sides(tmp_path):
+    pair = pair_files(tmp_path, (64, 64))
+    mask = np.zeros((64, 64), dtype=np.uint16)
+    mask[23:26, 23:26], mask[31:34, 31:34] = 1, 2
+    tifffile.imwrite(pair.mask, mask, metadata={"axes": "YX"})
+    inspected, _ = inspect_pair(pair)
+    training, validation = spatial_holdout(inspected, .2, 42, lambda p, training: min(p.domain_shape) >= 8)
+    assert any(training[0].plane_positive_counts)
+    assert any(validation[0].plane_positive_counts)
+
+
 def test_holdout_domain_enforced_before_transforms_and_statistics(tmp_path):
     original, _ = inspect_pair(pair_files(tmp_path, (64, 64)))
 

@@ -495,7 +495,8 @@ def spatial_holdout(
                 continue
             train = with_region(pair, tuple(train_bounds), "spatial_holdout")
             val = with_region(pair, tuple(val_bounds), "spatial_holdout")
-            if any(train.plane_positive_counts) and feasible(train, True) and feasible(val, False):
+            if (any(train.plane_positive_counts) and any(val.plane_positive_counts)
+                    and feasible(train, True) and feasible(val, False)):
                 return [train], [val]
     raise DatasetError(
         "No feasible disjoint spatial holdout exists; provide another source or choose a compatible patch/preset"
